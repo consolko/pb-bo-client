@@ -17,7 +17,7 @@ from tests.support.runtime import Emulator
 em = Emulator(firmware='U634_6.10.3425')
 
 
-def snapshot(label):
+def snapshot(label, filename='101.epub'):
     if not label or any(c not in 'abcdefghijklmnopqrstuvwxyz0123456789-_' for c in label):
         raise ValueError('Use a lowercase alphanumeric label')
     target = OUT / label
@@ -31,7 +31,7 @@ def snapshot(label):
     (target/'processes.txt').write_text(processes.stdout)
     (target/'task.txt').write_text(em.run_arm_probe('task-info').stdout)
     position = subprocess.run([sys.executable, str(Path(__file__).with_name('inspect_position.py')),
-                              str(LIVE/'mnt/ext1/system/explorer-3/explorer-3.db'), '--filename', '101.epub'],
+                              str(LIVE/'mnt/ext1/system/explorer-3/explorer-3.db'), '--filename', filename],
                              capture_output=True, text=True, check=True)
     (target/'position.json').write_text(position.stdout)
     (target/'frame.txt').write_text(em.run_probe('frame_dump').stdout)
@@ -45,4 +45,6 @@ def snapshot(label):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('label')
-    snapshot(parser.parse_args().label)
+    parser.add_argument('--filename', default='101.epub')
+    args = parser.parse_args()
+    snapshot(args.label, args.filename)

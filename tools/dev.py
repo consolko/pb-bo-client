@@ -1,4 +1,4 @@
-"""Mac entry point for the prepared VM: build, deploy, start, snapshot."""
+"""Mac entry point for the prepared VM: build, deploy, start, snapshot, input, frame."""
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,17 +25,65 @@ def snapshot():
     print(target)
 
 
+def frame(event=None):
+    target = ROOT / "tmp" / ("emulator-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + ".png")
+    target.parent.mkdir(exist_ok=True)
+    script = f"event = {event!r}\n" + '''from io import BytesIO
+from pathlib import Path
+import subprocess, sys, tempfile, time
+from PIL import Image
+base = Path.home() / "Projects/pbemu"
+sys.path[:0] = [str(base), str(base / "tools")]
+from tests.support.runtime import Emulator
+em = Emulator(firmware="U634_6.10.3425")
+if event:
+    em.run_input(*event)
+    time.sleep(1.5)
+with tempfile.NamedTemporaryFile(mode="w") as metadata:
+    metadata.write(em.run_probe("frame_dump").stdout)
+    metadata.flush()
+    pid = subprocess.check_output(["podman", "inspect", "--format", "{{.State.Pid}}", "pb-pocketbook-ui"], text=True).strip()
+    pgm = subprocess.check_output(["podman", "unshare", "nsenter", "--target", pid, "--ipc", sys.executable,
+                                   str(Path.home() / "Projects/pb-bo-workspace/pb-bo-client/tools/capture_frame.py"), metadata.name])
+Image.open(BytesIO(pgm)).save(sys.stdout.buffer, format="PNG")
+'''
+    try:
+        with target.open("wb") as out:
+            subprocess.run(["ssh", VM, "python3", "-"], input=script.encode(), stdout=out, check=True)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    print(target)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["build", "deploy", "start", "snapshot"])
+    parser.add_argument("action", choices=["build", "deploy", "start", "snapshot", "input", "frame"])
+    parser.add_argument("event", nargs="*")
     args = parser.parse_args()
-    if args.action == "snapshot":
+    if args.event:
+        if args.action not in ("input", "frame"):
+            parser.error("extra arguments are only accepted by input or frame")
+        if (args.event[0] not in ("touch", "key", "down", "move", "up")
+                or len(args.event) != (2 if args.event[0] == "key" else 3)):
+            parser.error("input requires touch/down/move/up X Y or key CODE")
+    elif args.action == "input":
+        parser.error("input requires touch/down/move/up X Y or key CODE")
+    if args.action == "input":
+        remote(f'''cd "$HOME/Projects/pbemu"
+.venv/bin/python - <<'PY'
+from tests.support.runtime import Emulator
+Emulator(firmware="U634_6.10.3425").run_input(*{args.event!r})
+PY''')
+    elif args.action == "frame":
+        frame(args.event)
+    elif args.action == "snapshot":
         snapshot()
     elif args.action == "build":
         source = subprocess.Popen(["tar", "-C", str(ROOT / "pb-bo-client"), "--exclude=.git",
                                    "--exclude=__pycache__", "--exclude=build", "-cf", "-", "."], stdout=subprocess.PIPE)
         try:
-            subprocess.run(["ssh", VM, "tar -xf - -C ~/Projects/pb-bo-workspace/pb-bo-client"],
+            subprocess.run(["ssh", VM, "tar -m -xf - -C ~/Projects/pb-bo-workspace/pb-bo-client"],
                            stdin=source.stdout, check=True)
         finally:
             source.stdout.close()
