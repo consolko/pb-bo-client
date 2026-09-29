@@ -66,7 +66,7 @@ QJsonObject smallBook(const QJsonObject &book) {
     for (const auto key : {"id", "title", "subtitle", "authors", "selectedFile", "files", "hasCover", "coverVersion",
              "description", "seriesName", "seriesIndex", "seriesMemberships", "publisher", "publishedDate", "publishedYear",
              "language", "pageCount", "isbn10", "isbn13", "libraryName", "genres", "tags", "rating", "personalNote",
-             "readStatus", "collections", "communityRatings", "detailed"})
+             "readStatus", "readingProgress", "collections", "communityRatings", "detailed"})
         if (book.contains(key)) result[key] = book[key];
     return result;
 }
@@ -376,7 +376,10 @@ QVariantMap Client::bookSummary(const QJsonObject &book) const {
         if (!localFile(variant).isEmpty() && !localFormats.contains(label)) localFormats << label;
     }
     const auto progress = record["progress"].toObject();
+    const auto readingProgress = book["readingProgress"];
     return {{"bookId", book["id"].toInt()}, {"title", book["title"].toString().isEmpty() ? "Без названия" : book["title"].toString()},
+        {"readStatus", book["readStatus"].toVariant()},
+        {"readingProgress", readingProgress.isDouble() && readingProgress.toDouble() >= 0 && readingProgress.toDouble() <= 100 ? readingProgress.toVariant() : QVariant{}},
         {"author", authorNames(book["authors"].toArray())}, {"seriesName", book["seriesName"].toString()},
         {"seriesIndex", book["seriesIndex"].toVariant()}, {"fileId", file["id"].toInt()}, {"format", format.toUpper()},
         {"fileCount", book["files"].toArray().size()}, {"localFormats", localFormats.join(", ")}, {"formats", formats.join(", ")},
@@ -440,6 +443,10 @@ void Client::showDetail(int bookId) {
                     if (!known.contains(file.toObject()["id"].toInt())) files.append(file);
                 detailBook["files"] = localView ? files : book["files"].toArray();
                 detailBook["selectedFile"] = book["selectedFile"];
+                if (!localView) {
+                    detailBook["readStatus"] = book["readStatus"];
+                    detailBook["readingProgress"] = book["readingProgress"];
+                }
                 break;
             }
         }
@@ -467,6 +474,8 @@ void Client::refreshDetail() {
             finish("Сервер вернул некорректные сведения о книге", false, "details"); return;
         }
         auto book = smallBook(response);
+        // The detail endpoint omits the book-level percentage returned by the catalog.
+        if (!book.contains("readingProgress")) book["readingProgress"] = detailBook["readingProgress"];
         book["files"] = bookFiles(response);
         book["description"] = plainText(response["description"].toString());
         book["detailed"] = true;
@@ -795,13 +804,15 @@ void Client::refresh(int targetPage, const QString &query) {
                 const auto book = value.toObject();
                 const int bookId = book["id"].toInt();
                 QString oldVersion;
-                const QString fileId = QString::number(book["selectedFile"].toObject()["id"].toInt());
-                auto record = downloads.value(fileId).toObject();
-                if (!record.isEmpty() && record["bookId"].toInt() == bookId) {
+                for (const auto &fileId : downloads.keys()) {
+                    auto record = downloads.value(fileId).toObject();
+                    if (record["bookId"].toInt() != bookId) continue;
                     auto stored = record["book"].toObject();
                     if (oldVersion.isEmpty()) oldVersion = stored["coverVersion"].toString();
                     stored["hasCover"] = book["hasCover"];
                     stored["coverVersion"] = book["coverVersion"];
+                    stored["readStatus"] = book["readStatus"];
+                    stored["readingProgress"] = book["readingProgress"];
                     record["book"] = stored;
                     saveRecord(fileId, record);
                 }

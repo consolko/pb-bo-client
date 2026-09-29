@@ -39,10 +39,14 @@ ApplicationWindow {
         formatDownload = download
         formatDialog.open()
     }
-    function readStatusLabel(value) {
-        if (!value || !value.status) return ""
-        const labels = { unread: "не прочитано", want_to_read: "хочу прочитать", reading: "читаю", on_hold: "отложено", rereading: "перечитываю", read: "прочитано", skimmed: "просмотрено", abandoned: "чтение прекращено" }
-        return labels[value.status] ? "В BookOrbit: " + labels[value.status] : ""
+    function readStatusLabel(book) {
+        const status = book.readStatus ? book.readStatus.status : "unread"
+        const labels = { unread: "Не прочитано", want_to_read: "Хочу прочитать", reading: "Читаю", on_hold: "Отложено", rereading: "Перечитываю", read: "Прочитано", skimmed: "Просмотрено", abandoned: "Чтение прекращено" }
+        let label = labels[status] || ""
+        const progress = book.readingProgress
+        if ((status === "reading" || status === "rereading") && typeof progress === "number" && isFinite(progress) && progress >= 0 && progress <= 100)
+            label += " · " + progress.toFixed(1).replace(/\.0$/, "").replace(".", ",") + " %"
+        return label
     }
     function editionText() {
         const d = client.detail, lines = []
@@ -107,20 +111,41 @@ ApplicationWindow {
         implicitHeight: 48 * window.u
         font.pixelSize: 17 * window.u
         padding: 10 * window.u
+        Accessible.name: text
+        ToolTip.text: text
+        ToolTip.visible: hovered && icon.source.toString().length > 0
+        ToolTip.delay: 600
         background: Rectangle {
-            color: action.down || action.checked ? "black" : "white"
+            color: action.down || action.checked ? (action.icon.source.toString().length ? "#dddddd" : "black") : "white"
             border.color: action.enabled ? "black" : "#999999"
             border.width: action.activeFocus ? 3 : 1
             radius: 3 * window.u
         }
-        contentItem: Text {
-            text: action.text
-            textFormat: Text.PlainText
-            elide: Text.ElideRight
-            font: action.font
-            color: !action.enabled ? "#777777" : (action.down || action.checked ? "white" : "black")
-            horizontalAlignment: Text.AlignHCenter
-            verticalAlignment: Text.AlignVCenter
+        contentItem: Item {
+            implicitWidth: action.icon.source.toString().length ? 28 * window.u : buttonText.implicitWidth
+            implicitHeight: Math.max(buttonText.implicitHeight, 28 * window.u)
+            Text {
+                id: buttonText
+                anchors.fill: parent
+                visible: !action.icon.source.toString().length
+                text: action.text
+                textFormat: Text.PlainText
+                elide: Text.ElideRight
+                font: action.font
+                color: !action.enabled ? "#777777" : (action.down || action.checked ? "white" : "black")
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
+            Image {
+                objectName: action.objectName + "Icon"
+                anchors.centerIn: parent
+                width: 28 * window.u; height: width
+                source: action.icon.source
+                visible: source.toString().length > 0
+                sourceSize.width: width; sourceSize.height: height
+                opacity: action.enabled ? 1 : 0.4
+                Accessible.ignored: true
+            }
         }
     }
     component Field: TextField {
@@ -136,7 +161,7 @@ ApplicationWindow {
     }
     ColumnLayout {
         anchors.fill: parent
-        anchors.margins: 20 * window.u
+        anchors.margins: Math.round(20 * window.u)
         spacing: 12 * window.u
         focus: true
         Keys.onEscapePressed: window.back()
@@ -154,12 +179,22 @@ ApplicationWindow {
             Layout.fillWidth: true
             Text { text: window.browsingFolders ? "Папка для книг" : (window.addingConnection ? "Подключение" : (window.settings ? "Настройки" : client.detailVisible ? "О книге" : "BookOrbit")); font.pixelSize: 29 * window.u; font.bold: true; Layout.fillWidth: true }
             Action {
+                objectName: "syncButton"
+                visible: !window.settings && !client.detailVisible
+                text: "Синхронизировать"
+                icon.source: "qrc:/icons/sync.svg"
+                Accessible.name: "Синхронизировать прогресс скачанных EPUB"
+                enabled: !client.busy && client.authenticated
+                onClicked: client.syncAll()
+            }
+            Action {
                 objectName: "navigationButton"
                 text: window.settings || client.detailVisible ? "Назад" : "Настройки"
+                icon.source: window.settings || client.detailVisible ? "" : "qrc:/icons/settings.svg"
                 enabled: !client.busy
                 onClicked: window.settings || client.detailVisible ? window.back() : window.editConnection()
             }
-            Action { visible: !window.settings && !client.detailVisible; text: "Закрыть"; enabled: !client.busy; onClicked: Qt.quit() }
+            Action { objectName: "exitButton"; visible: !window.settings && !client.detailVisible; text: "Закрыть приложение"; icon.source: "qrc:/icons/exit.svg"; enabled: !client.busy; onClicked: Qt.quit() }
         }
         Text {
             Layout.fillWidth: true
@@ -201,7 +236,16 @@ ApplicationWindow {
                 Text { text: "Имя пользователя"; font.pixelSize: 16 * window.u }
                 Field { id: username; inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText; Accessible.name: "Имя пользователя" }
                 Text { text: "Пароль для входа"; font.pixelSize: 16 * window.u }
-                Field { id: password; echoMode: TextInput.Password; inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText; Accessible.name: "Пароль" }
+                Field { id: password; objectName: "passwordField"; echoMode: showPassword.checked ? TextInput.Normal : TextInput.Password; inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText; Accessible.name: "Пароль" }
+                CheckBox {
+                    id: showPassword
+                    objectName: "showPassword"
+                    text: "Показать пароль"
+                    font.pixelSize: 16 * window.u
+                    implicitHeight: 44 * window.u
+                    enabled: !client.busy
+                    onVisibleChanged: if (!visible) checked = false
+                }
                 Text {
                     text: client.hasSavedPassword ? "Вход сохранён на устройстве до выхода из аккаунта." : "После входа пароль сохранится на устройстве до выхода из аккаунта."
                     Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444"
@@ -236,17 +280,23 @@ ApplicationWindow {
                             displayText: count > 0 ? currentText : "Подключений пока нет"
                             onActivated: client.selectAccount(currentIndex)
                         }
-                        Action { text: "Добавить"; enabled: !client.busy; onClicked: window.connectionForm(true) }
+                        Action { objectName: "addConnection"; text: "Добавить"; enabled: !client.busy; onClicked: window.connectionForm(true) }
                     }
-                    Action {
-                        text: "Подключиться"; Layout.fillWidth: true
-                        enabled: !client.busy && client.accounts.length > 0 && !client.authenticated
-                        onClicked: client.hasSavedPassword ? client.restoreSession() : window.connectionForm(false)
-                    }
-                    Action {
-                        text: "Выйти из аккаунта"; Layout.fillWidth: true
-                        visible: client.authenticated || client.hasSavedPassword; enabled: !client.busy
-                        onClicked: client.logout()
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8 * window.u
+                        Action {
+                            objectName: "connectButton"
+                            text: "Подключиться"; Layout.fillWidth: true; Layout.preferredWidth: 1
+                            enabled: !client.busy && client.accounts.length > 0 && !client.authenticated
+                            onClicked: client.hasSavedPassword ? client.restoreSession() : window.connectionForm(false)
+                        }
+                        Action {
+                            objectName: "logoutButton"
+                            text: "Выйти из аккаунта"; Layout.fillWidth: true; Layout.preferredWidth: 1
+                            enabled: !client.busy && (client.authenticated || client.hasSavedPassword)
+                            onClicked: client.logout()
+                        }
                     }
                     Item { Layout.preferredHeight: 10 * window.u }
                 Text { text: "Папка для скачивания книг"; font.pixelSize: 18 * window.u; font.bold: true }
@@ -259,7 +309,7 @@ ApplicationWindow {
                     enabled: !client.busy
                     onClicked: client.setDiagnosticLogging(checked)
                 }
-                Text { text: "Журнал: " + client.diagnosticLogPath + ". Без паролей и токенов; доступен через USB."; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; font.pixelSize: 14 * window.u; color: "#444444" }
+                Text { objectName: "diagnosticPath"; text: client.diagnosticLogPath; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; font.pixelSize: 14 * window.u; color: "#444444" }
                 }
             }
         }
@@ -328,13 +378,6 @@ ApplicationWindow {
             Text { text: "Скачанные книги доступны без входа"; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
             Action { text: "Войти"; enabled: !client.busy; onClicked: window.editConnection() }
         }
-        Action {
-            visible: !window.settings && !client.detailVisible && client.offlineOnly
-            text: "Синхронизировать"; Layout.fillWidth: true
-            Accessible.name: "Синхронизировать прогресс скачанных EPUB"
-            enabled: !client.busy && client.authenticated && client.books.length > 0
-            onClicked: client.syncAll()
-        }
         ListView {
             id: collectionList
             objectName: "collectionList"
@@ -370,53 +413,64 @@ ApplicationWindow {
             Layout.fillWidth: true; Layout.fillHeight: true
             clip: true
             model: client.books
-            spacing: 6 * window.u
+            spacing: Math.round(6 * window.u)
             ScrollBar.vertical: ScrollBar { }
-            delegate: Item {
+            delegate: ItemDelegate {
+                id: bookRow
                 required property var modelData
                 required property int index
+                objectName: "book-" + modelData.bookId
                 width: catalog.width
-                height: 130 * window.u
-                Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: "#aaaaaa" }
-                RowLayout {
-                    anchors.fill: parent; anchors.topMargin: 8 * window.u; anchors.bottomMargin: 10 * window.u
+                // Fractional row edges leave hairlines in the firmware's software renderer.
+                height: Math.ceil(Math.max(130 * window.u, implicitContentHeight + topPadding + bottomPadding))
+                padding: 0; topPadding: Math.round(8 * window.u); bottomPadding: Math.round(10 * window.u)
+                enabled: !client.busy
+                onClicked: window.showBook(modelData.bookId)
+                Accessible.name: "О книге: " + modelData.title + ", " + window.readStatusLabel(modelData)
+                background: Rectangle {
+                    color: bookRow.down ? "#dddddd" : "white"
+                    Rectangle { anchors.fill: parent; visible: bookRow.visualFocus; color: "transparent"; border.color: "black"; border.width: 2 }
+                    Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: "#aaaaaa" }
+                }
+                contentItem: RowLayout {
                     spacing: 14 * window.u
                     Rectangle {
+                        objectName: "cover-" + modelData.bookId
+                        Layout.alignment: Qt.AlignTop
                         Layout.preferredWidth: 70 * window.u; Layout.preferredHeight: 105 * window.u
                         color: "#eeeeee"
                         Text { anchors.centerIn: parent; visible: cover.status !== Image.Ready; text: "Книга"; font.pixelSize: 13 * window.u; color: "#555555" }
                         Image { id: cover; anchors.fill: parent; source: { const revision = client.coverRevision; return client.coverUrl(modelData.bookId) }
-                            fillMode: Image.PreserveAspectFit; cache: false; sourceSize.width: 240; sourceSize.height: 320 }
-                        MouseArea { anchors.fill: parent; enabled: !client.busy; onClicked: window.showBook(modelData.bookId) }
+                            fillMode: Image.PreserveAspectFit; verticalAlignment: Image.AlignTop; cache: false; sourceSize.width: 240; sourceSize.height: 320 }
                     }
                     ColumnLayout {
-                        Layout.fillWidth: true; Layout.fillHeight: true; spacing: 4 * window.u
-                        Action {
-                            objectName: "book-" + modelData.bookId
-                            Layout.fillWidth: true; Layout.preferredHeight: titleText.implicitHeight + 2 * window.u
-                            padding: 0; enabled: !client.busy
-                            onClicked: window.showBook(modelData.bookId)
-                            background: Rectangle { color: parent.down ? "#dddddd" : "white" }
-                            contentItem: Text { id: titleText; text: modelData.title; textFormat: Text.PlainText; font.pixelSize: 21 * window.u; font.bold: true; maximumLineCount: 2; wrapMode: Text.Wrap; elide: Text.ElideRight }
-                            Accessible.name: "О книге: " + modelData.title
-                        }
-                        Text { text: modelData.author; textFormat: Text.PlainText; Layout.fillWidth: true; font.pixelSize: 15 * window.u; elide: Text.ElideRight }
+                        Layout.fillWidth: true; Layout.minimumHeight: 105 * window.u; Layout.alignment: Qt.AlignTop; spacing: 4 * window.u
+                        Text { objectName: "title-" + modelData.bookId; text: modelData.title; Layout.fillWidth: true; textFormat: Text.PlainText; font.pixelSize: 21 * window.u; font.bold: true; maximumLineCount: 2; wrapMode: Text.Wrap; elide: Text.ElideRight }
+                        Text { objectName: "author-" + modelData.bookId; text: modelData.author; visible: text.trim().length > 0; textFormat: Text.PlainText; Layout.fillWidth: true; font.pixelSize: 15 * window.u; elide: Text.ElideRight }
+                        Text { objectName: "reading-" + modelData.bookId; text: window.readStatusLabel(modelData); visible: text.length > 0; Layout.fillWidth: true; font.pixelSize: 14 * window.u; elide: Text.ElideRight }
                         Item { Layout.fillHeight: true }
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Text {
-                                text: modelData.hasConflict ? "Выберите позицию" : modelData.pendingProgress ? "Позиция ожидает применения" : modelData.localFormats ? modelData.localFormats + " · на устройстве" : modelData.formats || "Нет файлов книги"
-                                Layout.fillWidth: true; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight; font.pixelSize: 13 * window.u
-                            }
-                            Action {
-                                text: modelData.downloaded ? (modelData.readable ? "Читать" : "О книге") : modelData.needsRepair ? "Заново" : "Скачать"
-                                enabled: !client.busy && (modelData.downloaded || modelData.supported && client.authenticated)
-                                onClicked: {
-                                    if (modelData.downloaded && modelData.readable && !modelData.pendingProgress) client.open(index)
-                                    else if (modelData.downloaded) window.showBook(modelData.bookId)
-                                    else if (modelData.fileCount > 1) { window.showBook(modelData.bookId); window.chooseFormat(true) }
-                                    else client.download(index)
-                                }
+                        Text {
+                            text: modelData.hasConflict ? "Выберите позицию" : modelData.pendingProgress ? "Позиция ожидает применения" : modelData.localFormats ? modelData.localFormats + " · на устройстве" : modelData.formats || "Нет файлов книги"
+                            Layout.fillWidth: true; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight; font.pixelSize: 13 * window.u
+                        }
+                    }
+                    Item {
+                        Layout.alignment: Qt.AlignTop
+                        Layout.preferredWidth: bookAction.implicitWidth
+                        Layout.preferredHeight: 105 * window.u
+                        Action {
+                            id: bookAction
+                            anchors.bottom: parent.bottom
+                            objectName: "bookAction-" + modelData.bookId
+                            text: modelData.downloaded ? (modelData.readable ? "Читать" : "О книге") : modelData.needsRepair ? "Заново" : "Скачать"
+                            icon.source: modelData.downloaded ? "" : "qrc:/icons/download.svg"
+                            Accessible.name: (modelData.downloaded ? text : modelData.needsRepair ? "Скачать заново" : "Скачать") + ": " + modelData.title
+                            enabled: !client.busy && (modelData.downloaded || modelData.supported && client.authenticated)
+                            onClicked: {
+                                if (modelData.downloaded && modelData.readable && !modelData.pendingProgress) client.open(index)
+                                else if (modelData.downloaded) window.showBook(modelData.bookId)
+                                else if (modelData.fileCount > 1) { window.showBook(modelData.bookId); window.chooseFormat(true) }
+                                else client.download(index)
                             }
                         }
                     }
@@ -457,6 +511,7 @@ ApplicationWindow {
                         Text { text: client.detail.title || ""; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.bold: true; font.pixelSize: 25 * window.u }
                         Text { text: client.detail.subtitle || ""; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 17 * window.u }
                         Text { text: client.detail.author || ""; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 18 * window.u }
+                        Text { objectName: "detailReading"; text: window.readStatusLabel(client.detail); visible: text.length > 0; Layout.fillWidth: true; font.pixelSize: 15 * window.u; wrapMode: Text.Wrap }
                         Text { text: (client.detail.seriesName || "") + (client.detail.seriesIndex ? " · № " + client.detail.seriesIndex : ""); textFormat: Text.PlainText; visible: !!client.detail.seriesName; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 15 * window.u }
                     }
                 }
@@ -479,7 +534,6 @@ ApplicationWindow {
                 Text { text: client.detail.hasConflict ? "На ридере и в BookOrbit разные позиции. Повторите сверку и выберите нужную." : client.detail.pendingProgress ? "Входящая позиция ещё не применена. Закройте книгу в читалке и повторите сверку." : client.detail.syncResult || ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
                 Action { text: "Читать локально"; visible: !!client.detail.pendingProgress; Layout.fillWidth: true; enabled: !client.busy; onClicked: client.openSelected(false) }
                 Action { text: "Синхронизировать позицию"; visible: !!client.detail.canSync; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.syncSelected() }
-                Text { text: window.readStatusLabel(client.detail.readStatus); visible: text.length > 0; Layout.fillWidth: true; font.pixelSize: 15 * window.u; wrapMode: Text.Wrap }
                 Text { text: client.detail.notice || ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
                 Action { text: client.detail.detailed ? "Обновить сведения" : "Загрузить сведения"; visible: client.offlineOnly || !!client.detail.notice; enabled: !client.busy && client.authenticated; onClicked: client.refreshDetail() }
                 Text { text: "Аннотация"; font.bold: true; font.pixelSize: 20 * window.u }
@@ -508,9 +562,9 @@ ApplicationWindow {
         RowLayout {
             visible: !window.settings && !client.offlineOnly && !client.collectionsView && !client.detailVisible
             Layout.fillWidth: true
-            Action { text: "‹"; Accessible.name: "Предыдущая страница"; enabled: !client.busy && client.authenticated && client.page > 0; onClicked: { catalog.contentY = 0; client.refresh(client.page-1, search.text) } }
+            Action { objectName: "previousPage"; text: "‹"; Layout.preferredWidth: 100 * window.u; Accessible.name: "Предыдущая страница"; enabled: !client.busy && client.authenticated && client.page > 0; onClicked: { catalog.contentY = 0; client.refresh(client.page-1, search.text) } }
             Text { text: client.total === 0 ? "Книг: 0" : (client.page+1) + " / " + Math.ceil(client.total/10) + " · " + (search.text ? "Найдено: " : "Книг: ") + client.total; Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; font.pixelSize: 14 * window.u }
-            Action { text: "›"; Accessible.name: "Следующая страница"; enabled: !client.busy && client.authenticated && (client.page+1)*10 < client.total; onClicked: { catalog.contentY = 0; client.refresh(client.page+1, search.text) } }
+            Action { objectName: "nextPage"; text: "›"; Layout.preferredWidth: 100 * window.u; Accessible.name: "Следующая страница"; enabled: !client.busy && client.authenticated && (client.page+1)*10 < client.total; onClicked: { catalog.contentY = 0; client.refresh(client.page+1, search.text) } }
         }
         Action { visible: client.downloading; text: "Отменить загрузку"; Layout.fillWidth: true; onClicked: client.cancelDownload() }
         Action { visible: client.canRetry; text: "Повторить"; Layout.fillWidth: true; onClicked: client.retry() }

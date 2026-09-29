@@ -424,7 +424,14 @@ int main(int argc, char **argv) {
     Client features(endpoint, featureRoot, nullptr, false);
     write(fault, "features");
     require(wait(features, [&] { features.login("demo", "demo"); }) && features.total() == 23, "multi-format paginated catalog");
+    require(features.books()[0].toMap()["readStatus"].toMap()["status"] == "reading" &&
+            features.books()[0].toMap()["readingProgress"].toDouble() == 37.5, "catalog exposes server reading status and percentage");
+    require(!features.books()[3].toMap()["readingProgress"].isNull() &&
+            features.books()[3].toMap()["readingProgress"].toDouble() == 0, "zero reading progress is retained");
+    for (const int i : {2, 4, 5, 6})
+        require(features.books()[i].toMap()["readingProgress"].isNull(), "missing or invalid percentage is not shown as zero");
     require(wait(features, [&] { features.showDetail(1); }), "load book details by stable book ID");
+    require(features.detail()["readingProgress"].toDouble() == 37.5, "detail without percentage preserves catalog reading progress");
     require(features.detail()["author"].toString() == "Локальный стенд" &&
             features.detail()["description"].toString().contains("Второй абзац") &&
             !features.detail()["description"].toString().contains("<p>"), "detail author objects and HTML become readable text");

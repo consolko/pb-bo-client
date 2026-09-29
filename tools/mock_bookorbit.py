@@ -79,6 +79,10 @@ EXTRA_FILES = {201: ("pdf", pdf()), 202: ("fb2", fb2()), 203: ("epub", epub(1)),
 
 def library_books():
     books = [dict(book, files=list(book["files"])) for book in BOOKS]
+    books[0].update(title="Очень длинное название тестовой книги для проверки переноса на две строки",
+                    readStatus={"status": "reading"}, readingProgress=37.5)
+    books[1].update(authors=[], readStatus={"status": "read"}, readingProgress=100)
+    books[2].update(readStatus={"status": "reading"}, readingProgress="42")
     books[0]["files"] += [{"id": i, "format": fmt, "role": "content", "filename": f"Тестовая книга.{fmt}", "sizeBytes": len(raw)}
                            for i, (fmt, raw) in EXTRA_FILES.items() if i != 204]
     books[0]["files"] += [{"id": 900, "format": "opf", "role": "supplementary", "sizeBytes": 100}]
@@ -86,6 +90,10 @@ def library_books():
     for i in range(4, 24):
         books.append({"id": i, "title": f"Книга коллекции {i}", "authors": ["Автор коллекции"], "hasCover": False,
                       "files": [{"id": 100+i, "format": "epub", "role": "primary", "sizeBytes": len(epub(i))}]})
+    books[3].update(readStatus={"status": "rereading"}, readingProgress=0)
+    books[4].update(readStatus={"status": "reading"}, readingProgress=None)
+    books[5].update(readStatus={"status": "reading"}, readingProgress=-1)
+    books[6].update(readStatus={"status": "reading"}, readingProgress=101)
     return books
 
 
@@ -167,8 +175,9 @@ class Handler(BaseHTTPRequestHandler):
                         subtitle="Проверка подробностей", publisher="Тестовое издательство", publishedYear=2026,
                         language="ru", pageCount=240, isbn13="9780000000000", libraryName="Тестовая библиотека",
                         genres=["Научная фантастика"], tags=["Тест"], rating=4, personalNote="Личная заметка из BookOrbit",
-                        readStatus={"status": "reading"}, collections=[{"id": 11, "name": "К прочтению"}],
+                        collections=[{"id": 11, "name": "К прочтению"}],
                         seriesName="Проверка серии", seriesIndex="2.5")
+            book.pop("readingProgress", None)  # Real detail API has no book-level percentage.
             if mode == "bad_files":
                 book["files"] = [{"id": 201, "format": "../pdf", "role": "primary", "sizeBytes": 1}]
             return self.send(200, book)
