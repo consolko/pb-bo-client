@@ -212,8 +212,9 @@ bool saveReaderPosition(const QString &path, const QString &expectedPosition,
         "_ZN10pocketbook2db9DbManager11SetPositionExRKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEil"));
     if (!instance || !initProfile || !setPosition) return false;
     double percentage=0;
+    QString point;
     *error = "Координата не подходит к этому EPUB.";
-    if (!epubPosition(path,cfi,&percentage)) return false;
+    if (!epubPosition(path,cfi,&percentage,&point)) return false;
     *error = "Закройте все книги в штатной читалке и повторите синхронизацию.";
     if (readerFileState(path) != ReaderFileState::Closed) return false;
     // Different paths can share one native book_id. Block all open books, including aliases.
@@ -232,7 +233,7 @@ bool saveReaderPosition(const QString &path, const QString &expectedPosition,
     QString current; qint64 bookId=0;
     *error = "Позиция или профиль ридера изменились. Повторите синхронизацию.";
     if (readerProfile()!=profile || !readReaderPosition(path,&current,&bookId) || bookId<=0 || current!=expectedPosition) return false;
-    const QString incoming="pbr:/webkit?##"+cfi;
+    const QString incoming="pbr:/webkit?##"+point;
     *error = "Не удалось подтвердить сохранение позиции. Повторите синхронизацию.";
     try {
         void *db=instance();

@@ -8,6 +8,7 @@
 #include <QMap>
 #include <QtEndian>
 #include <zlib.h>
+#include <algorithm>
 
 namespace {
 quint16 u16(const QByteArray &b, int p) { return qFromLittleEndian<quint16>(b.constData()+p); }
@@ -84,8 +85,7 @@ qint64 textSize(const QDomNode &node) {
     qint64 n=0; for (auto child=node.firstChild(); !child.isNull(); child=child.nextSibling()) n+=textSize(child);
     return n;
 }
-// ponytail: point CFIs only; add tested range/assertion support before accepting more forms.
-// They must gain a tested resolver before they may be applied to the native reader.
+// ponytail: simple steps and ID assertions only; extended assertions need a tested resolver.
 bool resolve(QDomElement root, const QString &path, QDomNode &target, qint64 &before, int &offset) {
     static const QRegularExpression step("^([1-9][0-9]*)(?:\\[([A-Za-z0-9_.:-]+)\\])?(?::([0-9]+))?$");
     if (!path.startsWith('/')) return false;
@@ -131,10 +131,19 @@ QString nativeCfi(const QString &position) {
     return {};
 }
 
-bool epubPosition(const QString &path, const QString &cfi, double *percentage) {
+bool epubPosition(const QString &path, const QString &cfi, double *percentage, QString *point) {
     if (cfi.size()>4096 || !cfi.startsWith("epubcfi(") || !cfi.endsWith(')')) return false;
-    const auto parts=cfi.mid(8,cfi.size()-9).split('!');
+    const auto range=cfi.mid(8,cfi.size()-9).split(',');
+    if (range.size()!=1 && range.size()!=3) return false;
+    const auto parts=range[0].split('!');
     if (parts.size()!=2) return false;
+    QString start=parts[1], end;
+    if (range.size()==3) {
+        if (start.isEmpty() ||
+            (!range[1].startsWith('/') && !range[1].startsWith(':')) ||
+            (!range[2].startsWith('/') && !range[2].startsWith(':'))) return false;
+        start+=range[1]; end=parts[1]+range[2];
+    }
     Zip zip(path); QDomDocument container, package;
     if (!xml(zip.read("META-INF/container.xml"),container)) return false;
     const auto roots=container.elementsByTagName("rootfile");
@@ -160,12 +169,28 @@ bool epubPosition(const QString &path, const QString &cfi, double *percentage) {
         if (!xml(zip.read(QDir::cleanPath(directory+QUrl::fromPercentEncoding(href.toUtf8()))),content)) return false;
         if (item==ref) {
             QDomNode target; qint64 before=0;
-            if (!resolve(content.documentElement(),parts[1],target,before,offset)) return false;
+            if (!resolve(content.documentElement(),start,target,before,offset)) return false;
+            if (!end.isEmpty()) {
+                QDomNode last; qint64 endBefore=0; int endOffset=0;
+                if (!resolve(content.documentElement(),end,last,endBefore,endOffset) || endBefore<before) return false;
+                // Text offsets alone cannot order empty elements: compare validated CFI steps too.
+                const auto order=[](const QString &path) {
+                    QList<int> result;
+                    for (auto step : path.mid(1).split('/')) {
+                        step.remove(QRegularExpression("\\[[^\\]]*\\]"));
+                        for (const auto &number : step.split(':')) result.append(number.toInt());
+                    }
+                    return result;
+                };
+                const auto firstOrder=order(start), lastOrder=order(end);
+                if (std::lexicographical_compare(lastOrder.begin(),lastOrder.end(),firstOrder.begin(),firstOrder.end())) return false;
+            }
             position=total+before;
         }
         total+=textSize(content.documentElement());
     }
     if (position<0 || total<=0 || position>total) return false;
     if (percentage) *percentage=100.0*double(position)/double(total);
+    if (point) *point="epubcfi("+parts[0]+"!"+start+")";
     return true;
 }

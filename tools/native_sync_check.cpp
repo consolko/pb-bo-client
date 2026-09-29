@@ -63,6 +63,10 @@ int main(int argc,char **argv) {
     QString after;
     require(readerPosition(path,&after) && nativeCfi(after)=="epubcfi(/6/2!/4/62/1)","native SQLite readback matches server CFI");
     require(readerFileState(path)==ReaderFileState::Closed,"book stayed closed throughout sync");
+    require(fault.open(QIODevice::WriteOnly) && fault.write("progress_range")==14,"move fixture server to a CFI range");
+    fault.close();
+    require(wait(c,[&] { c.syncProgress(0); }),"incoming range applied through real firmware adapter");
+    require(readerPosition(path,&after) && nativeCfi(after)=="epubcfi(/6/2!/4/42/1:0)","native readback is the range start");
     require(wait(c,[&] { c.syncAll(); }),"repeat batch is a no-op");
     Client restarted(QUrl("http://host.containers.internal:8766"),QString::fromLocal8Bit(argv[1]));
     require(!restarted.books().isEmpty() && !restarted.books()[0].toMap()["pendingProgress"].toBool(),"confirmed state survives client restart");

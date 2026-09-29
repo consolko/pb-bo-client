@@ -57,6 +57,13 @@ void write(const QString &path, const QByteArray &data) { QFile f(path); require
 
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
+    if (argc==4 && QString::fromLocal8Bit(argv[1])=="--resolve-cfi") {
+        QString point; double percentage=0;
+        require(epubPosition(QString::fromLocal8Bit(argv[2]),QString::fromLocal8Bit(argv[3]),&percentage,&point),
+                "resolve supplied EPUB and CFI without mutation");
+        std::printf("point=%s approximatePercentage=%.8f\n",qPrintable(point),percentage);
+        return 0;
+    }
     require(argc == 3, "data directory and fixture fault file supplied");
     const QString root = QString::fromLocal8Bit(argv[1]), fault = QString::fromLocal8Bit(argv[2]);
     const QUrl endpoint("http://host.containers.internal:8766");
@@ -103,8 +110,20 @@ int main(int argc, char **argv) {
     double percent=0;
     require(epubPosition(file,"epubcfi(/6/2!/4/14/1:65)",&percent) && percent>0 && percent<100, "resolve CFI and estimate text percentage");
     require(!epubPosition(file,"epubcfi(/6/2!/4/9999/1)",nullptr) &&
-            !epubPosition(file,"epubcfi(/6/2!/4/14/1:99999)",nullptr) &&
-            !epubPosition(file,"epubcfi(/6/2!/4,/14/1:0,/16/1:1)",nullptr), "reject out-of-book and unsupported range positions");
+            !epubPosition(file,"epubcfi(/6/2!/4/14/1:99999)",nullptr), "reject out-of-book positions");
+    QString point;
+    require(epubPosition(file,"epubcfi(/6/2!/4,/14/1:0,/16/1:1)",&percent,&point) &&
+            point=="epubcfi(/6/2!/4/14/1:0)", "validate both range endpoints and select its start");
+    require(epubPosition(file,"epubcfi(/6/2!/4/14/1,:0,:20)",nullptr,&point) &&
+            point=="epubcfi(/6/2!/4/14/1:0)", "resolve offsets relative to shared text node");
+    for (const auto *cfi : {"epubcfi(/6/2!/4,/14/1:0,/16/1:99999)",
+                            "epubcfi(/6/2!/4,/16/1:1,/14/1:0)",
+                            "epubcfi(/6/2!/4/14/1,:20,:10)",
+                            "epubcfi(/6/2!/4,/14/1:0,/9999/1)",
+                            "epubcfi(/6/2!/4,2,/8/1)",
+                            "epubcfi(/6/2!/4,/14/1:0,)",
+                            "epubcfi(/6/2!/4,/14/1:0,/16/1:1,/18)"})
+        require(!epubPosition(file,QString::fromLatin1(cfi),nullptr), "reject invalid or reversed range without applying its start");
     require(epubPosition(root+"/compressed.epub","epubcfi(/6/2!/4/14/1:65)",&percent), "resolve deflated ZIP member with CRC verification");
     require(epubPosition(root+"/multi.epub","epubcfi(/6/4[second]!/4/14[p6]/1:65)",&percent) && percent>50,
             "resolve second spine and validate element ID assertions");
@@ -128,6 +147,21 @@ int main(int argc, char **argv) {
             "retry saves pending incoming CFI without opening any book");
     require(!c.books()[0].toMap()["pendingProgress"].toBool(), "confirmed native write clears pending state");
     require(wait(c,[&] { c.syncProgress(0); }), "acknowledge applied position without echo upload");
+    write(fault,"progress_range");
+    require(wait(c,[&] { c.syncProgress(0); }) && appliedCfi=="epubcfi(/6/2!/4/42/1:0)" && !opened,
+            "incoming server range saves a point without launching reader");
+    require(wait(c,[&] { c.syncProgress(0); }) &&
+            QJsonDocument::fromJson(contents(scope+"/records/101.json")).object()["progress"].toObject()["remoteBase"].toObject()["cfi"].toString().contains(','),
+            "repeat sync preserves original server range without echo upload");
+    fakeProfile="range-first-sync";
+    fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/6/1)";
+    require(!wait(c,[&] { c.syncProgress(0); }) && c.progressConflict(), "first sync with local point and remote range requires explicit choice");
+    require(wait(c,[&] { c.resolveProgress(false); }) && appliedCfi=="epubcfi(/6/2!/4/42/1:0)",
+            "explicit range choice saves validated start");
+    fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/8/1)";
+    require(wait(c,[&] { c.syncProgress(0); }) && !c.progressConflict(), "reading after incoming range uploads against original server baseline");
+    fakeProfile="default";
+    require(wait(c,[&] { c.syncProgress(0); }), "same positions acknowledge current default profile");
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/10/1)";
     write(fault,"progress_other");
     require(!wait(c,[&] { c.syncProgress(0); }) && c.progressConflict(), "two changed sides create explicit conflict");

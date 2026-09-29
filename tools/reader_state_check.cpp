@@ -8,6 +8,9 @@ int main(int argc, char **argv) {
     QCoreApplication app(argc,argv);
     if (argc != 2 && argc != 3 && argc != 4) return 3;
     setupDevice();
+    if (argc==3 && QString::fromLocal8Bit(argv[2])=="--scan") {
+        scanBook(QString::fromLocal8Bit(argv[1])); return 0;
+    }
     if (argc==3 && QString::fromLocal8Bit(argv[2])=="--position") {
         QString position;
         if (!readerPosition(QString::fromLocal8Bit(argv[1]),&position)) return 4;

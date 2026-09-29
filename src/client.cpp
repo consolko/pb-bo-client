@@ -1311,12 +1311,15 @@ void Client::syncBook(const QString &id, int choice) {
             if (digestFile(path)!=downloads.value(id).toObject()["sha256"].toString().toLatin1()) {
                 finish("Локальный EPUB изменился во время сверки. Прогресс не изменён.",false,"progress"); return;
             }
-            const QString cfi=remote["cfi"].toString();
+            const QString remoteCfi=remote["cfi"].toString();
+            QString cfi=remoteCfi;
             const auto percent=remote["percentage"];
             if (!remote.contains("cfi") || (!remote["cfi"].isNull() && !remote["cfi"].isString()) ||
-                !percent.isDouble() || percent.toDouble()<0 || percent.toDouble()>100 ||
-                (!cfi.isEmpty() && !epubPosition(path,cfi,nullptr))) {
-                finish("Сервер вернул неподдерживаемую позицию. Прогресс не изменён.",false,"progress"); return;
+                !percent.isDouble() || percent.toDouble()<0 || percent.toDouble()>100) {
+                finish("Некорректный ответ сервера о прогрессе: ожидаются CFI и процент от 0 до 100. Прогресс не изменён.",false,"progress"); return;
+            }
+            if (!cfi.isEmpty() && !epubPosition(path,remoteCfi,nullptr,&cfi)) {
+                finish("Не удалось сопоставить серверную координату CFI с этим EPUB. Прогресс не изменён.",false,"progress"); return;
             }
             bool other=false;
             for (const auto key : {"positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
@@ -1343,7 +1346,7 @@ void Client::syncBook(const QString &id, int choice) {
             const bool known=state.contains("profile") && state["profile"].toString()==profile &&
                 state.contains("localBase") && state["remoteBase"].isObject();
             const bool localChanged=known ? local!=state["localBase"].toString() : !local.isEmpty();
-            const bool remoteChanged=known ? cfi!=state["remoteBase"].toObject()["cfi"].toString() : !remoteEmpty;
+            const bool remoteChanged=known ? remoteCfi!=state["remoteBase"].toObject()["cfi"].toString() : !remoteEmpty;
             int action=0;
             if (choice && conflictId==id && conflictProfile==profile && conflictLocal==local && conflictRemote==remote) action=choice;
             else if (state.contains("profile") && !pending.isEmpty() && pending==remote && state["pendingLocal"].toString()==local && state["profile"].toString()==profile) action=2;

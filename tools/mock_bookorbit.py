@@ -203,6 +203,9 @@ class Handler(BaseHTTPRequestHandler):
             if mode == "progress_metadata":
                 self.server.progress[file_id]["updatedAt"] = "2030-01-01T00:00:00Z"
                 fault.write_text("")
+            if mode == "progress_range":
+                self.server.progress[file_id] = {"cfi": "epubcfi(/6/2!/4,/42/1:0,/48/1:20)", "pageNumber": None, "percentage": 25}
+                fault.write_text("")
             if self.command == "POST":
                 if not isinstance(body.get("percentage"), (float, int)) or not 0 <= body["percentage"] <= 100:
                     return self.send(400, {})
