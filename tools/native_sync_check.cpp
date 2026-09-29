@@ -2,6 +2,7 @@
 #include "client.h"
 #include "device.h"
 #include "progress.h"
+#include "check_wait.h"
 #include <QCoreApplication>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
@@ -20,16 +21,9 @@ static void require(bool ok, const char *label) {
     if (!ok) std::exit(1);
 }
 static bool wait(Client &c, const std::function<void()> &action) {
-    QEventLoop loop; bool ok=false,done=false;
-    auto connection=QObject::connect(&c,&Client::completed,&loop,[&](const QString &operation,bool result) {
-        if (operation=="settings") return;
-        ok=result; done=true; loop.quit();
-    });
-    QTimer::singleShot(0,&loop,action);
-    QTimer::singleShot(25000,&loop,&QEventLoop::quit);
-    loop.exec(); QObject::disconnect(connection);
+    const bool ok=waitForClient(c,action);
     if (!ok) std::fprintf(stderr,"%s\n",qPrintable(c.status()));
-    return done && ok;
+    return ok;
 }
 int main(int argc,char **argv) {
     qputenv("QT_PLUGIN_PATH","/ebrmain/plugins");

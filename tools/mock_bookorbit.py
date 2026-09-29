@@ -10,6 +10,7 @@ import struct
 import time
 import zlib
 import zipfile
+from threading import Lock
 from urllib.parse import parse_qs
 
 TOKEN = "local-development-only"
@@ -121,6 +122,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def route(self, body):
         path = self.path.split("?", 1)[0]
+        with self.server.count_lock:
+            key = self.command + " " + path
+            self.server.counts[key] = self.server.counts.get(key, 0) + 1
+            if self.server.count_file:
+                temporary = self.server.count_file.with_suffix(".tmp")
+                temporary.write_text(json.dumps(self.server.counts))
+                temporary.replace(self.server.count_file)
         fault = self.server.fault_file
         mode = fault.read_text().strip() if fault and fault.exists() else ""
         if path == "/api/v1/auth/login" and self.command == "POST":
@@ -146,7 +154,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(401, {"message": "Expired session"})
         thumbnail = re.fullmatch(r"/api/v1/books/([1-3])/thumbnail", path)
         if thumbnail and self.command == "GET":
-            if thumbnail[1] == "3" or (mode == "cover_removed" and thumbnail[1] == "1"):
+            if thumbnail[1] == "3" or (mode in ("cover_removed", "cover_404") and thumbnail[1] == "1"):
                 return self.send(404, {"message": "No cover"})
             return self.send(200, cover(4 if mode == "cover_changed" and thumbnail[1] == "1" else int(thumbnail[1])), "image/png")
         if mode == "error":
@@ -202,6 +210,10 @@ class Handler(BaseHTTPRequestHandler):
                 for book in items:
                     if book["id"] == 1:
                         book["coverVersion"] = "2"
+            if mode in ("cover_unknown", "cover_404"):
+                for book in items:
+                    if book["id"] == 1:
+                        book.pop("coverVersion", None)
             return self.send(200, {"items": items[page*size:(page+1)*size], "total": len(items), "page": page, "size": size})
         match = re.fullmatch(r"/api/v1/books/files/(10[1-3])/(download|progress)", path)
         if match and match[2] == "progress":
@@ -214,6 +226,13 @@ class Handler(BaseHTTPRequestHandler):
                 fault.write_text("")
             if mode == "progress_range":
                 self.server.progress[file_id] = {"cfi": "epubcfi(/6/2!/4,/42/1:0,/48/1:20)", "pageNumber": None, "percentage": 25}
+                fault.write_text("")
+            if mode == "progress_page":
+                current = self.server.progress.setdefault(file_id, {"cfi": None, "percentage": 0})
+                current["pageNumber"] = 37
+                fault.write_text("")
+            if mode == "progress_page_conflict":
+                self.server.progress[file_id] = {"cfi": "epubcfi(/6/2!/4/82/1)", "pageNumber": 37, "percentage": 40}
                 fault.write_text("")
             if self.command == "POST":
                 if not isinstance(body.get("percentage"), (float, int)) or not 0 <= body["percentage"] <= 100:
@@ -268,6 +287,9 @@ def make_server(host="127.0.0.1", port=8765, fault_file=None):
     server.fault_file = fault_file
     server.refresh_count = 0
     server.progress = {}
+    server.count_lock = Lock()
+    server.counts = {}
+    server.count_file = fault_file.with_name("requests.json") if fault_file else None
     return server
 
 

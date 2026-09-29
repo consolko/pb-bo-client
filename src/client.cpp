@@ -8,6 +8,8 @@
 #include <QJsonDocument>
 #include <QNetworkReply>
 #include <QSaveFile>
+#include <QStorageInfo>
+#include <algorithm>
 #include <QTimer>
 #include <QBuffer>
 #include <QImageReader>
@@ -140,6 +142,11 @@ bool accessibleDirectory(const QString &path) {
     const QFileInfo dir(path);
     return dir.isDir() && dir.isWritable() && dir.canonicalFilePath() == path;
 }
+bool sameStorage(const QString &first, const QString &second) {
+    const QStorageInfo a(first), b(second);
+    return a.isValid() && b.isValid() && a.isReady() && b.isReady() && !a.device().isEmpty() &&
+           a.device() == b.device() && a.rootPath() == b.rootPath();
+}
 }
 
 Client::Client(QUrl server, QString root, QObject *parent, bool restoreAccount)
@@ -171,15 +178,30 @@ void Client::loadRecords() {
     scopeDir = rootDir + "/" + QString::fromLatin1(key.left(24));
     QDir().mkpath(scopeDir);
     const auto session = readObject(scopeDir+"/session.json");
-    savedPassword = session["password"].toString();
-    if (savedPassword.size() > 4096) savedPassword.clear();
     static const QRegularExpression nativeRefresh("^[a-f0-9]{64}$");
     refreshToken = session["refreshToken"].toString();
     if (!nativeRefresh.match(refreshToken).hasMatch()) refreshToken.clear();
-    items = {}; collectionItems = {}; detailBook = {}; browseHistory.clear(); authResume = {};
+    sessionStored = false; sessionNotice.clear();
+    const QString sessionFile = scopeDir+"/session.json";
+    if (QFile::exists(sessionFile)) {
+        if (refreshToken.isEmpty()) {
+            if (!QFile::remove(sessionFile)) sessionNotice = "Не удалось удалить старые данные входа.";
+        } else if (session.contains("password")) {
+            // Migrate the old plaintext-password record before using its refresh token.
+            saveSession();
+        } else {
+            const auto permissions = QFileInfo(sessionFile).permissions();
+            const auto shared = QFileDevice::ReadGroup | QFileDevice::WriteGroup | QFileDevice::ExeGroup |
+                                QFileDevice::ReadOther | QFileDevice::WriteOther | QFileDevice::ExeOther;
+            sessionStored = !(permissions & shared) && bool(permissions & QFileDevice::ReadOwner);
+            if (!sessionStored && !saveSession()) refreshToken.clear();
+        }
+    }
+    items = {}; collectionItems = {}; detailBook = {}; browseHistory.clear();
     ++detailGeneration; detailMessage.clear();
     activeCollection = 0; activeCollectionName.clear(); collectionList = false;
     fileChoices = readObject(scopeDir+"/file-choices.json");
+    coverVersions = readObject(scopeDir+"/cover-index.json");
     count = currentPage = 0;
     downloads = {};
     syncResults = {};
@@ -235,9 +257,9 @@ void Client::loadRecords() {
 }
 
 void Client::cleanupBooks() {
-    static const QRegularExpression owned("^([1-9][0-9]*)(?:-[0-9a-f-]{36})?\\.(?:epub|part)$");
+    static const QRegularExpression owned("^([1-9][0-9]*)(?:-[0-9a-f-]{36})?\\.(?:epub|part(?:\\.[A-Za-z0-9]+)?)$");
     const QDir dir(scopeDir);
-    for (const auto &name : dir.entryList({"*.epub", "*.part"}, QDir::Files)) {
+    for (const auto &name : dir.entryList({"*.epub", "*.part", "*.part.*"}, QDir::Files)) {
         const auto match = owned.match(name);
         if (!match.hasMatch()) continue;
         const QString id = match.captured(1);
@@ -246,33 +268,45 @@ void Client::cleanupBooks() {
         // A legacy file is only ours to remove when its migrated record points elsewhere.
         if (name.endsWith(".epub") && record.isEmpty()) continue;
         const QString path = dir.filePath(name);
-        if (readerFileState(path) == ReaderFileState::Closed) QFile::remove(path);
+        if (name.contains(".part") || readerFileState(path) == ReaderFileState::Closed) QFile::remove(path);
     }
 }
 
 void Client::removeCover(int bookId) {
-    if (QFile::remove(scopeDir+"/cover-"+QString::number(bookId)+".png")) {
+    const QString key = QString::number(bookId);
+    if (coverVersions.contains(key)) {
+        coverVersions.remove(key);
+        writeObject(scopeDir+"/cover-index.json", coverVersions);
+    }
+    if (QFile::remove(scopeDir+"/cover-"+key+".png")) {
         ++coverVersion;
         emit coversChanged();
     }
 }
 
 void Client::cleanupCovers() {
-    QSet<int> keep;
-    for (auto value : items) {
-        const auto book = value.toObject();
-        if (positiveId(book["id"]) && book["hasCover"] != false) keep.insert(book["id"].toInt());
-    }
+    QSet<int> downloaded, visible;
+    for (auto value : items) if (positiveId(value.toObject()["id"])) visible.insert(value.toObject()["id"].toInt());
     for (auto it=downloads.begin(); it!=downloads.end(); ++it) {
         const auto book = it.value().toObject()["book"].toObject();
-        if (positiveId(book["id"]) && book["hasCover"] != false) keep.insert(book["id"].toInt());
+        if (positiveId(book["id"]) && book["hasCover"] != false) downloaded.insert(book["id"].toInt());
     }
     static const QRegularExpression owned("^cover-([1-9][0-9]*)\\.png$");
+    QList<QFileInfo> transient;
     for (const auto &name : QDir(scopeDir).entryList({"cover-*.png"}, QDir::Files)) {
         const auto match = owned.match(name);
-        if (match.hasMatch() && !keep.contains(match.captured(1).toInt()))
-            removeCover(match.captured(1).toInt());
+        if (!match.hasMatch()) continue;
+        const int id = match.captured(1).toInt();
+        if (downloaded.contains(id)) continue;
+        if (!coverVersions.contains(QString::number(id)) && !visible.contains(id)) removeCover(id);
+        else transient.append(QFileInfo(scopeDir+"/"+name));
     }
+    std::sort(transient.begin(), transient.end(), [&visible](const QFileInfo &a, const QFileInfo &b) {
+        const int left=a.baseName().mid(6).toInt(), right=b.baseName().mid(6).toInt();
+        if (visible.contains(left) != visible.contains(right)) return !visible.contains(left);
+        return a.lastModified() < b.lastModified();
+    });
+    for (int i=0; i<transient.size()-64; ++i) removeCover(transient[i].baseName().mid(6).toInt());
 }
 
 bool Client::saveRecord(const QString &id, const QJsonObject &record) {
@@ -557,9 +591,13 @@ void Client::showCollections() {
 
 void Client::openCollection(int id, const QString &name, double catalogOffset, double detailOffset) {
     if (working || id <= 0) return;
-    if (detailVisible()) browseHistory.append(QJsonObject{{"detail", detailBook}, {"items", items}, {"page", currentPage},
+    if (detailVisible() && id == activeCollection) { closeDetail(); return; }
+    if (detailVisible()) {
+        if (browseHistory.size() == 16) browseHistory.removeFirst();
+        browseHistory.append(QJsonObject{{"detail", detailBook}, {"items", items}, {"page", currentPage},
         {"total", count}, {"local", localView}, {"collectionId", activeCollection}, {"collectionName", activeCollectionName},
         {"query", retryQuery}, {"catalogY", catalogOffset}, {"detailY", detailOffset}, {"notice", detailMessage}});
+    }
     closeDetail();
     activeCollection = id; activeCollectionName = name;
     refresh();
@@ -579,7 +617,7 @@ QVariantMap Client::backFromCollection() {
 }
 
 void Client::finish(const QString &text, bool success, const QString &operation) {
-    working = false; authResume = {};
+    working = false;
     activeDownload.clear();
     if (!success && retryKind == 3 && detailVisible()) detailMessage = text;
     if (success) retryKind = 0;
@@ -636,26 +674,30 @@ bool Client::setCredentials(const QJsonObject &response) {
         return false;
     }
     token = access.toUtf8(); refreshToken = refresh;
-    if (!pendingPassword.isEmpty()) { savedPassword = pendingPassword; pendingPassword.clear(); }
-    if (!savedPassword.isEmpty() && !saveSession()) {
-        token.clear(); refreshToken.clear();
-        finish("Не удалось сохранить вход на устройстве", false, "login");
-        return false;
-    }
+    saveSession(); // A storage failure leaves this login usable until the application closes.
     return true;
 }
 
 bool Client::saveSession() {
-    const bool saved = writeObject(scopeDir+"/session.json", {{"password", savedPassword}, {"refreshToken", refreshToken}});
-    if (saved) QFile::setPermissions(scopeDir+"/session.json", QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-    logEvent(saved ? "session saved" : "session save failed");
+    const QString path = scopeDir+"/session.json";
+    const bool written = writeObject(path, {{"refreshToken", refreshToken}});
+    const auto privatePermissions = QFileDevice::ReadOwner | QFileDevice::WriteOwner;
+    const auto shared = QFileDevice::ReadGroup | QFileDevice::WriteGroup | QFileDevice::ExeGroup |
+                        QFileDevice::ReadOther | QFileDevice::WriteOther | QFileDevice::ExeOther;
+    sessionStored = written && QFile::setPermissions(path, privatePermissions) &&
+                    !(QFileInfo(path).permissions() & shared) && bool(QFileInfo(path).permissions() & QFileDevice::ReadOwner);
+    if (!sessionStored) {
+        const bool removed = !QFile::exists(path) || QFile::remove(path);
+        sessionNotice = removed ? "Не удалось защитить сохранённый вход. После закрытия приложения потребуется войти снова."
+                                : "Не удалось защитить или удалить данные входа. Проверьте память устройства.";
+    } else sessionNotice.clear();
+    logEvent(sessionStored ? "session saved" : "session save failed");
     emit changed();
-    return saved;
+    return sessionStored;
 }
 
 void Client::restoreSession() {
-    if (working || authenticated() || savedPassword.isEmpty()) return;
-    if (refreshToken.isEmpty()) { login(user, savedPassword); return; }
+    if (working || authenticated() || refreshToken.isEmpty()) return;
     working = true;
     message = "Восстановление входа…";
     emit changed();
@@ -667,12 +709,11 @@ void Client::restoreSession() {
 }
 
 void Client::renewSession(const std::function<void()> &resume) {
-    authResume = resume;
     stopCovers();
     message = "Обновление сессии…";
     emit changed();
     jsonRequest("/api/v1/auth/refresh", {{"refreshToken", refreshToken}}, [this, resume](const QJsonObject &response) {
-        if (setCredentials(response)) { authResume = {}; queueCovers(); resume(); }
+        if (setCredentials(response)) { queueCovers(); resume(); }
     }, false);
 }
 
@@ -704,22 +745,11 @@ void Client::jsonRequest(const QString &path, const QJsonObject &payload, const 
             return;
         }
         if (reply->error() != QNetworkReply::NoError || code < 200 || code >= 300 || bytes->size() > maxJson) {
-            if (path == "/api/v1/auth/login") pendingPassword.clear();
             if (code == 401) { token.clear(); refreshToken.clear(); stopCovers(); }
-            if (code == 401 && path == "/api/v1/auth/refresh" && !savedPassword.isEmpty() && !passwordFallbackUsed) {
-                passwordFallbackUsed = true;
-                if (authResume) {
-                    const auto resume = authResume;
-                    authResume = {};
-                    jsonRequest("/api/v1/auth/login", {{"username", user}, {"password", savedPassword}, {"clientKind", "native"}},
-                        [this, resume](const QJsonObject &response) {
-                            if (setCredentials(response)) { queueCovers(); resume(); }
-                        }, false);
-                    return;
-                }
-                working = false;
-                login(user, savedPassword);
-                return;
+            if (code == 401 && path == "/api/v1/auth/refresh") {
+                sessionStored = false;
+                if (QFile::exists(scopeDir+"/session.json") && !QFile::remove(scopeDir+"/session.json"))
+                    sessionNotice = "Не удалось удалить истёкшую сессию с устройства.";
             }
             finish(path == "/api/v1/auth/logout" ? "Вы вышли на устройстве. Отзыв сессии на сервере не подтверждён." :
                    reply->error() == QNetworkReply::SslHandshakeFailedError ? "Не удалось проверить TLS-сертификат сервера. Проверьте доверенный CA и дату устройства." :
@@ -738,20 +768,19 @@ void Client::jsonRequest(const QString &path, const QJsonObject &payload, const 
             finish("Сервер вернул некорректные данные", false, path);
             return;
         }
-        if (path.startsWith("/api/v1/books/") || path.startsWith("/api/v1/collections")) passwordFallbackUsed = false;
         callback(arrayResponse ? QJsonObject{{"items", doc.array()}} : doc.object());
     });
 }
 
 void Client::login(const QString &username, const QString &password) {
     if (working) return;
-    const QString secret = password.isEmpty() && username == user ? savedPassword : password;
+    if (password.isEmpty() && username == user && !refreshToken.isEmpty()) { restoreSession(); return; }
+    const QString secret = password;
     if (!validServer(endpoint) || username.isEmpty() || secret.isEmpty()) {
         finish("Укажите HTTPS-адрес, имя пользователя и пароль.", false, "login");
         return;
     }
     if (!configure(endpoint.toString(), username)) return;
-    pendingPassword = secret;
     retryKind = 0;
     working = true;
     message = "Подключение…";
@@ -771,7 +800,6 @@ void Client::refresh(int targetPage, const QString &query) {
     collectionList = false;
     stopCovers();
     items = {}; count = currentPage = 0; localView = false;
-    cleanupCovers();
     if (token.isEmpty()) { finish("Сначала войдите на сервер", false, "catalog"); return; }
     retryKind = 1; retryPage = targetPage; retryQuery = query;
     working = true;
@@ -803,12 +831,10 @@ void Client::refresh(int targetPage, const QString &query) {
             for (auto value : parsed) {
                 const auto book = value.toObject();
                 const int bookId = book["id"].toInt();
-                QString oldVersion;
                 for (const auto &fileId : downloads.keys()) {
                     auto record = downloads.value(fileId).toObject();
                     if (record["bookId"].toInt() != bookId) continue;
                     auto stored = record["book"].toObject();
-                    if (oldVersion.isEmpty()) oldVersion = stored["coverVersion"].toString();
                     stored["hasCover"] = book["hasCover"];
                     stored["coverVersion"] = book["coverVersion"];
                     stored["readStatus"] = book["readStatus"];
@@ -816,9 +842,7 @@ void Client::refresh(int targetPage, const QString &query) {
                     record["book"] = stored;
                     saveRecord(fileId, record);
                 }
-                const QString newVersion = book["coverVersion"].toString();
-                if (book["hasCover"] == false || (!oldVersion.isEmpty() && !newVersion.isEmpty() && oldVersion != newVersion))
-                    removeCover(bookId);
+                if (book["hasCover"] == false) removeCover(bookId);
             }
             items = parsed; currentPage = targetPage; count = response["total"].toInt();
             cleanupCovers();
@@ -856,11 +880,11 @@ void Client::downloadBook(const QJsonObject &book, bool renew) {
     }
     const qint64 expected = reportedSize < 0 ? 0 : static_cast<qint64>(reportedSize);
     const QString directory = downloadDirectory();
-    if (!accessibleDirectory(directory)) {
+    if (!accessibleDirectory(directory) || !sameStorage(scopeDir,directory)) {
         finish("Папка загрузки недоступна. Выберите другую папку в настройках.", false, "download"); return;
     }
     const QString stem = id+"-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
-    const QString staging = directory+"/"+stem+".part";
+    const QString staging = scopeDir+"/"+stem+".part";
     const QString finalPath = directory+"/"+stem+"."+format;
     auto output = std::make_shared<QSaveFile>(staging);
     if (!output->open(QIODevice::WriteOnly)) { finish("Не удалось создать файл книги", false, "download"); return; }
@@ -914,7 +938,8 @@ void Client::downloadBook(const QJsonObject &book, bool renew) {
             rememberFile(book);
             finish("Книга уже скачана", true, "download"); return;
         }
-        if (!accessibleDirectory(directory) || !output->commit() || !validContent(staging, format) || !QFile::rename(staging, finalPath)) {
+        if (!accessibleDirectory(directory) || !sameStorage(scopeDir,directory) || !output->commit() ||
+            !validContent(staging, format) || !QFile::rename(staging, finalPath)) {
             QFile::remove(staging);
             finish("Не удалось сохранить книгу", false, "download"); return;
         }
@@ -924,6 +949,8 @@ void Client::downloadBook(const QJsonObject &book, bool renew) {
         }
         QJsonObject record{{"bookId", book["id"]}, {"fileId", file["id"]}, {"filename", stem+"."+format}, {"format", format},
                                  {"sha256", newHash}, {"bytes", double(*size)}, {"book", smallBook(book)}};
+        if (previous["sha256"].toString() == newHash && previous["format"].toString("epub") == format &&
+            previous["progress"].isObject()) record["progress"] = previous["progress"];
         if (directory != scopeDir) record["directory"] = directory;
         if (!saveRecord(id, record)) {
             QFile::remove(finalPath);
@@ -989,7 +1016,7 @@ QStringList Client::accounts() const {
 
 bool Client::validDownloadDirectory(const QString &path) const {
     static const QRegularExpression accountFolder("^[0-9a-f]{24}(?:/|$)");
-    return storagePath(path) && accessibleDirectory(path) &&
+    return storagePath(path) && accessibleDirectory(path) && sameStorage(scopeDir,path) &&
            !accountFolder.match(QDir(rootDir).relativeFilePath(path)).hasMatch();
 }
 
@@ -1097,7 +1124,7 @@ void Client::logout() {
     if (QFile::exists(sessionFile) && !QFile::remove(sessionFile)) {
         finish("Не удалось удалить сохранённый вход. Проверьте память устройства.", false, "logout"); return;
     }
-    savedPassword.clear(); pendingPassword.clear();
+    sessionStored = false; sessionNotice.clear();
     token.clear(); refreshToken.clear(); retryKind = 0; localView = true;
     items = {}; count = currentPage = 0; collectionItems = {}; detailBook = {};
     ++detailGeneration; browseHistory.clear(); collectionList = false; activeCollection = 0; activeCollectionName.clear();
@@ -1183,8 +1210,14 @@ void Client::queueCovers() {
     for (auto value : items) {
         const auto book = value.toObject();
         if (!positiveId(book["id"])) continue;
-        if (book["hasCover"] == false) removeCover(book["id"].toInt());
-        else coverQueue.append(book["id"].toInt());
+        const int id=book["id"].toInt();
+        if (book["hasCover"] == false) { removeCover(id); continue; }
+        const QString version=book["coverVersion"].toString();
+        const QString path=scopeDir+"/cover-"+QString::number(id)+".png";
+        if (!version.isEmpty() && coverVersions[QString::number(id)].toString()==version && QFile::exists(path)) continue;
+        if (!version.isEmpty() && coverVersions.contains(QString::number(id)) &&
+            coverVersions[QString::number(id)].toString()!=version) removeCover(id);
+        coverQueue.append(id);
     }
     fetchNextCover();
 }
@@ -1194,6 +1227,8 @@ void Client::fetchNextCover() {
     if (!connectNetwork()) { stopCovers(); logEvent("cover network unavailable"); return; }
     const int id = coverQueue.takeFirst(), generation = coverGeneration;
     const QString path = scopeDir+"/cover-"+QString::number(id)+".png";
+    QString version;
+    for (auto value : items) if (value.toObject()["id"].toInt()==id) { version=value.toObject()["coverVersion"].toString(); break; }
     auto request = this->request("/api/v1/books/"+QString::number(id)+"/thumbnail");
     auto reply = network.get(request);
     activeCover = reply;
@@ -1203,13 +1238,12 @@ void Client::fetchNextCover() {
         if (bytes->size() > maxJson) reply->abort();
     });
     QTimer::singleShot(15000, reply, [reply] { if (!reply->isFinished()) reply->abort(); });
-    connect(reply, &QNetworkReply::finished, this, [this, reply, bytes, path, generation] {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, bytes, path, id, version, generation] {
         reply->deleteLater();
         if (generation != coverGeneration) return;
         activeCover.clear();
         bytes->append(reply->readAll());
-        if (reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 404)
-            removeCover(QFileInfo(path).baseName().mid(6).toInt());
+        if (reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 404) removeCover(id);
         if (reply->error() == QNetworkReply::NoError && bytes->size() <= maxJson &&
             reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200) {
             QBuffer buffer(bytes.get()); buffer.open(QIODevice::ReadOnly);
@@ -1222,7 +1256,11 @@ void Client::fetchNextCover() {
                 const auto cover = reader.read();
                 QSaveFile file(path);
                 if (!cover.isNull() && file.open(QIODevice::WriteOnly) && cover.save(&file, "PNG") && file.commit()) {
+                    if (version.isEmpty()) coverVersions.remove(QString::number(id));
+                    else coverVersions[QString::number(id)]=version;
+                    writeObject(scopeDir+"/cover-index.json",coverVersions);
                     ++coverVersion; emit coversChanged();
+                    cleanupCovers();
                 }
             }
         }
@@ -1312,8 +1350,13 @@ void Client::syncBook(const QString &id, int choice) {
         finish("Формат локальной позиции не поддерживается. Прогресс не изменён.",false,"progress"); return;
     }
     working=true; retryKind=0; stopCovers(); message="Проверка EPUB и прогресса…"; emit changed();
-    verifyRemoteFile(id,[this,id,path,position,local,percentage,choice,profile] {
-        const QString route="/api/v1/books/files/"+id+"/progress";
+    const QString route="/api/v1/books/files/"+id+"/progress";
+    const auto state=record["progress"].toObject();
+    const bool unchangedCandidate=!choice && state["profile"].toString()==profile &&
+        state.contains("localBase") && state["localBase"].toString()==local && state["remoteBase"].isObject() &&
+        !state.contains("pending") && !state.contains("outgoing") && !state.contains("conflictRemote");
+    auto checked=[this,id,path,position,local,percentage,choice,profile,route] {
+    verifyRemoteFile(id,[this,id,path,position,local,percentage,choice,profile,route] {
         jsonRequest(route,{},[this,id,path,position,local,percentage,choice,route,profile](const QJsonObject &remote) {
             QString current;
             if (readerProfile()!=profile || readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position) {
@@ -1336,7 +1379,8 @@ void Client::syncBook(const QString &id, int choice) {
             for (const auto key : {"positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
                                   "koboLocationType","koboLocationValue","koboContentSourceProgressPercent","koreaderProgress","narrationPercentage","narrationUpdatedAt"})
                 if (remote.contains(key) && !remote[key].isNull()) other=true;
-            const bool remoteEmpty=cfi.isEmpty() && percent.toDouble()==0 && remote["pageNumber"].isNull() && !other;
+            const bool hasPage=remote.contains("pageNumber") && !remote["pageNumber"].isNull();
+            const bool remoteEmpty=cfi.isEmpty() && percent.toDouble()==0 && !hasPage && !other;
             if (cfi.isEmpty() && !remoteEmpty) {
                 finish("На сервере есть прогресс без точного CFI. Автоматический обмен невозможен.",false,"progress"); return;
             }
@@ -1391,8 +1435,10 @@ void Client::syncBook(const QString &id, int choice) {
                 if (persist()) { dismissConflict(); finish("Позиция сохранена. Откройте книгу из штатной библиотеки.",true,"progress"); }
                 return;
             }
-            if (local.isEmpty() || other) {
-                finish(other?"Серверная запись содержит другие координаты чтения. Отправка остановлена, чтобы сохранить их.":"На ридере ещё нет точной позиции.",false,"progress"); return;
+            if (local.isEmpty() || other || hasPage) {
+                finish(hasPage ? "Серверная позиция содержит номер страницы. Отправка остановлена, чтобы не стереть его." :
+                       other ? "Серверная запись содержит другие координаты чтения. Отправка остановлена, чтобы сохранить их." :
+                               "На ридере ещё нет точной позиции.",false,"progress"); return;
             }
             // Save before POST. An uncertain result is reconciled by the next GET, never blindly retried.
             const QJsonObject outgoing{{"source","text"},{"cfi",local},{"pageNumber",QJsonValue::Null},{"percentage",percentage}};
@@ -1411,4 +1457,14 @@ void Client::syncBook(const QString &id, int choice) {
             });
         },true,true);
     });
+    };
+    if (!unchangedCandidate) { checked(); return; }
+    jsonRequest(route,{},[this,id,path,position,profile,state,checked](const QJsonObject &remote) {
+        QString current;
+        if (remote==state["remoteBase"].toObject() && readerProfile()==profile &&
+            readerFileState(path)==ReaderFileState::Closed && readerPosition(path,&current) && current==position &&
+            digestFile(path)==downloads.value(id).toObject()["sha256"].toString().toLatin1()) {
+            finish("Прогресс не изменился",true,"progress");
+        } else checked();
+    },true,true);
 }

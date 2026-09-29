@@ -35,7 +35,8 @@ class Client : public QObject {
     Q_PROPERTY(QString downloadDirectory READ downloadDirectory NOTIFY changed)
     Q_PROPERTY(bool diagnosticLogging READ diagnosticLogging NOTIFY changed)
     Q_PROPERTY(QString diagnosticLogPath READ diagnosticLogPath CONSTANT)
-    Q_PROPERTY(bool hasSavedPassword READ hasSavedPassword NOTIFY changed)
+    Q_PROPERTY(bool hasSavedSession READ hasSavedSession NOTIFY changed)
+    Q_PROPERTY(QString sessionWarning READ sessionWarning NOTIFY changed)
 public:
     Client(QUrl server, QString root, QObject *parent = nullptr, bool restoreAccount = true);
     QVariantList books() const;
@@ -77,7 +78,8 @@ public:
     QString downloadDirectory() const;
     bool diagnosticLogging() const { return diagnostics; }
     QString diagnosticLogPath() const;
-    bool hasSavedPassword() const { return !savedPassword.isEmpty(); }
+    bool hasSavedSession() const { return sessionStored; }
+    QString sessionWarning() const { return sessionNotice; }
     Q_INVOKABLE QVariantList directories(const QString &path) const;
     Q_INVOKABLE bool setDownloadDirectory(const QString &path);
     Q_INVOKABLE bool setDiagnosticLogging(bool enabled);
@@ -139,12 +141,11 @@ private:
     QString rootDir, scopeDir, bookDirectory, user, message;
     QByteArray token;
     QString refreshToken;
-    QString savedPassword, pendingPassword;
+    QString sessionNotice;
     QJsonArray items;
     QJsonArray collectionItems;
     QList<QJsonObject> browseHistory;
-    QJsonObject detailBook, fileChoices;
-    std::function<void()> authResume;
+    QJsonObject detailBook, fileChoices, coverVersions;
     QString detailMessage, activeCollectionName;
     int activeCollection = 0, detailGeneration = 0;
     bool collectionList = false;
@@ -157,6 +158,6 @@ private:
     QString retryQuery;
     int retryPage = 0, retryKind = 0;
     bool localView = false, cancelled = false;
-    bool working = false, diagnostics = false, passwordFallbackUsed = false;
+    bool working = false, diagnostics = false, sessionStored = false;
     int currentPage = 0, count = 0;
 };

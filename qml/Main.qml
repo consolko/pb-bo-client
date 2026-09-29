@@ -216,6 +216,14 @@ ApplicationWindow {
             Accessible.role: Accessible.StaticText
             Accessible.name: text
         }
+        Text {
+            Layout.fillWidth: true
+            visible: client.sessionWarning.length > 0
+            text: client.sessionWarning
+            wrapMode: Text.Wrap
+            font.pixelSize: 14 * window.u
+            Accessible.name: text
+        }
         ScrollView {
             id: settingsScroll
             visible: window.settings && !window.browsingFolders
@@ -247,12 +255,12 @@ ApplicationWindow {
                     onVisibleChanged: if (!visible) checked = false
                 }
                 Text {
-                    text: client.hasSavedPassword ? "Вход сохранён на устройстве до выхода из аккаунта." : "После входа пароль сохранится на устройстве до выхода из аккаунта."
+                    text: client.hasSavedSession ? "На устройстве сохранён токен для восстановления входа. Пароль не сохраняется." : "После входа клиент попробует сохранить токен. Пароль не сохраняется."
                     Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444"
                 }
                 Action {
                     text: "Войти"; Layout.fillWidth: true
-                    enabled: !client.busy && username.text.length > 0 && (password.text.length > 0 || client.hasSavedPassword && username.text === client.username && server.text === client.server)
+                    enabled: !client.busy && username.text.length > 0 && (password.text.length > 0 || client.hasSavedSession && username.text === client.username && server.text === client.server)
                     onClicked: {
                         if (client.configure(server.text, username.text)) {
                             client.login(username.text, password.text)
@@ -289,12 +297,12 @@ ApplicationWindow {
                             objectName: "connectButton"
                             text: "Подключиться"; Layout.fillWidth: true; Layout.preferredWidth: 1
                             enabled: !client.busy && client.accounts.length > 0 && !client.authenticated
-                            onClicked: client.hasSavedPassword ? client.restoreSession() : window.connectionForm(false)
+                            onClicked: client.hasSavedSession ? client.restoreSession() : window.connectionForm(false)
                         }
                         Action {
                             objectName: "logoutButton"
                             text: "Выйти из аккаунта"; Layout.fillWidth: true; Layout.preferredWidth: 1
-                            enabled: !client.busy && (client.authenticated || client.hasSavedPassword)
+                            enabled: !client.busy && (client.authenticated || client.hasSavedSession)
                             onClicked: client.logout()
                         }
                     }

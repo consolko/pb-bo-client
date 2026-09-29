@@ -2,6 +2,7 @@
 #include "client.h"
 #include "device.h"
 #include "progress.h"
+#include "check_wait.h"
 #include <QCoreApplication>
 #include <QEventLoop>
 #include <QTimer>
@@ -40,20 +41,23 @@ void require(bool value, const char *label) {
     std::printf("PASS: %s\n", label); std::fflush(stdout);
 }
 bool wait(Client &client, const std::function<void()> &action) {
-    QEventLoop loop;
-    bool ok = false, done = false;
-    auto connection = QObject::connect(&client, &Client::completed, &loop, [&](const QString &op, bool success) {
-        if (op == "settings") return;
-        ok = success; done = true; loop.quit();
-    });
-    QTimer::singleShot(0, &loop, action);
-    QTimer::singleShot(25000, &loop, &QEventLoop::quit);
-    loop.exec(); QObject::disconnect(connection);
+    bool done = false;
+    const bool ok = waitForClient(client, action, &done);
     require(done, "operation completed within timeout");
     return ok;
 }
 QByteArray contents(const QString &path) { QFile f(path); require(f.open(QIODevice::ReadOnly), "read test file"); return f.readAll(); }
 void write(const QString &path, const QByteArray &data) { QFile f(path); require(f.open(QIODevice::WriteOnly) && f.write(data) == data.size(), "write test data"); }
+int requests(const QString &root, const QString &route) {
+    return QJsonDocument::fromJson(contents(root+"/requests.json")).object()[route].toInt();
+}
+int rssKiB() {
+    QFile status("/proc/self/status");
+    if (!status.open(QIODevice::ReadOnly)) return -1;
+    for (const auto &line : status.readAll().split('\n'))
+        if (line.startsWith("VmRSS:")) return line.mid(6).trimmed().split(' ').first().toInt();
+    return -1;
+}
 
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
@@ -74,11 +78,23 @@ int main(int argc, char **argv) {
     require(!c.configure("https://example.com?token=secret", "a"), "reject URL query");
     require(wait(c, [&] { c.login("demo", "demo"); }), "login and catalog");
     const QString sessionFile = root+"/"+QString::fromLatin1(QCryptographicHash::hash((endpoint.toString()+"\ndemo").toUtf8(), QCryptographicHash::Sha256).toHex().left(24))+"/session.json";
-    require(c.hasSavedPassword() && contents(sessionFile).contains("refreshToken"),
-            "successful login saves credentials in account data");
+    require(c.hasSavedSession() && contents(sessionFile).contains("refreshToken") && !contents(sessionFile).contains("password"),
+            "successful login saves refresh token without password");
     Client resumed(endpoint, root);
-    require(resumed.hasSavedPassword() && wait(resumed, [&] { resumed.restoreSession(); }) && resumed.authenticated(),
+    require(resumed.hasSavedSession() && wait(resumed, [&] { resumed.restoreSession(); }) && resumed.authenticated(),
             "restart restores the session without entering a password");
+    write(sessionFile, QJsonDocument(QJsonObject{{"refreshToken", QString(64, '0')}, {"password", "legacy secret"}}).toJson());
+    Client migrated(endpoint, root);
+    require(migrated.hasSavedSession() && !contents(sessionFile).contains("password") &&
+            !(QFileInfo(sessionFile).permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther)),
+            "legacy password file is rewritten as private token-only session");
+    const QString unprotectedRoot=root+"/session-storage-failure";
+    const QString accountKey=QString::fromLatin1(QCryptographicHash::hash((endpoint.toString()+"\ndemo").toUtf8(),QCryptographicHash::Sha256).toHex().left(24));
+    require(QDir().mkpath(unprotectedRoot+"/"+accountKey+"/session.json"), "inject session storage failure");
+    Client unprotected(endpoint,unprotectedRoot,nullptr,false);
+    require(wait(unprotected,[&] { unprotected.login("demo","demo"); }) && unprotected.authenticated() &&
+            !unprotected.hasSavedSession() && !unprotected.sessionWarning().isEmpty(),
+            "unsafe session storage does not undo successful login");
     require(wait(c, [&] { c.showDownloaded(false); }), "opening catalog fetches online");
     require(c.books().size() == 3, "catalog contains three books");
     const QString catalogPath = QFileInfo(sessionFile).absolutePath()+"/catalog.json";
@@ -131,8 +147,14 @@ int main(int argc, char **argv) {
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/14/1:65)";
     require(wait(c,[&] { c.syncProgress(0); }), "upload native reading position to empty server");
     require(QJsonDocument::fromJson(contents(scope+"/records/101.json")).object()["progress"].toObject()["localBase"]==nativeCfi(fakePosition), "persist agreed baseline");
+    const int firstDownloads = requests(root, "GET /api/v1/books/files/101/download");
+    require(wait(c,[&] { c.syncProgress(0); }) && requests(root, "GET /api/v1/books/files/101/download") == firstDownloads,
+            "unchanged progress uses GET without downloading EPUB again");
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/6/1)";
+    const int beforeMovedDownload=requests(root,"GET /api/v1/books/files/101/download");
     require(wait(c,[&] { c.syncProgress(0); }), "sync deliberate backwards reading without percentage ordering");
+    require(requests(root,"GET /api/v1/books/files/101/download")>beforeMovedDownload,
+            "changed local position verifies full remote EPUB before upload");
     write(fault,"progress_remote");
     applyAllowed=false; opened=false;
     require(!wait(c,[&] { c.syncProgress(0); }), "native write failure is not reported as synchronization success");
@@ -180,8 +202,25 @@ int main(int argc, char **argv) {
             c.books()[1].toMap()["syncResult"].toString().contains("BookOrbit"), "batch exposes an independent result for each book");
     blockedPath.clear();
     require(wait(c,[&] { c.syncAll(); }), "batch retry reconciles both downloaded books");
+    fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/18/1)";
+    const int beforePagePosts = requests(root, "POST /api/v1/books/files/101/progress");
+    write(fault,"progress_page");
+    require(!wait(c,[&] { c.syncProgress(0); }) && c.status().contains("страниц") &&
+            requests(root, "POST /api/v1/books/files/101/progress") == beforePagePosts,
+            "server page number blocks outgoing POST and remains intact on retry");
+    require(!wait(c,[&] { c.syncProgress(0); }) && c.status().contains("страниц") &&
+            requests(root, "POST /api/v1/books/files/101/progress") == beforePagePosts,
+            "server page number survives blocked upload");
+    write(fault,"progress_page_conflict");
+    require(!wait(c,[&] { c.syncProgress(0); }) && c.progressConflict(), "page-number record can still require explicit conflict choice");
+    require(!wait(c,[&] { c.resolveProgress(true); }) && c.status().contains("страниц") &&
+            requests(root, "POST /api/v1/books/files/101/progress") == beforePagePosts,
+            "explicit local choice cannot erase remote page number");
     write(fault,"changed");
+    const int beforeChangedPosts=requests(root,"POST /api/v1/books/files/101/progress");
     require(!wait(c,[&] { c.syncProgress(0); }) && c.status().contains("EPUB"), "reject changed server EPUB under same file ID");
+    require(requests(root,"POST /api/v1/books/files/101/progress")==beforeChangedPosts,
+            "changed server EPUB never reaches progress POST");
     write(fault,"");
     networkAvailable=false;
     require(!wait(c,[&] { c.syncProgress(0); }) && !c.busy(), "network failure leaves durable progress available for retry");
@@ -198,6 +237,20 @@ int main(int argc, char **argv) {
     QObject::connect(&poll, &QTimer::timeout, &covers, [&] { if (!c.coverUrl(1).isEmpty() && !c.coverUrl(2).isEmpty()) covers.quit(); });
     poll.start(20); QTimer::singleShot(10000, &covers, &QEventLoop::quit); covers.exec();
     require(!c.coverUrl(1).isEmpty() && !c.coverUrl(2).isEmpty() && c.coverUrl(3).isEmpty(), "covers cached; absent cover stays empty");
+    const int cachedCoverRequests=requests(root,"GET /api/v1/books/1/thumbnail");
+    require(wait(c,[&] { c.refresh(1); }) && wait(c,[&] { c.refresh(0); }) &&
+            requests(root,"GET /api/v1/books/1/thumbnail")==cachedCoverRequests,
+            "catalog page change reuses versioned cover without a second GET");
+    write(fault,"cover_unknown");
+    require(wait(c,[&] { c.refresh(0); }), "catalog with unknown cover version");
+    QEventLoop unknownCover;
+    QTimer unknownPoll;
+    QObject::connect(&unknownPoll,&QTimer::timeout,&unknownCover,[&] {
+        if (requests(root,"GET /api/v1/books/1/thumbnail")>cachedCoverRequests) unknownCover.quit();
+    });
+    unknownPoll.start(20); QTimer::singleShot(10000,&unknownCover,&QEventLoop::quit); unknownCover.exec();
+    require(requests(root,"GET /api/v1/books/1/thumbnail")>cachedCoverRequests,
+            "unknown cover version triggers online recheck");
     write(fault, "cover_removed");
     require(wait(c, [&] { c.refresh(0); }) && c.coverUrl(1).isEmpty() && !QFile::exists(scope+"/cover-1.png"), "removed cover deletes cached image");
     write(fault, "cover_changed");
@@ -207,6 +260,16 @@ int main(int argc, char **argv) {
     QObject::connect(&changedPoll, &QTimer::timeout, &changedCover, [&] { if (!c.coverUrl(1).isEmpty()) changedCover.quit(); });
     changedPoll.start(20); QTimer::singleShot(10000, &changedCover, &QEventLoop::quit); changedCover.exec();
     require(!c.coverUrl(1).isEmpty(), "changed cover fetched after invalidation");
+    const int before404=requests(root,"GET /api/v1/books/1/thumbnail");
+    write(fault,"cover_404");
+    require(wait(c,[&] { c.refresh(0); }), "catalog still advertises unavailable cover");
+    QEventLoop missingCover;
+    QTimer missingPoll;
+    QObject::connect(&missingPoll,&QTimer::timeout,&missingCover,[&] { if (c.coverUrl(1).isEmpty()) missingCover.quit(); });
+    missingPoll.start(20); QTimer::singleShot(10000,&missingCover,&QEventLoop::quit); missingCover.exec();
+    require(c.coverUrl(1).isEmpty() && !QFile::exists(scope+"/cover-1.png") &&
+            requests(root,"GET /api/v1/books/1/thumbnail")>before404,
+            "thumbnail 404 deletes cached cover");
     write(fault, "");
     require(wait(c, [&] { c.refresh(0, "no such title"); }), "empty search");
     require(c.books().isEmpty(), "empty catalog shown");
@@ -229,17 +292,32 @@ int main(int argc, char **argv) {
     write(fault, "");
     require(wait(c, [&] { c.retry(); }), "retry succeeds");
     require(c.localFile(0) == file, "identical redownload keeps file identity");
+    const auto progressBeforeRepair = QJsonDocument::fromJson(contents(scope+"/records/101.json")).object()["progress"].toObject();
     write(file, QByteArray(contents(file).size(), 'x'));
     c.open(0);
     require(c.localFile(0).isEmpty() && c.books().size() == 2 && c.books()[0].toMap()["needsRepair"].toBool(), "corruption preserves library entry with repair action");
     require(wait(c, [&] { c.download(0); }), "redownload repairs corruption");
     const auto repaired = c.localFile(0);
     require(!repaired.isEmpty() && repaired != file, "repair switches to a new EPUB path");
+    require(QJsonDocument::fromJson(contents(scope+"/records/101.json")).object()["progress"].toObject()==progressBeforeRepair,
+            "same-hash repair retains durable progress journal");
+    const auto recordPath = scope+"/records/101.json";
+    require(QFile::rename(recordPath,recordPath+".saved") && QDir().mkdir(recordPath),
+            "inject record failure before changed-content replacement");
     write(fault, "changed");
+    require(!wait(c,[&] { c.download(0); }) && c.localFile(0)==repaired,
+            "failed changed-content record write keeps previous EPUB");
+    require(QDir().rmdir(recordPath) && QFile::rename(recordPath+".saved",recordPath),
+            "restore record before restart checkpoint");
+    Client beforeReplacement(endpoint,root);
+    require(QJsonDocument::fromJson(contents(recordPath)).object()["progress"].toObject()==progressBeforeRepair &&
+            !beforeReplacement.localFile(0).isEmpty(),
+            "restart between failed and completed replacement keeps same-EPUB progress");
     require(wait(c, [&] { c.download(0); }) && c.localFile(0) != repaired, "changed EPUB under same ID gets a new path");
     const auto changedFile = c.localFile(0);
+    require(!QJsonDocument::fromJson(contents(scope+"/records/101.json")).object().contains("progress"),
+            "changed EPUB starts without previous progress journal");
     require(QFile::exists(changedFile) && !QFile::exists(repaired), "old closed version cleaned after switch");
-    const auto recordPath = scope+"/records/101.json";
     require(QFile::rename(recordPath, recordPath+".saved") && QDir().mkdir(recordPath), "inject metadata write failure");
     write(fault, "");
     require(!wait(c, [&] { c.download(0); }) && c.localFile(0) == changedFile, "failed metadata write preserves current EPUB");
@@ -249,8 +327,12 @@ int main(int argc, char **argv) {
     require(!afterFailure.localFile(0).isEmpty(), "restart after metadata failure keeps previous book");
     const QString orphan = scope+"/101-"+QUuid::createUuid().toString(QUuid::WithoutBraces)+".epub";
     write(orphan, "orphan");
+    const QString orphanPart = scope+"/101-"+QUuid::createUuid().toString(QUuid::WithoutBraces)+".part";
+    write(orphanPart, "partial");
+    write(orphanPart+".ABC123", "partial temporary");
     Client afterCrash(endpoint, root);
-    require(!QFile::exists(orphan), "restart removes unreferenced version");
+    require(!QFile::exists(orphan) && !QFile::exists(orphanPart) && !QFile::exists(orphanPart+".ABC123"),
+            "restart removes only owned unreferenced versions and partial downloads");
     require(QFile::rename(recordPath, recordPath+".saved"), "save record before corruption test");
     write(recordPath, "{");
     Client badRecord(endpoint, root);
@@ -270,7 +352,7 @@ int main(int argc, char **argv) {
     write(fault, "");
     require(wait(c, [&] { c.retry(); }), "catalog retry succeeds");
     require(wait(c, [&] { c.logout(); }), "server logout completes");
-    require(!c.authenticated() && !c.hasSavedPassword() && !QFile::exists(sessionFile) && c.books().size() == 2,
+    require(!c.authenticated() && !c.hasSavedSession() && !QFile::exists(sessionFile) && c.books().size() == 2,
             "logout clears saved credentials and keeps downloads");
     require(wait(c, [&] { c.login("demo", "demo"); }), "new session after logout");
     write(fault, "always401");
@@ -496,10 +578,15 @@ int main(int argc, char **argv) {
     require(!wait(features, [&] { features.openCollection(99, "Удалённая коллекция"); }) && features.books().isEmpty(), "deleted collection does not fall back to global catalog");
     write(fault, "renew");
     require(wait(features, [&] { features.showCollections(); }) && features.authenticated(), "collection 401 renews session and retries array response");
-    require(wait(features, [&] { features.openCollection(12, "Общая библиотека"); }), "collection before password renewal");
+    require(wait(features, [&] { features.openCollection(12, "Общая библиотека"); }), "collection before token expiry");
     write(fault, "relogin");
-    require(wait(features, [&] { features.refresh(1); }) && features.collectionId() == 12 && features.page() == 1 && features.total() == 23,
-            "expired refresh token relogin resumes the same collection page");
+    require(!wait(features, [&] { features.refresh(1); }) && !features.authenticated() && !features.hasSavedSession(),
+            "rejected refresh token clears saved session and requests a password");
+    require(wait(features, [&] { features.login("demo", "demo"); }) &&
+            wait(features, [&] { features.openCollection(12, "Общая библиотека"); }) &&
+            wait(features, [&] { features.refresh(1); }) &&
+            features.collectionId() == 12 && features.page() == 1 && features.total() == 23,
+            "explicit login restores access to collection page");
     write(fault, "bad_collections");
     require(!wait(features, [&] { features.showCollections(); }) && features.collections().isEmpty(), "reject wrong collection response shape");
     write(fault, "features");
@@ -513,11 +600,35 @@ int main(int argc, char **argv) {
     require(features.detailVisible() && features.detail()["bookId"].toInt() == 1 && features.collectionId() == 11 &&
             restoredView["catalogY"].toDouble() == 120 && restoredView["detailY"].toDouble() == 250,
             "back from linked collection restores the previous book and navigation context");
+    const int rssBefore=rssKiB();
+    for (int step=0; step<100; ++step) {
+        require(wait(features,[&] { features.showDetail(1); }), "navigation detail loads");
+        require(wait(features,[&] { features.openCollection(step%2 ? 11 : 12, "Коллекция"); }), "navigation collection loads");
+    }
+    bool bounded=true;
+    for (int step=0; step<16; ++step) bounded &= !features.backFromCollection().isEmpty();
+    bounded &= features.backFromCollection().isEmpty();
+    require(bounded, "100 collection transitions retain at most 16 history entries");
+    const int rssAfter=rssKiB();
+    std::printf("RSS navigation KiB: before=%d after=%d delta=%d\n",rssBefore,rssAfter,rssAfter-rssBefore);
     write(fault, "error");
     require(!wait(features, [&] { features.refreshDetail(); }) && features.detail()["description"].toString().contains("Аннотация"),
             "failed detail refresh preserves known metadata and downloaded actions");
     write(fault, "");
     require(features.configure("https://books.example.test", "other") && !features.detailVisible() && features.collections().isEmpty() && features.books().isEmpty(),
             "account change clears details, collections and file selection context");
+    const QString coverRoot=root+"/cover-limit-check";
+    const QString coverKey=QString::fromLatin1(QCryptographicHash::hash((endpoint.toString()+"\n").toUtf8(),QCryptographicHash::Sha256).toHex().left(24));
+    const QString coverScope=coverRoot+"/"+coverKey;
+    require(QDir().mkpath(coverScope), "create isolated cover cache");
+    QJsonObject manyVersions;
+    for (int id=1000; id<1070; ++id) {
+        write(coverScope+"/cover-"+QString::number(id)+".png", "transient");
+        manyVersions[QString::number(id)]="v1";
+    }
+    write(coverScope+"/cover-index.json",QJsonDocument(manyVersions).toJson());
+    Client boundedCache(endpoint,coverRoot,nullptr,false);
+    require(QDir(coverScope).entryList({"cover-*.png"},QDir::Files).size()==64,
+            "restart bounds transient cover cache to 64 files");
     std::puts("PASS: stage 3 client checks");
 }

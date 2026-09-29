@@ -1,6 +1,7 @@
 // Production QML and native firmware adapter, isolated fixture/account/files only.
 #include "client.h"
 #include "device.h"
+#include "check_wait.h"
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -25,17 +26,10 @@ static void settle(int ms = 250) {
     QEventLoop loop; QTimer::singleShot(ms, &loop, &QEventLoop::quit); loop.exec();
 }
 static bool wait(Client &client, const std::function<void()> &action) {
-    QEventLoop loop; bool done = false, ok = false;
-    auto connection = QObject::connect(&client, &Client::completed, &loop, [&](const QString &op, bool success) {
-        if (op == "settings") return;
-        done = true; ok = success; loop.quit();
-    });
-    QTimer::singleShot(0, &loop, action);
-    QTimer::singleShot(25000, &loop, &QEventLoop::quit); loop.exec();
-    QObject::disconnect(connection);
+    const bool ok = waitForClient(client, action);
     if (!ok) std::fprintf(stderr, "%s\n", qPrintable(client.status()));
     settle();
-    return done && ok;
+    return ok;
 }
 
 int main(int argc, char **argv) {
