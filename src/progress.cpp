@@ -69,6 +69,15 @@ struct Zip {
     }
 };
 QString tag(const QDomElement &e) { return e.tagName().section(':',-1); }
+bool precedingHeading(const QDomNode &node, const QDomNode &target, QString &heading) {
+    const QString name=tag(node.toElement());
+    if (name.size()==2 && name[0]=='h' && name[1]>='1' && name[1]<='6')
+        heading=node.toElement().text().simplified().left(120);
+    if (node==target) return true;
+    for (auto child=node.firstChild(); !child.isNull(); child=child.nextSibling())
+        if (precedingHeading(child,target,heading)) return true;
+    return false;
+}
 bool xml(const QByteArray &bytes, QDomDocument &doc) {
     if (bytes.isEmpty()) return false;
     QXmlStreamReader reader(bytes); int depth=0, nodes=0;
@@ -131,7 +140,9 @@ QString nativeCfi(const QString &position) {
     return {};
 }
 
-bool epubPosition(const QString &path, const QString &cfi, double *percentage, QString *point) {
+bool epubPosition(const QString &path, const QString &cfi, double *percentage, QString *point, QVariantMap *context) {
+    if (context) context->clear();
+    QVariantMap resolvedContext;
     if (cfi.size()>4096 || !cfi.startsWith("epubcfi(") || !cfi.endsWith(')')) return false;
     const auto range=cfi.mid(8,cfi.size()-9).split(',');
     if (range.size()!=1 && range.size()!=3) return false;
@@ -186,11 +197,18 @@ bool epubPosition(const QString &path, const QString &cfi, double *percentage, Q
                 if (std::lexicographical_compare(lastOrder.begin(),lastOrder.end(),firstOrder.begin(),firstOrder.end())) return false;
             }
             position=total+before;
+            if (context) {
+                QString heading;
+                precedingHeading(content.documentElement(),target,heading);
+                resolvedContext={{"chapter",heading},
+                    {"excerpt",content.documentElement().text().mid(before,160).simplified()}};
+            }
         }
         total+=textSize(content.documentElement());
     }
     if (position<0 || total<=0 || position>total) return false;
     if (percentage) *percentage=100.0*double(position)/double(total);
     if (point) *point="epubcfi("+parts[0]+"!"+start+")";
+    if (context) *context=resolvedContext;
     return true;
 }

@@ -3,4 +3,14 @@ __pycache__/
 build/
 *.app
 .DS_Store
-/tools/
+/tools/*
+!/tools/client_check.cpp
+!/tools/catalog_ui_check.cpp
+!/tools/native_sync_check.cpp
+!/tools/reader_state_check.cpp
+!/tools/check_wait.h
+!/tools/check_stage3.py
+!/tools/mock_bookorbit.py
+!/tools/test_mock.py
+!/tools/fixture_position.py
+!/tools/inspect_position.py

@@ -16,6 +16,7 @@
 #include <QImage>
 #include <QRegularExpression>
 #include <QSet>
+#include <QMap>
 #include <QUuid>
 #include <QDateTime>
 #include <QSslConfiguration>
@@ -419,6 +420,7 @@ QVariantMap Client::bookSummary(const QJsonObject &book) const {
         {"fileCount", book["files"].toArray().size()}, {"localFormats", localFormats.join(", ")}, {"formats", formats.join(", ")},
         {"downloaded", downloaded}, {"readable", readableFormat(format)}, {"canSync", downloaded && format == "epub"},
         {"syncResult", syncResults[id].toString()}, {"pendingProgress", progress["pending"].isObject()},
+        {"remoteFileChanged", record["remoteFileChanged"].toBool()},
         {"hasConflict", progress["conflictRemote"].isObject()},
         {"supported", !pathFor(book).isEmpty() && file["sizeBytes"].toDouble() <= maxBook},
         {"needsRepair", !record.isEmpty() && !downloaded}};
@@ -428,6 +430,130 @@ QVariantList Client::books() const {
     QVariantList result;
     for (const auto value : visibleItems()) result.append(bookSummary(value.toObject()));
     return result;
+}
+
+QVariantMap Client::syncFileStatus(const QString &id, const QString &profile) const {
+    const auto record=downloads.value(id).toObject(), progress=record["progress"].toObject();
+    const auto saved=record["syncStatus"].toObject();
+    const bool sameProfile=saved["profile"].toString()==profile;
+    const bool progressProfile=progress.contains("profile") && progress["profile"].toString()==profile;
+    QString state=sameProfile ? saved["state"].toString("unknown") : "unknown";
+    QString reason=sameProfile ? saved["text"].toString() : QString{};
+    const auto book=record["book"].toObject();
+    const bool available=!localFile(book).isEmpty();
+    if (record["remoteFileChanged"].toBool()) {
+        state="file"; reason="Файл на сервере отличается. Скачайте новую версию перед обменом позицией.";
+    } else if (!available) {
+        state="file"; reason="Локальный EPUB отсутствует или повреждён. Скачайте его заново.";
+    } else if (progressProfile && progress["conflictRemote"].isObject()) state="conflict";
+    else if (progressProfile && progress["outgoing"].isObject()) state="uncertain";
+    else if (progressProfile && progress["pending"].isObject() && (state=="synced" || state=="unknown")) state="pending";
+    static const QMap<QString,QString> labels{
+        {"synced","Синхронизировано"},{"conflict","Выберите позицию"},{"reader","Закройте читалку"},
+        {"reader_unknown","Не удалось проверить читалку"},{"network","Ожидает сети"},
+        {"pending","Позиция ещё не применена"},{"uncertain","Нужно проверить результат"},
+        {"unknown","Ещё не проверено"},{"auth","Войдите в BookOrbit"},{"file","Проверьте файл EPUB"},
+        {"position","Не удалось сопоставить позицию"},{"error","Не удалось синхронизировать"}};
+    if (!labels.contains(state)) state="unknown";
+    if (state=="unknown") reason="Выполните сверку, чтобы узнать состояние позиции.";
+    const auto at=QDateTime::fromString(saved["at"].toString(),Qt::ISODate).toLocalTime();
+    return {{"fileId",id.toInt()},{"filename",book["selectedFile"].toObject()["filename"].toString(record["filename"].toString())},
+        {"state",state},{"label",labels[state]},{"reason",reason},{"available",available},
+        {"checkedAt",sameProfile && at.isValid() ? at.toString("dd.MM.yyyy HH:mm") : QString{}}};
+}
+
+QVariantList Client::syncBooks() const {
+    QMap<QString,QVariantMap> grouped;
+    const QString profile=readerProfile();
+    const QStringList priority{"conflict","file","position","reader","reader_unknown","error","auth","pending","uncertain","network","unknown","synced"};
+    for (auto it=downloads.begin(); it!=downloads.end(); ++it) {
+        const auto record=it.value().toObject();
+        if (record["format"].toString("epub")!="epub") continue;
+        const auto book=record["book"].toObject();
+        const QString key=positiveId(book["id"]) ? "book:"+QString::number(book["id"].toInt()) : "file:"+it.key();
+        const auto file=syncFileStatus(it.key(),profile);
+        auto &entry=grouped[key];
+        if (entry.isEmpty()) entry={{"key",key},{"title",book["title"].toString("Без названия")},
+            {"author",authorNames(book["authors"].toArray())},{"state","synced"},{"label","Синхронизировано"}};
+        auto files=entry["files"].toList(); files.append(file); entry["files"]=files;
+        if (priority.indexOf(file["state"].toString())<=priority.indexOf(entry["state"].toString())) {
+            entry["state"]=file["state"]; entry["label"]=file["label"];
+        }
+    }
+    QVariantList result;
+    for (const auto &entry : grouped) result.append(entry);
+    std::stable_sort(result.begin(),result.end(),[&priority](const QVariant &a,const QVariant &b) {
+        const auto left=a.toMap(),right=b.toMap();
+        const int l=priority.indexOf(left["state"].toString()),r=priority.indexOf(right["state"].toString());
+        return l!=r ? l<r : QString::localeAwareCompare(left["title"].toString(),right["title"].toString())<0;
+    });
+    return result;
+}
+
+QVariantMap Client::syncSummary() const {
+    const auto books=syncBooks();
+    int synced=0;
+    for (const auto &book : books) if (book.toMap()["state"]=="synced") ++synced;
+    QSet<int> unsupported,epubs;
+    for (const auto value : downloads) {
+        const auto record=value.toObject(); const int id=record["book"].toObject()["id"].toInt();
+        if (record["format"].toString("epub")=="epub") epubs.insert(id); else unsupported.insert(id);
+    }
+    unsupported.subtract(epubs);
+    return {{"total",books.size()},{"synced",synced},{"attention",books.size()-synced},{"unsupported",unsupported.size()}};
+}
+
+void Client::syncFile(int fileId) {
+    if (working || !downloads.contains(QString::number(fileId))) return;
+    dismissConflict(); syncBook(QString::number(fileId));
+}
+
+void Client::showSyncFile(int fileId) {
+    if (working || !downloads.contains(QString::number(fileId))) return;
+    ++detailGeneration;
+    detailBook=downloads.value(QString::number(fileId)).toObject()["book"].toObject();
+    detailMessage="Сведения сохранены на устройстве";
+    emit changed();
+}
+
+void Client::connectForSync() {
+    if (working) return;
+    if (ensureNetwork()) { message="Сеть подключена. Теперь повторите сверку."; emit changed(); }
+}
+
+void Client::prepareConflict(const QString &id,const QString &local,const QJsonObject &remote,const QString &profile) {
+    const bool different=conflictId!=id || conflictLocal!=local || conflictRemote!=remote || conflictProfile!=profile;
+    conflictId=id; conflictLocal=local; conflictRemote=remote; conflictProfile=profile;
+    conflictMessage=downloads.value(id).toObject()["book"].toObject()["title"].toString();
+    const auto record=downloads.value(id).toObject();
+    const QString path=localFile(record["book"].toObject());
+    const bool sameFile=!path.isEmpty() && digestFile(path)==record["sha256"].toString().toLatin1();
+    bool other=false;
+    for (const auto key : {"pageNumber","positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
+            "koboLocationType","koboLocationValue","koboContentSourceProgressPercent","koreaderProgress","narrationPercentage","narrationUpdatedAt"})
+        if (remote.contains(key) && !remote[key].isNull()) other=true;
+    positionChoices.clear();
+    for (bool useLocal : {true,false}) {
+        QVariantMap context; double percentage=0;
+        const auto cfi=useLocal ? local : remote["cfi"].toString();
+        const bool valid=sameFile && epubPosition(path,cfi,&percentage,nullptr,&context);
+        context["source"]=useLocal ? "На этом PocketBook" : "В BookOrbit";
+        context["local"]=useLocal;
+        context["percentage"]=valid ? QString("Около %1% книги").arg(QString::number(percentage,'f',1).replace('.',',')) : cfi.isEmpty() ? "Позиция ещё не сохранена" : "Координата не подходит к этому EPUB";
+        context["canUse"]=valid && !(useLocal && other) && !record["remoteFileChanged"].toBool();
+        context["notice"]=useLocal && other ? "Отправка остановлена, чтобы сохранить другие серверные координаты." : QString{};
+        positionChoices.append(context);
+    }
+    if (different) ++positionRevision;
+}
+
+void Client::inspectConflict(int fileId) {
+    if (working) return;
+    const QString id=QString::number(fileId);
+    const auto progress=downloads.value(id).toObject()["progress"].toObject();
+    if (!progress["conflictRemote"].isObject() || progress["profile"].toString()!=readerProfile()) return;
+    prepareConflict(id,progress["conflictLocal"].toString(),progress["conflictRemote"].toObject(),progress["profile"].toString());
+    emit changed();
 }
 
 QVariantMap Client::detail() const {
@@ -442,7 +568,7 @@ QVariantMap Client::detail() const {
         book["selectedFile"] = value;
         auto file = value.toObject().toVariantMap();
         const auto info = bookSummary(book);
-        for (const auto key : {"downloaded", "readable", "supported", "needsRepair"}) file[key] = info[key];
+        for (const auto key : {"downloaded", "readable", "supported", "needsRepair", "remoteFileChanged", "syncResult"}) file[key] = info[key];
         file["format"] = fileFormat(value.toObject()).toUpper();
         const double bytes = value.toObject()["sizeBytes"].toDouble(-1);
         file["sizeLabel"] = bytes < 0 ? QString{} : bytes < 1024 ? QString::number(bytes, 'f', 0)+" Б" : bytes < 1024*1024 ? QString::number(bytes/1024, 'f', 0)+" КБ" : QString::number(bytes/(1024*1024), 'f', 1)+" МБ";
@@ -616,28 +742,69 @@ QVariantMap Client::backFromCollection() {
     return {{"query", retryQuery}, {"catalogY", saved["catalogY"].toDouble()}, {"detailY", saved["detailY"].toDouble()}};
 }
 
-void Client::finish(const QString &text, bool success, const QString &operation) {
-    working = false;
+void Client::finish(QString text, bool success, const QString &operation, const QString &syncState) {
+    working = syncingAll || checkingLibrary;
     activeDownload.clear();
     if (!success && retryKind == 3 && detailVisible()) detailMessage = text;
     if (success) retryKind = 0;
+    const bool hasFile = !syncingId.isEmpty();
+    if (hasFile && !checkingLibrary) {
+        auto record=downloads.value(syncingId).toObject();
+        record["syncStatus"]=QJsonObject{{"state",syncState.isEmpty() ? (success ? "synced" : "error") : syncState},
+            {"text",text},{"at",QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},{"profile",readerProfile()}};
+        if (!saveRecord(syncingId,record)) {
+            success=false;
+            text="Не удалось сохранить результат сверки. Повторите после устранения ошибки записи.";
+            record["syncStatus"]=QJsonObject{{"state","error"},{"text",text},{"profile",readerProfile()}};
+            downloads[syncingId]=record;
+        }
+    }
     message = text;
     logEvent(operation, success ? 0 : 1);
-    if (!syncingId.isEmpty()) {
-        syncResults[syncingId]=text;
+    if (hasFile) {
+        if (!checkingLibrary || !verificationCancelled) syncResults[syncingId]=text;
         syncingId.clear();
     }
-    if (syncingAll) {
-        if (success) ++syncSucceeded;
+    if (syncingAll || checkingLibrary) {
+        if (checkingLibrary) {
+            if (hasFile && !verificationCancelled) {
+                if (success) ++syncSucceeded;
+                else if (operation == "verify-different") ++verificationDifferent;
+                else ++verificationErrors;
+            }
+            if (verificationCancelled || !authenticated()) syncQueue.clear();
+        } else if (success) ++syncSucceeded;
         dismissConflict(); // Each unresolved conflict remains in its book record for individual retry.
         if (!syncQueue.isEmpty()) {
             working=true;
             emit changed();
-            QTimer::singleShot(0,this,[this] { working=false; syncBook(syncQueue.takeFirst()); });
+            QTimer::singleShot(0,this,[this] {
+                working=false;
+                if (checkingLibrary && verificationCancelled) {
+                    finish("Проверка отменена",false,"verify"); return;
+                }
+                const auto id=syncQueue.takeFirst();
+                if (checkingLibrary) verifyBook(id);
+                else syncBook(id);
+            });
+            return;
+        }
+        if (checkingLibrary) {
+            checkingLibrary=false;
+            working=false;
+            const int unchecked=syncCount-syncSucceeded-verificationDifferent-verificationErrors;
+            message=QString("%1. Файлов: %2; совпало: %3; отличается: %4; ошибок: %5; не проверено: %6. Результаты — на карточках книг.")
+                .arg(verificationCancelled ? "Проверка отменена" : !authenticated() ? "Проверка остановлена: войдите снова" : "Проверка завершена")
+                .arg(syncCount).arg(syncSucceeded).arg(verificationDifferent).arg(verificationErrors).arg(unchecked);
+            emit changed();
+            emit completed("verify",!verificationCancelled && syncSucceeded==syncCount);
             return;
         }
         syncingAll=false;
-        message=QString("Сверка завершена: %1 из %2 без ошибок. Результаты — на карточках книг.").arg(syncSucceeded).arg(syncCount);
+        working=false;
+        const auto summary=syncSummary();
+        message=QString("Сверка завершена. Синхронизировано книг: %1 из %2. Требуют действия: %3.")
+            .arg(summary["synced"].toInt()).arg(summary["total"].toInt()).arg(summary["attention"].toInt());
         emit changed();
         emit completed("sync",syncSucceeded==syncCount);
         return;
@@ -719,15 +886,17 @@ void Client::renewSession(const std::function<void()> &resume) {
 
 bool Client::ensureNetwork() {
     if (connectNetwork()) return true;
-    finish("Wi-Fi не подключён. Подключитесь к сети и повторите действие.", false, "network");
+    finish("Wi-Fi не подключён. Подключитесь к сети и повторите действие.", false, "network", "network");
     return false;
 }
 
 void Client::jsonRequest(const QString &path, const QJsonObject &payload, const Callback &callback, bool renew, bool get, bool arrayResponse) {
+    if (checkingLibrary && verificationCancelled) { finish("Проверка отменена",false,"verify"); return; }
     if (!ensureNetwork()) return;
     auto request = this->request(path);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     auto reply = get ? network.get(request) : network.post(request, QJsonDocument(payload).toJson(QJsonDocument::Compact));
+    if (checkingLibrary) activeVerification=reply;
     auto bytes = std::make_shared<QByteArray>();
     connect(reply, &QNetworkReply::readyRead, this, [reply, bytes] {
         bytes->append(reply->readAll());
@@ -737,6 +906,8 @@ void Client::jsonRequest(const QString &path, const QJsonObject &payload, const 
     QTimer::singleShot(20000, reply, [reply] { if (!reply->isFinished()) reply->abort(); });
     connect(reply, &QNetworkReply::finished, this, [this, reply, bytes, callback, path, payload, renew, get, arrayResponse] {
         reply->deleteLater();
+        if (activeVerification==reply) activeVerification.clear();
+        if (checkingLibrary && verificationCancelled) { finish("Проверка отменена",false,"verify"); return; }
         bytes->append(reply->readAll());
         const int code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         logEvent(path.section('?', 0, 0), int(reply->error()), code);
@@ -758,7 +929,7 @@ void Client::jsonRequest(const QString &path, const QJsonObject &payload, const 
                    reply->error() == QNetworkReply::TimeoutError || reply->error() == QNetworkReply::OperationCanceledError ? "Время подключения истекло. Проверьте сеть и повторите." :
                    code == 401 ? "Вход не выполнен или сессия истекла. Войдите снова." :
                    code >= 400 ? "Сервер ответил HTTP "+QString::number(code)+". Проверьте адрес и повторите." :
-                   "Сервер недоступен. Скачанные книги можно читать без сети.", false, path);
+                   "Сервер недоступен. Скачанные книги можно читать без сети.", false, path, code==401 ? "auth" : "error");
             return;
         }
         if (!get && path.endsWith("/progress") && bytes->trimmed().isEmpty()) { callback({}); return; }
@@ -935,6 +1106,15 @@ void Client::downloadBook(const QJsonObject &book, bool renew) {
         if (downloads.value(id).toObject()["sha256"] == newHash &&
             !localFile(book).isEmpty() && digestFile(oldFile) == newHash.toLatin1()) {
             output->cancelWriting();
+            auto record=downloads.value(id).toObject();
+            if (record.contains("remoteFileChanged")) {
+                record.remove("remoteFileChanged");
+                record.remove("syncStatus");
+                if (!saveRecord(id,record)) {
+                    finish("Не удалось сохранить результат загрузки. Прежняя книга доступна.",false,"download"); return;
+                }
+            }
+            syncResults.remove(id);
             rememberFile(book);
             finish("Книга уже скачана", true, "download"); return;
         }
@@ -956,6 +1136,7 @@ void Client::downloadBook(const QJsonObject &book, bool renew) {
             QFile::remove(finalPath);
             finish("Запись загрузки не сохранена. Прежняя книга доступна.", false, "download"); return;
         }
+        syncResults.remove(id);
         if (!previous.isEmpty() && oldFile != finalPath && QFile::exists(oldFile) &&
             QFileInfo(oldFile).canonicalPath() == QFileInfo(oldFile).absolutePath() &&
             readerFileState(oldFile) == ReaderFileState::Closed)
@@ -1270,6 +1451,7 @@ void Client::fetchNextCover() {
 
 void Client::dismissConflict() {
     conflictId.clear(); conflictProfile.clear(); conflictLocal.clear(); conflictRemote={}; conflictMessage.clear();
+    positionChoices.clear();
     emit changed();
 }
 
@@ -1286,8 +1468,7 @@ void Client::syncAll() {
     if (!authenticated()) { finish("Для синхронизации войдите на сервер",false,"sync"); return; }
     syncQueue.clear(); syncResults={};
     for (auto it=downloads.begin(); it!=downloads.end(); ++it)
-        if (it.value().toObject()["format"].toString("epub") == "epub" &&
-            !localFile(it.value().toObject()["book"].toObject()).isEmpty()) syncQueue.append(it.key());
+        if (it.value().toObject()["format"].toString("epub") == "epub") syncQueue.append(it.key());
     if (syncQueue.isEmpty()) { finish("Нет скачанных книг для синхронизации",true,"sync"); return; }
     dismissConflict();
     syncingAll=true; syncCount=syncQueue.size(); syncSucceeded=0;
@@ -1298,40 +1479,101 @@ void Client::resolveProgress(bool useLocal) {
     if (!working && !conflictId.isEmpty()) syncBook(conflictId,useLocal?1:2);
 }
 
-void Client::verifyRemoteFile(const QString &id, const std::function<void()> &resume, bool renew) {
+void Client::verifyLibrary() {
+    if (working) return;
+    if (!authenticated()) { finish("Для проверки библиотеки войдите на сервер",false,"verify"); return; }
+    syncQueue=downloads.keys();
+    if (syncQueue.isEmpty()) { finish("Нет скачанных файлов для проверки",true,"verify"); return; }
+    dismissConflict(); stopCovers(); retryKind=0;
+    checkingLibrary=true; verificationCancelled=false;
+    syncCount=syncQueue.size(); syncSucceeded=verificationDifferent=verificationErrors=0;
+    verifyBook(syncQueue.takeFirst());
+}
+
+void Client::cancelLibraryVerification() {
+    if (!checkingLibrary) return;
+    verificationCancelled=true;
+    if (activeVerification) activeVerification->abort();
+    // Between files the queued continuation completes cancellation before starting another file.
+}
+
+void Client::verifyBook(const QString &id) {
+    syncingId=id;
+    const auto record=downloads.value(id).toObject();
+    const auto path=recordFile(id,record);
+    const QFileInfo info(path);
+    working=true;
+    message=QString("Проверка файла %1 из %2: %3 (%4, fileId %5)…")
+        .arg(syncCount-syncQueue.size()).arg(syncCount)
+        .arg(record["book"].toObject()["title"].toString())
+        .arg(record["format"].toString("epub").toUpper(),id);
+    emit changed();
+    if (verificationCancelled) { finish("Проверка отменена",false,"verify"); return; }
+    if (path.isEmpty() || !info.isFile() || info.isSymLink() || info.canonicalPath()!=info.absolutePath() ||
+        info.size()!=record["bytes"].toDouble() || digestFile(path)!=record["sha256"].toString().toLatin1()) {
+        finish("Не удалось проверить: локальный файл отсутствует или повреждён. Скачайте заново.",false,"verify"); return;
+    }
+    verifyRemoteFile(id);
+}
+
+void Client::verifyRemoteFile(const QString &id, bool renew) {
+    if (verificationCancelled) { finish("Проверка отменена",false,"verify"); return; }
     if (!ensureNetwork()) return;
     auto reply=network.get(request("/api/v1/books/files/"+id+"/download"));
+    activeVerification=reply;
     auto hash=std::make_shared<QCryptographicHash>(QCryptographicHash::Sha256);
     auto size=std::make_shared<qint64>(0);
     auto drain=[reply,hash,size] {
+        if (!reply->bytesAvailable()) return;
         const auto bytes=reply->readAll(); *size+=bytes.size();
         if (*size>maxBook) { reply->abort(); return; }
         hash->addData(bytes);
     };
     connect(reply,&QNetworkReply::readyRead,this,drain);
     QTimer::singleShot(120000,reply,[reply] { if (!reply->isFinished()) reply->abort(); });
-    connect(reply,&QNetworkReply::finished,this,[this,reply,id,resume,renew,drain,hash,size] {
+    connect(reply,&QNetworkReply::finished,this,[this,reply,id,renew,drain,hash,size] {
         drain(); reply->deleteLater();
+        activeVerification.clear();
+        if (verificationCancelled) { finish("Проверка отменена",false,"verify"); return; }
         const int code=reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        logEvent("progress file verification",int(reply->error()),code);
+        logEvent("library file verification",int(reply->error()),code);
         if (code==401 && renew && !refreshToken.isEmpty()) {
-            renewSession([this,id,resume] { verifyRemoteFile(id,resume,false); }); return;
+            renewSession([this,id] { verifyRemoteFile(id,false); }); return;
         }
-        if (reply->error()!=QNetworkReply::NoError || code!=200 || *size>maxBook) {
-            finish("Не удалось проверить EPUB на сервере. Прогресс сохранён без изменений.",false,"progress"); return;
+        if (code==401) { token.clear(); refreshToken.clear(); stopCovers(); }
+        const auto length=reply->header(QNetworkRequest::ContentLengthHeader);
+        const auto type=reply->header(QNetworkRequest::ContentTypeHeader).toString();
+        const auto format=downloads.value(id).toObject()["format"].toString("epub");
+        if (reply->error()!=QNetworkReply::NoError || code!=200 || *size==0 || *size>maxBook ||
+            (length.isValid() && length.toLongLong()!=*size) || type.startsWith("application/json") ||
+            (type.startsWith("text/html") && format!="html" && format!="htm")) {
+            finish("Не удалось проверить файл на сервере"+(code>=400 ? QString(" (HTTP %1)").arg(code) : QString{})+".",false,"verify"); return;
         }
-        if (hash->result().toHex()!=downloads.value(id).toObject()["sha256"].toString().toLatin1()) {
-            finish("EPUB на сервере изменился. Скачайте новую версию перед обменом прогрессом.",false,"progress"); return;
+        auto record=downloads.value(id).toObject();
+        const auto path=recordFile(id,record);
+        if (digestFile(path)!=record["sha256"].toString().toLatin1()) {
+            finish("Не удалось проверить: локальный файл изменился во время проверки.",false,"verify"); return;
         }
-        resume();
+        const bool different=hash->result().toHex()!=record["sha256"].toString().toLatin1();
+        if (different) record["remoteFileChanged"]=true;
+        else record.remove("remoteFileChanged");
+        if (record!=downloads.value(id).toObject() && !saveRecord(id,record)) {
+            if (different) downloads[id]=record; // Keep the known mismatch blocked in memory even when storage fails.
+            finish("Не удалось сохранить результат проверки. Повторите проверку после устранения ошибки записи.",false,"verify"); return;
+        }
+        finish(different ? "Файл на сервере отличается. Обмен прогрессом приостановлен" : "Локальный файл совпадает с BookOrbit",
+               !different,different ? "verify-different" : "verify");
     });
 }
 
 void Client::syncBook(const QString &id, int choice) {
     if (working) return;
     syncingId=id;
-    if (!authenticated()) { finish("Для синхронизации войдите на сервер",false,"progress"); return; }
+    if (!authenticated()) { finish("Для синхронизации войдите на сервер",false,"progress","auth"); return; }
     auto record=downloads.value(id).toObject();
+    if (record["remoteFileChanged"].toBool()) {
+        finish("Файл на сервере отличается. Обмен прогрессом приостановлен",false,"progress","file"); return;
+    }
     if (record["format"].toString("epub") != "epub") {
         finish("Обмен позицией доступен только для EPUB. Файл можно читать локально.",false,"progress"); return;
     }
@@ -1339,31 +1581,33 @@ void Client::syncBook(const QString &id, int choice) {
     QString position;
     const QString profile=readerProfile();
     if (path.isEmpty() || digestFile(path)!=record["sha256"].toString().toLatin1()) {
-        finish("Скачайте действительный EPUB перед синхронизацией",false,"progress"); return;
+        finish("Скачайте действительный EPUB перед синхронизацией",false,"progress","file"); return;
     }
-    if (readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&position)) {
-        finish("Закройте книгу в штатной читалке и повторите синхронизацию. Кнопка Home оставляет книгу открытой.",false,"progress"); return;
+    const auto reader=readerFileState(path);
+    if (reader==ReaderFileState::Open) {
+        finish("Закройте книгу в штатной читалке и повторите синхронизацию. Кнопка Home оставляет книгу открытой.",false,"progress","reader"); return;
+    }
+    if (reader==ReaderFileState::Unknown || !readerPosition(path,&position)) {
+        finish("Не удалось проверить состояние читалки. Позиции не изменены; повторите проверку.",false,"progress","reader_unknown"); return;
     }
     const QString local=nativeCfi(position);
     double percentage=0;
     if ((!position.isEmpty() && local.isEmpty()) || (!local.isEmpty() && !epubPosition(path,local,&percentage))) {
-        finish("Формат локальной позиции не поддерживается. Прогресс не изменён.",false,"progress"); return;
+        finish("Формат локальной позиции не поддерживается. Прогресс не изменён.",false,"progress","position"); return;
     }
-    working=true; retryKind=0; stopCovers(); message="Проверка EPUB и прогресса…"; emit changed();
+    working=true; retryKind=0; stopCovers();
+    message=syncingAll ? QString("Проверяем файл %1 из %2: %3…").arg(syncCount-syncQueue.size()).arg(syncCount)
+        .arg(record["book"].toObject()["title"].toString()) : "Синхронизация прогресса…";
+    emit changed();
     const QString route="/api/v1/books/files/"+id+"/progress";
-    const auto state=record["progress"].toObject();
-    const bool unchangedCandidate=!choice && state["profile"].toString()==profile &&
-        state.contains("localBase") && state["localBase"].toString()==local && state["remoteBase"].isObject() &&
-        !state.contains("pending") && !state.contains("outgoing") && !state.contains("conflictRemote");
-    auto checked=[this,id,path,position,local,percentage,choice,profile,route] {
-    verifyRemoteFile(id,[this,id,path,position,local,percentage,choice,profile,route] {
+    // ponytail: trust the downloaded file identity; explicit library verification detects server replacements.
         jsonRequest(route,{},[this,id,path,position,local,percentage,choice,route,profile](const QJsonObject &remote) {
             QString current;
             if (readerProfile()!=profile || readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position) {
                 finish("Состояние читалки изменилось. Повторите синхронизацию.",false,"progress"); return;
             }
             if (digestFile(path)!=downloads.value(id).toObject()["sha256"].toString().toLatin1()) {
-                finish("Локальный EPUB изменился во время сверки. Прогресс не изменён.",false,"progress"); return;
+                finish("Локальный EPUB изменился во время сверки. Прогресс не изменён.",false,"progress","file"); return;
             }
             const QString remoteCfi=remote["cfi"].toString();
             QString cfi=remoteCfi;
@@ -1373,7 +1617,7 @@ void Client::syncBook(const QString &id, int choice) {
                 finish("Некорректный ответ сервера о прогрессе: ожидаются CFI и процент от 0 до 100. Прогресс не изменён.",false,"progress"); return;
             }
             if (!cfi.isEmpty() && !epubPosition(path,remoteCfi,nullptr,&cfi)) {
-                finish("Не удалось сопоставить серверную координату CFI с этим EPUB. Прогресс не изменён.",false,"progress"); return;
+                finish("Не удалось сопоставить серверную координату CFI с этим EPUB. Прогресс не изменён.",false,"progress","position"); return;
             }
             bool other=false;
             for (const auto key : {"positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
@@ -1382,7 +1626,7 @@ void Client::syncBook(const QString &id, int choice) {
             const bool hasPage=remote.contains("pageNumber") && !remote["pageNumber"].isNull();
             const bool remoteEmpty=cfi.isEmpty() && percent.toDouble()==0 && !hasPage && !other;
             if (cfi.isEmpty() && !remoteEmpty) {
-                finish("На сервере есть прогресс без точного CFI. Автоматический обмен невозможен.",false,"progress"); return;
+                finish("На сервере есть прогресс без точного CFI. Автоматический обмен невозможен.",false,"progress","position"); return;
             }
             auto record=downloads.value(id).toObject(); auto state=record["progress"].toObject();
             if (state.contains("profile") && state["profile"].toString()!=profile) state={};
@@ -1403,7 +1647,9 @@ void Client::syncBook(const QString &id, int choice) {
             const bool localChanged=known ? local!=state["localBase"].toString() : !local.isEmpty();
             const bool remoteChanged=known ? remoteCfi!=state["remoteBase"].toObject()["cfi"].toString() : !remoteEmpty;
             int action=0;
-            if (choice && conflictId==id && conflictProfile==profile && conflictLocal==local && conflictRemote==remote) action=choice;
+            const bool changedChoice=choice && (conflictId!=id || conflictProfile!=profile || conflictLocal!=local || conflictRemote!=remote);
+            if (changedChoice) action=0; // A stale explicit choice must never become an automatic write.
+            else if (choice) action=choice;
             else if (state.contains("profile") && !pending.isEmpty() && pending==remote && state["pendingLocal"].toString()==local && state["profile"].toString()==profile) action=2;
             else if (!known || localChanged || remoteChanged) {
                 if (localChanged && !remoteChanged) action=1;
@@ -1416,11 +1662,8 @@ void Client::syncBook(const QString &id, int choice) {
                 // Persist both versions; after restart the next GET rechecks the conflict.
                 state["conflictLocal"]=local; state["conflictRemote"]=remote;
                 if (!persist()) return;
-                conflictId=id; conflictLocal=local; conflictRemote=remote; conflictProfile=profile;
-                conflictMessage=record["book"].toObject()["title"].toString()+
-                    "\nНа ридере и сервере разные позиции. Выберите, какую использовать.\nРидер: "+
-                    (local.isEmpty()?QString("нет позиции"):QString::number(percentage,'f',1)+"% (примерно)")+"\nBookOrbit: "+QString::number(percent.toDouble(),'f',1)+"%";
-                finish("Нужно выбрать позицию чтения",false,"progress"); return;
+                if (!syncingAll) prepareConflict(id,local,remote,profile);
+                finish(changedChoice ? "Позиция изменилась во время выбора. Проверьте варианты ещё раз." : "Нужно выбрать позицию чтения",false,"progress","conflict"); return;
             }
             if (action==2) {
                 if (cfi.isEmpty()) { finish("На сервере нет точной позиции для открытия.",false,"progress"); return; }
@@ -1429,7 +1672,7 @@ void Client::syncBook(const QString &id, int choice) {
                 if (!persist()) return;
                 QString error;
                 if (!saveReaderPosition(path,position,cfi,profile,&error)) {
-                    finish(error,false,"progress"); return;
+                    finish(error,false,"progress","pending"); return;
                 }
                 state={{"localBase",cfi},{"remoteBase",remote}};
                 if (persist()) { dismissConflict(); finish("Позиция сохранена. Откройте книгу из штатной библиотеки.",true,"progress"); }
@@ -1456,15 +1699,4 @@ void Client::syncBook(const QString &id, int choice) {
                 },true,true);
             });
         },true,true);
-    });
-    };
-    if (!unchangedCandidate) { checked(); return; }
-    jsonRequest(route,{},[this,id,path,position,profile,state,checked](const QJsonObject &remote) {
-        QString current;
-        if (remote==state["remoteBase"].toObject() && readerProfile()==profile &&
-            readerFileState(path)==ReaderFileState::Closed && readerPosition(path,&current) && current==position &&
-            digestFile(path)==downloads.value(id).toObject()["sha256"].toString().toLatin1()) {
-            finish("Прогресс не изменился",true,"progress");
-        } else checked();
-    },true,true);
 }

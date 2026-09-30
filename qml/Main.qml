@@ -18,6 +18,10 @@ ApplicationWindow {
     property int pendingFileId: 0
     property bool formatDownload: false
     property bool settings: false
+    property bool syncView: false
+    property string syncFilter: "all"
+    property string syncBookKey: ""
+    readonly property var selectedSyncBook: client.syncBooks.find(book => book.key === syncBookKey) || ({})
     property bool addingConnection: false
     property bool browsingFolders: false
     property string folderPath: "/mnt/ext1"
@@ -67,7 +71,7 @@ ApplicationWindow {
         return lines.length ? lines.join("\n") : "Дополнительные сведения не указаны"
     }
     function pageContent(direction) {
-        const target = client.detailVisible ? detailScroll.contentItem : client.collectionsView ? collectionList : activeCatalog
+        const target = client.detailVisible ? detailScroll.contentItem : syncView ? (syncBookKey ? syncDetails.contentItem : syncList) : client.collectionsView ? collectionList : activeCatalog
         target.contentY = Math.max(0, Math.min(Math.max(0, target.contentHeight-target.height), target.contentY + direction*target.height*0.85))
     }
     function backCollection() {
@@ -99,10 +103,16 @@ ApplicationWindow {
         settingsScroll.contentItem.contentY = 0
     }
     function back() {
+        if (client.progressConflict) { if (!client.busy) client.dismissConflict(); return }
         if (formatDialog.visible) { formatDialog.close(); return }
         if (Qt.inputMethod.visible) { Qt.inputMethod.hide(); return }
         if (browsingFolders) { browsingFolders = false; return }
         if (addingConnection) { addingConnection = false; password.text = ""; return }
+        if (syncView && !settings && !client.detailVisible) {
+            if (syncBookKey) syncBookKey = ""
+            else syncView = false
+            return
+        }
         if (settings) { settings = false; password.text = ""; Qt.inputMethod.hide() }
         else if (client.detailVisible) { client.closeDetail(); Qt.callLater(function() { activeCatalog.contentY = savedCatalogY }) }
         else if (client.collectionId > 0 && !client.busy) window.backCollection()
@@ -128,6 +138,7 @@ ApplicationWindow {
             implicitHeight: Math.max(buttonText.implicitHeight, 28 * window.u)
             Text {
                 id: buttonText
+                objectName: action.objectName + "Label"
                 anchors.fill: parent
                 visible: !action.icon.source.toString().length
                 text: action.text
@@ -179,10 +190,10 @@ ApplicationWindow {
         }
         RowLayout {
             Layout.fillWidth: true
-            Text { text: window.browsingFolders ? "Папка для книг" : (window.addingConnection ? "Подключение" : (window.settings ? "Настройки" : client.detailVisible ? "О книге" : "BookOrbit")); font.pixelSize: 29 * window.u; font.bold: true; Layout.fillWidth: true }
+            Text { text: window.browsingFolders ? "Папка для книг" : (window.addingConnection ? "Подключение" : (window.settings ? "Настройки" : client.detailVisible ? "О книге" : window.syncView ? (window.syncBookKey ? "Позиция чтения" : "Синхронизация") : "BookOrbit")); font.pixelSize: 29 * window.u; font.bold: true; Layout.fillWidth: true }
             Action {
                 objectName: "syncButton"
-                visible: !window.settings && !client.detailVisible
+                visible: !window.settings && !window.syncView && !client.detailVisible
                 text: "Синхронизировать"
                 icon.source: "qrc:/icons/sync.svg"
                 Accessible.name: "Синхронизировать прогресс скачанных EPUB"
@@ -191,12 +202,12 @@ ApplicationWindow {
             }
             Action {
                 objectName: "navigationButton"
-                text: window.settings || client.detailVisible ? "Назад" : "Настройки"
-                icon.source: window.settings || client.detailVisible ? "" : "qrc:/icons/settings.svg"
+                text: window.settings || client.detailVisible || window.syncView ? "Назад" : "Настройки"
+                icon.source: window.settings || client.detailVisible || window.syncView ? "" : "qrc:/icons/settings.svg"
                 enabled: !client.busy
-                onClicked: window.settings || client.detailVisible ? window.back() : window.editConnection()
+                onClicked: window.settings || client.detailVisible || window.syncView ? window.back() : window.editConnection()
             }
-            Action { objectName: "exitButton"; visible: !window.settings && !client.detailVisible; text: "Закрыть приложение"; icon.source: "qrc:/icons/exit.svg"; enabled: !client.busy; onClicked: Qt.quit() }
+            Action { objectName: "exitButton"; visible: !window.settings && !window.syncView && !client.detailVisible; text: "Закрыть приложение"; icon.source: "qrc:/icons/exit.svg"; enabled: !client.busy; onClicked: Qt.quit() }
         }
         Text {
             Layout.fillWidth: true
@@ -228,6 +239,7 @@ ApplicationWindow {
         }
         ScrollView {
             id: settingsScroll
+            objectName: "settingsScroll"
             visible: window.settings && !window.browsingFolders
             Layout.fillWidth: true
             Layout.fillHeight: true
@@ -313,6 +325,17 @@ ApplicationWindow {
                 Text { text: client.downloadDirectory; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; font.pixelSize: 14 * window.u }
                 Action { text: "Выбрать папку…"; Layout.fillWidth: true; enabled: !client.busy; onClicked: { Qt.inputMethod.hide(); window.browsingFolders = true } }
                 Text { text: "Для новых загрузок. Уже скачанные книги останутся на своих местах."; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
+                Action {
+                    objectName: "verifyLibraryButton"
+                    text: "Полная проверка библиотеки"
+                    Layout.fillWidth: true
+                    enabled: !client.busy && client.authenticated
+                    onClicked: client.verifyLibrary()
+                }
+                Text {
+                    text: "Сверяет скачанные файлы с BookOrbit. Загружает их содержимое для проверки; книги и позиции чтения не заменяет"
+                    Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444"
+                }
                 CheckBox {
                     text: "Записывать диагностический журнал"
                     checked: client.diagnosticLogging
@@ -363,7 +386,7 @@ ApplicationWindow {
             Action { text: "Отмена"; Layout.fillWidth: true; onClicked: window.browsingFolders = false }
         }
         RowLayout {
-            visible: !window.settings && !client.detailVisible
+            visible: !window.settings && !window.syncView && !client.detailVisible
             Layout.fillWidth: true
             spacing: 8 * window.u
             Action { objectName: "downloadsTab"; text: "Скачанные"; checked: client.offlineOnly; Layout.fillWidth: true; enabled: !client.busy; onClicked: { search.text = ""; client.showDownloaded(true) } }
@@ -371,13 +394,13 @@ ApplicationWindow {
             Action { objectName: "collectionsTab"; text: "Коллекции"; checked: client.collectionsView || client.collectionId > 0; Layout.fillWidth: true; enabled: !client.busy; onClicked: { search.text = ""; client.showCollections() } }
         }
         RowLayout {
-            visible: !window.settings && !client.detailVisible && client.collectionId > 0
+            visible: !window.settings && !window.syncView && !client.detailVisible && client.collectionId > 0
             Layout.fillWidth: true
             Action { text: "‹ Назад"; enabled: !client.busy; onClicked: window.backCollection() }
             Text { text: client.collectionName; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight; font.bold: true; font.pixelSize: 20 * window.u }
         }
         RowLayout {
-            visible: !window.settings && !client.offlineOnly && !client.collectionsView && !client.detailVisible
+            visible: !window.settings && !window.syncView && !client.offlineOnly && !client.collectionsView && !client.detailVisible
             Layout.fillWidth: true
             Field { id: search; objectName: "searchField"; placeholderText: "Название, автор или серия"; onAccepted: { Qt.inputMethod.hide(); client.refresh(0, text) } }
             Action { objectName: "searchButton"; text: "Найти"; enabled: !client.busy && client.authenticated; onClicked: { Qt.inputMethod.hide(); client.refresh(0, search.text) } }
@@ -395,10 +418,108 @@ ApplicationWindow {
             Text { text: "Скачанные книги доступны без входа"; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
             Action { text: "Войти"; enabled: !client.busy; onClicked: window.editConnection() }
         }
+        Action {
+            objectName: "syncStatusButton"
+            visible: !window.settings && !window.syncView && !client.detailVisible && client.offlineOnly
+            Layout.fillWidth: true
+            text: "Синхронизация: " + client.syncSummary.synced + " из " + client.syncSummary.total + " · открыть"
+            enabled: !client.busy
+            onClicked: { window.syncView = true; window.syncBookKey = "" }
+        }
+        ColumnLayout {
+            visible: window.syncView && !window.settings && !client.detailVisible && !window.syncBookKey
+            Layout.fillWidth: true
+            spacing: 10 * window.u
+            Text { text: client.username + " · " + client.server; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; font.pixelSize: 14 * window.u }
+            Text { objectName: "syncSummaryText"; text: "Синхронизировано: " + client.syncSummary.synced + " из " + client.syncSummary.total; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 22 * window.u; font.bold: true }
+            Text { text: "Позиции скачанных EPUB · по последней сверке"; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
+            RowLayout {
+                Layout.fillWidth: true; spacing: 6 * window.u
+                Repeater {
+                    model: [{key:"all",label:"Все",count:client.syncSummary.total}, {key:"attention",label:"Требуют действия",count:client.syncSummary.attention}, {key:"synced",label:"Синхронизированы",count:client.syncSummary.synced}]
+                    Action {
+                        required property var modelData
+                        objectName: "syncFilter-" + modelData.key
+                        Layout.fillWidth: true; Layout.preferredWidth: 1
+                        implicitHeight: 64 * window.u
+                        checked: window.syncFilter === modelData.key
+                        text: modelData.label + "\n" + modelData.count
+                        onClicked: { window.syncFilter = modelData.key; syncList.contentY = 0 }
+                        contentItem: Text { text: parent.text; font.pixelSize: 14 * window.u; wrapMode: Text.Wrap; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; color: parent.checked ? "white" : "black" }
+                    }
+                }
+            }
+        }
+        ListView {
+            id: syncList
+            objectName: "syncList"
+            visible: window.syncView && !window.settings && !client.detailVisible && !window.syncBookKey
+            Layout.fillWidth: true; Layout.fillHeight: true
+            clip: true
+            model: client.syncBooks.filter(book => window.syncFilter === "all" || (window.syncFilter === "synced" ? book.state === "synced" : book.state !== "synced"))
+            ScrollBar.vertical: ScrollBar { }
+            delegate: ItemDelegate {
+                required property var modelData
+                objectName: "syncBook-" + modelData.key
+                width: syncList.width; height: syncRow.implicitHeight + 28 * window.u
+                enabled: !client.busy
+                onClicked: { window.syncBookKey = modelData.key; syncDetails.contentItem.contentY = 0 }
+                Accessible.name: modelData.title + ", " + modelData.label
+                background: Rectangle { color: parent.down ? "#dddddd" : "white"; Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: "#aaaaaa" } }
+                contentItem: RowLayout {
+                    id: syncRow
+                    spacing: 14 * window.u
+                    Text { text: modelData.state === "synced" ? "✓" : modelData.state === "conflict" ? "?" : "!"; font.pixelSize: 24 * window.u; Layout.preferredWidth: 25 * window.u; Accessible.ignored: true }
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 4 * window.u
+                        Text { text: modelData.title; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight; font.pixelSize: 21 * window.u; font.bold: true }
+                        Text { text: modelData.author; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; maximumLineCount: 1; elide: Text.ElideRight; font.pixelSize: 14 * window.u; color: "#444444" }
+                        Text { text: modelData.label + " · " + (modelData.files.length > 1 ? "файлов EPUB: " + modelData.files.length : "EPUB"); Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
+                    }
+                    Text { text: "›"; font.pixelSize: 22 * window.u; Accessible.ignored: true }
+                }
+            }
+            Text {
+                anchors.centerIn: parent; width: parent.width
+                visible: syncList.count === 0
+                text: client.syncSummary.total === 0 ? "Пока нечего синхронизировать.\nСкачайте EPUB из каталога." : "В этой группе больше нет книг."
+                wrapMode: Text.Wrap; horizontalAlignment: Text.AlignHCenter; font.pixelSize: 19 * window.u
+            }
+        }
+        ScrollView {
+            id: syncDetails
+            objectName: "syncDetails"
+            visible: window.syncView && !window.settings && !client.detailVisible && window.syncBookKey.length > 0
+            Layout.fillWidth: true; Layout.fillHeight: true
+            clip: true; contentWidth: availableWidth
+            ColumnLayout {
+                width: syncDetails.availableWidth; spacing: 16 * window.u
+                Text { text: window.selectedSyncBook.title || "Книга недоступна"; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 24 * window.u; font.bold: true }
+                Repeater {
+                    model: window.selectedSyncBook.files || []
+                    ColumnLayout {
+                        required property var modelData
+                        Layout.fillWidth: true; spacing: 12 * window.u
+                        Text { text: modelData.filename || "EPUB"; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; font.pixelSize: 15 * window.u; color: "#444444" }
+                        Text { objectName: "syncState-" + modelData.fileId; text: modelData.label; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 21 * window.u; font.bold: true }
+                        Text { text: modelData.reason; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 18 * window.u }
+                        Text { text: modelData.checkedAt ? "Последняя попытка: " + modelData.checkedAt : ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
+                        Action { objectName: "choosePosition-" + modelData.fileId; visible: modelData.state === "conflict"; text: "Выбрать позицию"; Layout.fillWidth: true; enabled: !client.busy; onClicked: client.inspectConflict(modelData.fileId) }
+                        Action { visible: modelData.state === "network"; text: "Подключить сеть"; Layout.fillWidth: true; enabled: !client.busy; onClicked: client.connectForSync() }
+                        Action { objectName: "retrySync-" + modelData.fileId; text: modelData.state === "synced" ? "Сверить ещё раз" : "Повторить сверку"; visible: modelData.state !== "file"; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.syncFile(modelData.fileId) }
+                        Action { text: modelData.state === "file" ? "Открыть карточку файла" : "О книге"; Layout.fillWidth: true; enabled: !client.busy; onClicked: client.showSyncFile(modelData.fileId) }
+                        Action { text: "Читать локально"; visible: modelData.available; Layout.fillWidth: true; enabled: !client.busy; onClicked: { client.showSyncFile(modelData.fileId); client.openSelected(false) } }
+                        Rectangle { Layout.fillWidth: true; height: 1; color: "#aaaaaa" }
+                    }
+                }
+            }
+        }
+        Text { visible: window.syncView && !window.settings && !client.detailVisible && !window.syncBookKey && client.syncSummary.unsupported > 0; text: "Ещё книг без поддержки синхронизации позиции: " + client.syncSummary.unsupported; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
+        Action { objectName: "syncAllStatusButton"; visible: window.syncView && !window.settings && !client.detailVisible && !window.syncBookKey; text: client.busy ? "Сверяем книги…" : "Синхронизировать"; Layout.fillWidth: true; checked: true; enabled: !client.busy && client.authenticated && client.syncSummary.total > 0; onClicked: client.syncAll() }
         ListView {
             id: collectionList
             objectName: "collectionList"
-            visible: !window.settings && client.collectionsView && !client.detailVisible
+            visible: !window.settings && !window.syncView && client.collectionsView && !client.detailVisible
             Layout.fillWidth: true; Layout.fillHeight: true
             clip: true
             model: client.collections
@@ -426,7 +547,7 @@ ApplicationWindow {
         ListView {
             id: catalog
             objectName: "catalog"
-            visible: !window.settings && !client.detailVisible && !client.collectionsView && (!window.coverGrid || client.offlineOnly || count === 0)
+            visible: !window.settings && !window.syncView && !client.detailVisible && !client.collectionsView && (!window.coverGrid || client.offlineOnly || count === 0)
             Layout.fillWidth: true; Layout.fillHeight: true
             clip: true
             model: client.books
@@ -507,7 +628,7 @@ ApplicationWindow {
         GridView {
             id: coverCatalog
             objectName: "coverCatalog"
-            visible: !window.settings && !client.detailVisible && !client.collectionsView && !client.offlineOnly && window.coverGrid && count > 0
+            visible: !window.settings && !window.syncView && !client.detailVisible && !client.collectionsView && !client.offlineOnly && window.coverGrid && count > 0
             Layout.fillWidth: true; Layout.fillHeight: true
             clip: true
             model: client.books
@@ -679,7 +800,9 @@ ApplicationWindow {
                 Action { objectName: "descriptionToggle"; text: window.fullDescription ? "Свернуть аннотацию" : "Читать полностью"; visible: window.fullDescription || description.truncated; onClicked: window.fullDescription = !window.fullDescription }
                 Text { text: client.detail.downloaded ? "Скачано на устройство" : ""; visible: text.length > 0; Layout.fillWidth: true; font.pixelSize: 14 * window.u }
                 Text { text: !client.detail.supported && client.detail.format ? "Размер файла превышает лимит загрузки 100 МБ." : !client.detail.readable && client.detail.format ? "Можно скачать; открытие этого формата из клиента пока не поддерживается." : client.detail.format && client.detail.format !== "EPUB" ? "Обмен позицией для этого формата пока не поддерживается." : ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
-                Text { text: client.detail.hasConflict ? "На ридере и в BookOrbit разные позиции. Повторите сверку и выберите нужную." : client.detail.pendingProgress ? "Входящая позиция ещё не применена. Закройте книгу в читалке и повторите сверку." : client.detail.syncResult || ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
+                Text { objectName: "fileCheckResult"; text: client.detail.remoteFileChanged ? "Файл на сервере отличается. Обмен прогрессом приостановлен" : client.detail.syncResult || ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
+                Text { text: client.detail.hasConflict ? "На ридере и в BookOrbit разные позиции. Повторите сверку и выберите нужную." : client.detail.pendingProgress ? "Входящая позиция ещё не применена. Закройте книгу в читалке и повторите сверку." : ""; visible: !client.detail.remoteFileChanged && text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
+                Action { objectName: "redownloadButton"; text: "Скачать заново"; visible: !!client.detail.remoteFileChanged; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.downloadSelected() }
                 Action { text: "Читать локально"; visible: !!client.detail.pendingProgress; Layout.fillWidth: true; enabled: !client.busy; onClicked: client.openSelected(false) }
                 Action { text: "Синхронизировать позицию"; visible: !!client.detail.canSync; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.syncSelected() }
                 Text { text: client.detail.notice || ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
@@ -700,13 +823,14 @@ ApplicationWindow {
             }
         }
         RowLayout {
-            visible: !window.settings && !client.offlineOnly && !client.collectionsView && !client.detailVisible
+            visible: !window.settings && !window.syncView && !client.offlineOnly && !client.collectionsView && !client.detailVisible
             Layout.fillWidth: true
             Action { objectName: "previousPage"; text: "‹"; Layout.preferredWidth: 100 * window.u; Accessible.name: "Предыдущая страница"; enabled: !client.busy && client.authenticated && client.page > 0; onClicked: { activeCatalog.contentY = 0; client.refresh(client.page-1, search.text) } }
             Text { text: client.total === 0 ? "Книг: 0" : (client.page+1) + " / " + Math.ceil(client.total/10) + " · " + (search.text ? "Найдено: " : "Книг: ") + client.total; Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; font.pixelSize: 14 * window.u }
             Action { objectName: "nextPage"; text: "›"; Layout.preferredWidth: 100 * window.u; Accessible.name: "Следующая страница"; enabled: !client.busy && client.authenticated && (client.page+1)*10 < client.total; onClicked: { activeCatalog.contentY = 0; client.refresh(client.page+1, search.text) } }
         }
         Action { visible: client.downloading; text: "Отменить загрузку"; Layout.fillWidth: true; onClicked: client.cancelDownload() }
+        Action { objectName: "cancelVerificationButton"; visible: client.verifyingLibrary; text: "Отменить проверку"; Layout.fillWidth: true; onClicked: client.cancelLibraryVerification() }
         Action { visible: client.canRetry; text: "Повторить"; Layout.fillWidth: true; onClicked: client.retry() }
     }
     Dialog {
@@ -755,18 +879,67 @@ ApplicationWindow {
     }
     Dialog {
         id: progressDialog
+        objectName: "progressDialog"
+        property int choice: -1
+        readonly property int revision: client.conflictRevision
+        onRevisionChanged: choice = -1
+        onOpened: choice = -1
         anchors.centerIn: parent
         width: parent.width - 40 * window.u
+        height: parent.height - 40 * window.u
         modal: true
-        title: "Позиция чтения"
+        title: "Выбор позиции"
         visible: client.progressConflict
         closePolicy: Popup.NoAutoClose
-        contentItem: ColumnLayout {
-            spacing: 12 * window.u
-            Text { text: client.conflictDescription; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 18 * window.u }
-            Action { text: "Использовать позицию ридера"; Layout.fillWidth: true; enabled: !client.busy; onClicked: client.resolveProgress(true) }
-            Action { text: "Использовать позицию BookOrbit"; Layout.fillWidth: true; enabled: !client.busy; onClicked: client.resolveProgress(false) }
-            Action { text: "Отмена"; Layout.fillWidth: true; enabled: !client.busy; onClicked: client.dismissConflict() }
+        background: Rectangle { color: "white"; border.color: "black"; radius: 3 * window.u }
+        contentItem: ScrollView {
+            id: conflictScroll
+            clip: true; contentWidth: availableWidth
+            ColumnLayout {
+                width: conflictScroll.availableWidth
+                spacing: 14 * window.u
+                Text { text: client.conflictDescription; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 22 * window.u; font.bold: true }
+                Text { text: "На ридере и в BookOrbit сохранены разные позиции. Где продолжить чтение?"; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 18 * window.u }
+                Text { text: "Глава и фрагмент — из EPUB на устройстве."; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
+                Repeater {
+                    model: client.conflictPositions
+                    RadioButton {
+                        required property var modelData
+                        required property int index
+                        objectName: modelData.local ? "conflictLocal" : "conflictRemote"
+                        Layout.fillWidth: true
+                        implicitHeight: positionContent.implicitHeight + 24 * window.u
+                        checked: progressDialog.choice === index
+                        enabled: !client.busy && modelData.canUse
+                        onClicked: progressDialog.choice = index
+                        Accessible.name: modelData.source + ", " + (modelData.chapter || "") + ", " + modelData.percentage
+                        indicator: Rectangle {
+                            x: 10 * window.u; y: 16 * window.u
+                            width: 22 * window.u; height: width; radius: width / 2
+                            color: "white"; border.color: "black"
+                            Rectangle { anchors.centerIn: parent; width: 12 * window.u; height: width; radius: width / 2; color: "black"; visible: progressDialog.choice === index }
+                        }
+                        background: Rectangle { color: parent.checked ? "#eeeeee" : "white"; border.color: "black"; border.width: parent.checked ? 3 : 1; radius: 3 * window.u }
+                        contentItem: ColumnLayout {
+                            id: positionContent
+                            spacing: 6 * window.u
+                            Text { text: modelData.source; Layout.fillWidth: true; Layout.leftMargin: 40 * window.u; Layout.rightMargin: 10 * window.u; font.pixelSize: 20 * window.u; font.bold: true }
+                            Text { text: modelData.chapter || ""; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; Layout.leftMargin: 40 * window.u; Layout.rightMargin: 10 * window.u; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight; font.pixelSize: 18 * window.u }
+                            Text { text: modelData.excerpt ? "«" + modelData.excerpt + "»" : modelData.chapter ? "" : "Глава и фрагмент недоступны"; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; Layout.leftMargin: 40 * window.u; Layout.rightMargin: 10 * window.u; wrapMode: Text.Wrap; maximumLineCount: 3; elide: Text.ElideRight; font.pixelSize: 17 * window.u }
+                            Text { text: modelData.percentage; Layout.fillWidth: true; Layout.leftMargin: 40 * window.u; Layout.rightMargin: 10 * window.u; wrapMode: Text.Wrap; font.pixelSize: 15 * window.u; color: "#444444" }
+                            Text { text: modelData.notice || ""; visible: text.length > 0; Layout.fillWidth: true; Layout.leftMargin: 40 * window.u; Layout.rightMargin: 10 * window.u; wrapMode: Text.Wrap; font.pixelSize: 15 * window.u }
+                        }
+                    }
+                }
+                Text { text: progressDialog.choice === 0 ? "Позиция ридера заменит позицию в BookOrbit." : progressDialog.choice === 1 ? "Позиция BookOrbit заменит позицию на ридере. Все книги штатной читалки должны быть закрыты." : "Обе позиции сохранены. Выберите одну или решите позже."; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
+                Text { text: client.status; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
+            }
+        }
+        footer: ColumnLayout {
+            spacing: 10 * window.u
+            Action { objectName: "applyConflict"; text: client.busy ? "Проверяем позиции…" : progressDialog.choice === 0 ? "Использовать позицию ридера" : progressDialog.choice === 1 ? "Использовать позицию BookOrbit" : "Выберите позицию"; Layout.fillWidth: true; checked: true; enabled: !client.busy && client.authenticated && progressDialog.choice >= 0; onClicked: client.resolveProgress(progressDialog.choice === 0) }
+            Action { text: "Войти для применения позиции"; visible: !client.authenticated; Layout.fillWidth: true; enabled: !client.busy; onClicked: { client.dismissConflict(); window.editConnection() } }
+            Action { objectName: "deferConflict"; text: "Решить позже"; Layout.fillWidth: true; enabled: !client.busy; onClicked: client.dismissConflict() }
         }
     }
     Connections {
@@ -786,6 +959,10 @@ ApplicationWindow {
     Connections {
         target: client
         function onCompleted(operation, success) {
+            if (operation === "sync" && client.syncSummary.total > 0 && !window.settings) {
+                window.syncView = true
+                window.syncBookKey = ""
+            }
             if (success && operation === "catalog" && client.authenticated && window.addingConnection) {
                 window.addingConnection = false
                 window.settings = false

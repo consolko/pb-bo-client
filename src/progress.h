@@ -1,7 +1,8 @@
 #pragma once
 #include <QString>
+#include <QVariantMap>
 
 // Percentage is a text-length estimate; only CFI is used to restore a position.
 // Validated ranges use their start when a reader needs a single location.
-bool epubPosition(const QString &path, const QString &cfi, double *percentage, QString *point = nullptr);
+bool epubPosition(const QString &path, const QString &cfi, double *percentage, QString *point = nullptr, QVariantMap *context = nullptr);
 QString nativeCfi(const QString &position);

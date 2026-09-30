@@ -20,6 +20,10 @@ class Client : public QObject {
     Q_PROPERTY(QString collectionName READ collectionName NOTIFY changed)
     Q_PROPERTY(bool progressConflict READ progressConflict NOTIFY changed)
     Q_PROPERTY(QString conflictDescription READ conflictDescription NOTIFY changed)
+    Q_PROPERTY(QVariantList conflictPositions READ conflictPositions NOTIFY changed)
+    Q_PROPERTY(int conflictRevision READ conflictRevision NOTIFY changed)
+    Q_PROPERTY(QVariantList syncBooks READ syncBooks NOTIFY changed)
+    Q_PROPERTY(QVariantMap syncSummary READ syncSummary NOTIFY changed)
     Q_PROPERTY(QString status READ status NOTIFY changed)
     Q_PROPERTY(bool busy READ busy NOTIFY changed)
     Q_PROPERTY(bool authenticated READ authenticated NOTIFY changed)
@@ -31,6 +35,7 @@ class Client : public QObject {
     Q_PROPERTY(QStringList accounts READ accounts NOTIFY changed)
     Q_PROPERTY(bool offlineOnly READ offlineOnly NOTIFY changed)
     Q_PROPERTY(bool downloading READ downloading NOTIFY changed)
+    Q_PROPERTY(bool verifyingLibrary READ verifyingLibrary NOTIFY changed)
     Q_PROPERTY(bool canRetry READ canRetry NOTIFY changed)
     Q_PROPERTY(QString downloadDirectory READ downloadDirectory NOTIFY changed)
     Q_PROPERTY(bool diagnosticLogging READ diagnosticLogging NOTIFY changed)
@@ -58,8 +63,19 @@ public:
     Q_INVOKABLE void syncSelected();
     bool progressConflict() const { return !syncingAll && !conflictId.isEmpty(); }
     QString conflictDescription() const { return conflictMessage; }
+    QVariantList conflictPositions() const { return positionChoices; }
+    int conflictRevision() const { return positionRevision; }
+    QVariantList syncBooks() const;
+    QVariantMap syncSummary() const;
+    Q_INVOKABLE void syncFile(int fileId);
+    Q_INVOKABLE void inspectConflict(int fileId);
+    Q_INVOKABLE void showSyncFile(int fileId);
+    Q_INVOKABLE void connectForSync();
     Q_INVOKABLE void syncProgress(int index);
     Q_INVOKABLE void syncAll();
+    Q_INVOKABLE void verifyLibrary();
+    Q_INVOKABLE void cancelLibraryVerification();
+    bool verifyingLibrary() const { return checkingLibrary; }
     Q_INVOKABLE void resolveProgress(bool useLocal);
     Q_INVOKABLE void dismissConflict();
     QString status() const { return message; }
@@ -100,14 +116,21 @@ signals:
     void coversChanged();
     void completed(const QString &operation, bool success);
 private:
+    QVariantMap syncFileStatus(const QString &id, const QString &profile) const;
+    void prepareConflict(const QString &id, const QString &local, const QJsonObject &remote, const QString &profile);
+    QVariantList positionChoices;
+    int positionRevision = 0;
     void syncBook(const QString &id, int choice = 0);
-    void verifyRemoteFile(const QString &id, const std::function<void()> &resume, bool renew = true);
+    void verifyRemoteFile(const QString &id, bool renew = true);
+    void verifyBook(const QString &id);
     QString conflictId, conflictLocal, conflictMessage, conflictProfile;
     QString syncingId;
     QStringList syncQueue;
     QJsonObject syncResults;
     bool syncingAll=false;
+    bool checkingLibrary=false, verificationCancelled=false;
     int syncCount=0, syncSucceeded=0;
+    int verificationDifferent=0, verificationErrors=0;
     QJsonObject conflictRemote;
     bool ensureNetwork();
     using Callback = std::function<void(const QJsonObject &)>;
@@ -115,7 +138,7 @@ private:
     void jsonRequest(const QString &path, const QJsonObject &payload, const Callback &callback, bool renew = true, bool get = false, bool arrayResponse = false);
     bool setCredentials(const QJsonObject &response);
     void renewSession(const std::function<void()> &resume);
-    void finish(const QString &text, bool success, const QString &operation);
+    void finish(QString text, bool success, const QString &operation, const QString &syncState = {});
     bool saveRecord(const QString &id, const QJsonObject &record);
     QString recordFile(const QString &id, const QJsonObject &record) const;
     void loadRecords();
@@ -152,6 +175,7 @@ private:
     QJsonObject downloads;
     QJsonArray savedAccounts;
     QPointer<QNetworkReply> activeDownload, activeCover;
+    QPointer<QNetworkReply> activeVerification;
     QList<int> coverQueue;
     int coverVersion = 0, coverGeneration = 0;
     QJsonObject retryBook;
