@@ -36,7 +36,7 @@ jobs:
           cmake -S . -B build/desktop -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBOOKORBIT_CHECKS=ON
           cmake --build build/desktop -j2
       - name: Run tests
-        run: ctest --test-dir build/desktop --output-on-failure
+        run: ctest --test-dir build/desktop --output-on-failure --no-tests=error
       - name: Preserve exact sources and test logs
         if: always()
         uses: actions/upload-artifact@v4
