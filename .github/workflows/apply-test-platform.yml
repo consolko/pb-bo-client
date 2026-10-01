@@ -1,0 +1,54 @@
+name: Preserve native test entry point
+on:
+  push:
+    branches: [fix/audit-hardening]
+    paths: [.github/workflows/apply-test-platform.yml]
+permissions:
+  contents: read
+jobs:
+  apply:
+    if: "${{ github.event.head_commit.message == 'maintenance: preserve native test entry point' }}"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Scope GUI test application to desktop builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          changes = {
+              'CMakeLists.txt': (
+                  '9913719013a29ffdfbb16da64b80f9e7702c3c4c',
+                  'bfe62e051313e3e456a85e3164ab91d292156ae5',
+                  [('    target_link_libraries(client_check PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Xml z)', '    target_link_libraries(client_check PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Xml z)\n    target_compile_definitions(client_check PRIVATE BOOKORBIT_DESKTOP_CHECK')]),
+              'tools/client_check.cpp': (
+                  '5ca2175f8034c5e8bd3bc80c4a5585ddf307eaef',
+                  '5d3a0faa542dadd8886a0bf98a1afb2bac50ddeb',
+                  [('#include <QGuiApplication>', '#include <QCoreApplication>\n#ifdef BOOKORBIT_DESKTOP_CHECK\n#include <QGuiApplication>\n#endif'),
+                   ('    QGuiApplication app(argc, argv);', '#ifdef BOOKORBIT_DESKTOP_CHECK\n    QGuiApplication app(argc, argv);\n#else\n    QCoreApplication app(argc, argv);\n#endif')]),
+          }
+          for name, (before, after, edits) in changes.items():
+              if subprocess.check_output(['git', 'hash-object', name], text=True).strip() != before:
+                  raise SystemExit(f'Unexpected input version: {name}')
+              path = Path(name)
+              text = path.read_text()
+              for old, new in edits:
+                  if text.count(old) != 1:
+                      raise SystemExit(f'Ambiguous edit: {name}')
+                  text = text.replace(old, new)
+              path.write_text(text)
+              if subprocess.check_output(['git', 'hash-object', name], text=True).strip() != after:
+                  raise SystemExit(f'Unexpected output version: {name}')
+          PY
+          git add CMakeLists.txt tools/client_check.cpp
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'test: preserve native check entry point and initialize GUI on desktop only'
+          git push origin HEAD:refs/heads/fix/audit-hardening
