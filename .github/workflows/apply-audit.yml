@@ -6,7 +6,7 @@ permissions:
   contents: read
 jobs:
   apply:
-    if: github.event.head_commit.message == 'maintenance: apply reviewed audit patch'
+    if: "${{ github.event.head_commit.message == 'maintenance: apply reviewed audit patch' }}"
     runs-on: ubuntu-latest
     permissions:
       contents: write
