@@ -26,7 +26,7 @@ jobs:
               'CMakeLists.txt': (
                   '9913719013a29ffdfbb16da64b80f9e7702c3c4c',
                   'bfe62e051313e3e456a85e3164ab91d292156ae5',
-                  [('    target_link_libraries(client_check PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Xml z)', '    target_link_libraries(client_check PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Xml z)\n    target_compile_definitions(client_check PRIVATE BOOKORBIT_DESKTOP_CHECK')]),
+                  [('    target_link_libraries(client_check PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Xml z)', '    target_link_libraries(client_check PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Xml z)\n    target_compile_definitions(client_check PRIVATE BOOKORBIT_DESKTOP_CHECK)')]),
               'tools/client_check.cpp': (
                   '5ca2175f8034c5e8bd3bc80c4a5585ddf307eaef',
                   '5d3a0faa542dadd8886a0bf98a1afb2bac50ddeb',
