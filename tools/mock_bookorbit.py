@@ -195,6 +195,9 @@ class Handler(BaseHTTPRequestHandler):
                         genres=["Научная фантастика"], tags=["Тест"], rating=4, personalNote="Личная заметка из BookOrbit",
                         collections=[{"id": 11, "name": "К прочтению"}],
                         seriesName="Проверка серии", seriesIndex="2.5")
+            if mode == "long_ui":
+                book.update(title="Очень длинное название книги "*20, authors=[{"name":"Автор с длинным именем "+str(i)} for i in range(8)],
+                            genres=["Жанр "+str(i) for i in range(50)], publisher="Длинное издательство "*20)
             book.pop("readingProgress", None)  # Real detail API has no book-level percentage.
             if mode == "bad_files":
                 book["files"] = [{"id": 201, "format": "../pdf", "role": "primary", "sizeBytes": 1}]
@@ -228,6 +231,15 @@ class Handler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/v1/books/files/(10[1-3])/(download|progress)", path)
         if match and match[2] == "progress":
             file_id = match[1]
+            if mode == "slow_progress" and self.command == "GET": time.sleep(0.4)
+            if mode == "slow_confirm" and self.command == "POST":
+                fault.write_text("confirm_wait")
+            if mode == "confirm_wait" and self.command == "GET": time.sleep(0.4)
+            if mode == "uncertain_post" and self.command == "POST":
+                self.server.progress[file_id] = dict(body)
+                fault.write_text("confirm_error")
+                return self.send(503, {})
+            if mode == "confirm_error" and self.command == "GET": return self.send(503, {})
             if mode in ("progress_remote", "progress_other"):
                 self.server.progress[file_id] = {"cfi": "epubcfi(/6/2!/4/" + ("62" if mode == "progress_remote" else "82") + "/1)", "pageNumber": None, "percentage": 40}
                 fault.write_text("")

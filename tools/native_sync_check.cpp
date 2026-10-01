@@ -8,6 +8,9 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickWindow>
+#include <QQuickItem>
+#include <QMouseEvent>
+#include <QJsonDocument>
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
@@ -32,9 +35,43 @@ int main(int argc,char **argv) {
     const auto screen=setupDevice();
     QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
     QGuiApplication app(argc,argv);
-    require(argc==3 || (argc==4 && QString::fromLocal8Bit(argv[3])=="--ui"),"isolated directory and fault file supplied");
+    require(argc==3 || (argc==4 && (QString::fromLocal8Bit(argv[3])=="--ui" || QString::fromLocal8Bit(argv[3])=="--history-check")),"isolated directory and fault file supplied");
     require(!screen.isEmpty(),"native adapter initialized");
     Client c(QUrl("http://host.containers.internal:8766"),QString::fromLocal8Bit(argv[1]));
+    if (argc==4 && QString::fromLocal8Bit(argv[3])=="--history-check") {
+        c.showDownloaded(true); c.refreshRecents(); QCoreApplication::processEvents();
+        require(c.historyAvailable() && c.recentBook()["fileId"].toInt()==101,"stock-library open appears in the account recent snapshot after restart");
+        QQmlApplicationEngine engine; engine.addImportPath("/ebrmain/qml");
+        engine.rootContext()->setContextProperty("client",&c);
+        engine.rootContext()->setContextProperty("screenWidth",screen.width());
+        engine.rootContext()->setContextProperty("screenHeight",screen.height());
+        int warnings=0;
+        QObject::connect(&engine,&QQmlApplicationEngine::warnings,&app,[&](const QList<QQmlError> &errors) { warnings+=errors.size(); });
+        engine.load(QUrl("qrc:/Main.qml"));
+        require(!engine.rootObjects().isEmpty(),"native recents load in production QML without authentication");
+        auto window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());
+        QEventLoop settle; QTimer::singleShot(600,&settle,&QEventLoop::quit); settle.exec();
+        require(window->grabWindow().save(QString::fromLocal8Bit(argv[1])+"/native-recents.png"),"capture real native recent block");
+        std::function<QQuickItem *(QQuickItem *)> find=[&](QQuickItem *parent)->QQuickItem * {
+            if (parent->objectName()=="recentAction") return parent;
+            for (auto child:parent->childItems()) if (auto item=find(child)) return item;
+            return nullptr;
+        };
+        auto button=find(window->contentItem());
+        require(button && button->isVisible() && button->isEnabled(),"one-tap recent read action is accessible offline");
+        require(wait(c,[&] {
+            QEventLoop polish; QTimer::singleShot(40,&polish,&QEventLoop::quit); polish.exec();
+            const QPointF point=button->mapToScene(QPointF(button->width()/2,button->height()/2));
+            require(point.x()>=0 && point.x()<window->width() && point.y()>=0 && point.y()<window->height(),"native recent tap is inside the viewport");
+            QMouseEvent press(QEvent::MouseButtonPress,point,point,point,Qt::LeftButton,Qt::LeftButton,Qt::NoModifier);
+            QCoreApplication::sendEvent(window,&press);
+            require(button->property("pressed").toBool(),"recent button receives the native QML press");
+            QMouseEvent release(QEvent::MouseButtonRelease,point,point,point,Qt::LeftButton,Qt::NoButton,Qt::NoModifier);
+            QCoreApplication::sendEvent(window,&release);
+        }),"one native QML tap opens the exact recent file without login");
+        require(warnings==0,"no QML warnings in native recents scenario");
+        return 0;
+    }
     require(wait(c,[&] { c.login(c.server(), "demo","demo"); }),"synthetic native login");
     const QString bookDir="/mnt/ext1/books/BookOrbit/"+QFileInfo(QString::fromLocal8Bit(argv[1])).fileName();
     require(QDir().mkpath(bookDir) && c.setDownloadDirectory(bookDir),"isolated native download directory");
@@ -44,6 +81,9 @@ int main(int argc,char **argv) {
         QEventLoop pause; QTimer::singleShot(200,&pause,&QEventLoop::quit); pause.exec();
     }
     require(readerBookIndexed(path),"firmware scanner registered the file");
+    const auto initialRecents=readerRecents({path});
+    require(initialRecents.available && initialRecents.profile==readerProfile() && initialRecents.files.contains(path) && initialRecents.files[path].bookId>0,
+        "read native recents using current profile and verified schema");
     QString before;
     require(readerPosition(path,&before) && !nativeCfi(before).isEmpty(),"read saved stock-reader CFI");
     QString error;
@@ -57,6 +97,11 @@ int main(int argc,char **argv) {
     QString after;
     require(readerPosition(path,&after) && nativeCfi(after)=="epubcfi(/6/2!/4/62/1)","native SQLite readback matches server CFI");
     require(readerFileState(path)==ReaderFileState::Closed,"book stayed closed throughout sync");
+    const auto afterRecents=readerRecents({path});
+    require(afterRecents.available && afterRecents.files[path].openTime>=initialRecents.files[path].openTime && afterRecents.files[path].openTime>0,
+        "incoming native position can advance recents without a reading session");
+    c.showDownloaded(true); c.refreshRecents(); QCoreApplication::processEvents();
+    require(c.recentBook()["fileId"].toInt()==101,"native recent snapshot identifies the exact account file");
     require(fault.open(QIODevice::WriteOnly) && fault.write("progress_range")==14,"move fixture server to a CFI range");
     fault.close();
     require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }),"incoming range applied through real firmware adapter");

@@ -21,6 +21,9 @@ QString fakePosition;
 QString fakeProfile="default";
 QString readerProfile() { return fakeProfile; }
 bool readerPosition(const QString &, QString *position) { *position=fakePosition; return true; }
+bool historyReadable=true;
+QMap<QString,ReaderRecent> fakeRecents;
+ReaderRecents readerRecents(const QStringList &) { return {fakeProfile,historyReadable,fakeRecents}; }
 QString appliedCfi;
 bool applyAllowed=true;
 bool saveReaderPosition(const QString &, const QString &expected, const QString &cfi, const QString &profile, QString *error) {
@@ -257,6 +260,54 @@ int main(int argc, char **argv) {
             c.books()[1].toMap()["syncResult"].toString().contains("BookOrbit"), "batch exposes an independent result for each book");
     blockedPath.clear();
     require(wait(c,[&] { c.syncAll(); }), "batch retry reconciles both downloaded books");
+    const QString untouched=QString::fromUtf8(contents(scope+"/records/102.json"));
+    int otherGets=requests(root,"GET /api/v1/books/files/102/progress");
+    write(fault,"slow_progress");
+    require(!wait(c,[&] {
+        c.syncAll(); QTimer::singleShot(100,&c,[&] { c.stopSyncAfterCurrent(); });
+    }) && c.syncBatch()["completed"].toInt()==1 && !c.busy() &&
+        requests(root,"GET /api/v1/books/files/102/progress")==otherGets &&
+        QString::fromUtf8(contents(scope+"/records/102.json"))==untouched,
+        "stop during GET finishes one file and preserves every unprocessed record");
+    write(fault,"");
+    auto stopBetween=QObject::connect(&c,&Client::changed,&c,[&] {
+        if (c.syncBatch()["running"].toBool() && c.syncBatch()["completed"].toInt()==1) c.stopSyncAfterCurrent();
+    });
+    require(!wait(c,[&] { c.syncAll(); }) && requests(root,"GET /api/v1/books/files/102/progress")==otherGets,
+        "stop at the queued transition never starts the next file");
+    QObject::disconnect(stopBetween);
+    fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/20/1)";
+    const int posts=requests(root,"POST /api/v1/books/files/101/progress");
+    write(fault,"slow_confirm");
+    require(!wait(c,[&] {
+        c.syncAll(); QTimer::singleShot(100,&c,[&] { c.stopSyncAfterCurrent(); });
+    }) && requests(root,"POST /api/v1/books/files/101/progress")==posts+1 &&
+        requests(root,"GET /api/v1/books/files/102/progress")==otherGets &&
+        !QJsonDocument::fromJson(contents(scope+"/records/101.json")).object()["progress"].toObject().contains("outgoing"),
+        "stop after POST still confirms the current file before returning");
+    fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/22/1)";
+    write(fault,"uncertain_post");
+    require(!wait(c,[&] {
+        c.syncAll(); QTimer::singleShot(0,&c,[&] { c.stopSyncAfterCurrent(); });
+    }) && QJsonDocument::fromJson(contents(scope+"/records/101.json")).object()["progress"].toObject().contains("outgoing") &&
+        c.syncBooks()[0].toMap()["state"]=="uncertain", "unknown send outcome remains journaled after stopping");
+    write(fault,"");
+    require(wait(c,[&] { c.syncAll(); }), "a fresh batch reconciles a stopped uncertain send");
+    auto stopLast=QObject::connect(&c,&Client::changed,&c,[&] {
+        if (c.syncBatch()["running"].toBool() && c.syncBatch()["completed"].toInt()==2) c.stopSyncAfterCurrent();
+    });
+    require(!wait(c,[&] { c.syncAll(); }) && c.syncBatch()["completed"].toInt()==2 && c.status().contains("пользователем"),
+        "stop on the last file keeps its confirmed result and reports the requested stop");
+    QObject::disconnect(stopLast);
+    otherGets=requests(root,"GET /api/v1/books/files/102/progress"); write(fault,"relogin");
+    require(!wait(c,[&] { c.syncAll(); }) && !c.authenticated() && requests(root,"GET /api/v1/books/files/102/progress")==otherGets &&
+        c.status().contains("войдите снова"),"authorization loss stops the sync queue without starting the next file");
+    require(wait(c,[&] { c.login(c.server(),"demo","demo"); }),"restore session after sync authorization stop");
+    c.setUiContext("sync"); require(wait(c,[&] { c.syncAll(); }),"prepare successful sync feedback");
+    require(c.feedback()["context"]=="sync" && !c.feedback()["text"].toString().isEmpty(),"structured feedback carries its operation context");
+    c.setUiContext("connection"); require(c.feedback()["text"].toString().isEmpty(),"successful sync feedback clears on leaving its context");
+
+
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/18/1)";
     const int beforePagePosts = requests(root, "POST /api/v1/books/files/101/progress");
     write(fault,"progress_page");
@@ -484,7 +535,7 @@ int main(int argc, char **argv) {
     write(fault, "");
     require(wait(c, [&] { c.login(c.server(), "demo", "demo"); }), "login after expiry");
     write(fault, "error");
-    require(!wait(c, [&] { c.refresh(0, ""); }) && c.canRetry() && c.books().isEmpty(), "catalog outage clears previous page and offers retry");
+    require(!wait(c, [&] { c.refresh(0, ""); }) && c.canRetry() && c.books().size()==3, "catalog outage preserves previous page and offers retry");
     write(fault, "");
     require(wait(c, [&] { c.retry(); }), "catalog retry succeeds");
     require(wait(c, [&] { c.logout(); }), "server logout completes");
@@ -590,6 +641,41 @@ int main(int argc, char **argv) {
     Client many(endpoint, manyRoot);
     many.showDownloaded(true);
     require(many.books().size() == 1200, "large downloaded list remains available");
+    const QString searchRoot=root+"/search-check",searchScope=searchRoot+"/"+QFileInfo(scope).fileName();
+    require(QDir().mkpath(searchScope+"/records"),"create isolated search library");
+    const QString searchEpub=root+"/compressed.epub";
+    const QString searchDigest=QString::fromLatin1(QCryptographicHash::hash(contents(searchEpub),QCryptographicHash::Sha256).toHex());
+    for (int i=1;i<=100;++i) {
+        const int id=3000+i;
+        const QJsonObject variant{{"id",id},{"format","epub"},{"role","content"},{"sizeBytes",QFileInfo(searchEpub).size()}};
+        const QJsonObject book{{"id",i},{"title",i==1 ? "Ёлка C++ % ? e\u0301" : QString("Книга %1").arg(i,3,10,QChar('0'))},
+            {"authors",QJsonArray{QJsonObject{{"name",i==2 ? "Анна ТЕСТ" : "Автор"}}}},
+            {"seriesName",i==3 ? "Лунная СЕРИЯ" : ""},{"files",QJsonArray{variant}},{"selectedFile",variant}};
+        require(QFile::copy(searchEpub,searchScope+"/"+QString::number(id)+".epub"),"copy controlled local EPUB");
+        write(searchScope+"/records/"+QString::number(id)+".json",QJsonDocument(QJsonObject{{"fileId",id},{"bookId",i},
+            {"bytes",QFileInfo(searchEpub).size()},{"sha256",searchDigest},{"book",book}}).toJson());
+    }
+    write(searchRoot+"/accounts.json",contents(root+"/accounts.json"));
+    Client searchClient(endpoint,searchRoot); searchClient.showDownloaded(true);
+    const int beforeLocal=requests(root,"POST /api/v1/books/query");
+    for (const auto &query:QStringList{"ёлКа","C++","%","?","é"}) {
+        searchClient.searchDownloaded(query); require(searchClient.books().size()==1,"Unicode and literal punctuation search");
+    }
+    searchClient.searchDownloaded("анна тест"); require(searchClient.books().size()==1,"local author search folds Cyrillic case");
+    searchClient.searchDownloaded("лунная серия"); require(searchClient.books().size()==1,"local series search");
+    searchClient.searchDownloaded("missing"); require(searchClient.books().isEmpty(),"empty local search result");
+    searchClient.searchDownloaded(""); searchClient.setLocalSort("author");
+    require(searchClient.books().size()==100 && requests(root,"POST /api/v1/books/query")==beforeLocal,"100-book search and sort never request network");
+    opened=false; networkAvailable=false;
+    require(wait(searchClient,[&] { searchClient.openFile(3001); }) && opened,"stable file ID opens after sorting without network");
+    networkAvailable=true;
+    searchClient.setDiagnosticLogging(true); searchClient.setLocalSort("title");
+    Client searchRestart(endpoint,searchRoot);
+    require(searchRestart.localSort()=="title" && searchRestart.diagnosticLogging(),"sort persists without overwriting other settings");
+    searchClient.searchDownloaded("Ёлка"); searchClient.showDownloaded(true);
+    require(searchClient.localQuery()=="Ёлка","query survives tab transitions within session");
+    searchClient.configure(endpoint.toString(),"other");
+    require(searchClient.localQuery().isEmpty() && searchClient.recentBook().isEmpty() && searchClient.books().isEmpty(),"account switch resets query and native recents");
     const QString folderRoot = root+"/folder-check";
     const QString destination = "/mnt/ext1/books/folder-check-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
     const QString first = destination+"/Первая папка", second = destination+"/Вторая папка";
@@ -785,6 +871,38 @@ int main(int argc, char **argv) {
             "two EPUB files of one book keep distinct file identities");
     require(features.syncSummary()["total"].toInt()==1 && features.syncBooks()[0].toMap()["files"].toList().size()==2 &&
             features.syncSummary()["unsupported"].toInt()==0, "two EPUBs plus PDF and FB2 count as one book and keep separate file actions");
+    const QString categoriesRoot=root+"/category-check", categoriesScope=categoriesRoot+"/"+QFileInfo(scope).fileName();
+    require(QDir().mkpath(categoriesScope+"/records"),"create isolated sync category fixture");
+    write(categoriesRoot+"/accounts.json",contents(featureRoot+"/accounts.json"));
+    auto categoryRecord=QJsonDocument::fromJson(contents(featureRoot+"/"+QFileInfo(scope).fileName()+"/records/101.json")).object();
+    categoryRecord.remove("directory");
+    require(QFile::copy(epubPath,categoriesScope+"/"+categoryRecord["filename"].toString()),"copy category fixture EPUB into its own scope");
+    for (const auto &state:QStringList{"unknown","network","conflict","reader","reader_unknown","pending","uncertain","auth","file","position","error","synced"}) {
+        categoryRecord["syncStatus"]=QJsonObject{{"state",state},{"profile",fakeProfile}};
+        write(categoriesScope+"/records/101.json",QJsonDocument(categoryRecord).toJson());
+        Client category(endpoint,categoriesRoot);
+        const QString group=state=="synced" ? "synced" : (state=="unknown" || state=="network") ? "waiting" : "attention";
+        require(!category.syncBooks().isEmpty() && category.syncBooks()[0].toMap()["group"]==group && category.syncSummary()["waiting"].toInt()+category.syncSummary()["attention"].toInt()+category.syncSummary()["synced"].toInt()==1,
+            "every persisted sync state maps to one book category");
+    }
+    fakeRecents={{epubPath,{10,100}},{features.localFile(0),{10,100}},{pdfPath,{11,90}}};
+    features.refreshRecents(); QCoreApplication::processEvents();
+    require(features.historyAvailable() && features.recentBook()["fileId"].toInt()==203,
+        "native aliases with equal opentime prefer the user's selected variant");
+    features.selectFile(101); features.refreshRecents(); QCoreApplication::processEvents();
+    require(features.recentBook()["fileId"].toInt()==101, "equal native times honor a changed preferred file");
+    features.selectFile(201); features.refreshRecents(); QCoreApplication::processEvents();
+    require(features.recentBook()["fileId"].toInt()==101,"equal aliases without a recent preferred format choose the smaller file ID");
+    require(QFile::rename(epubPath,epubPath+".recent-test"),"temporarily remove only the isolated recent candidate");
+    features.refreshRecents(); QCoreApplication::processEvents();
+    require(features.recentBook()["fileId"].toInt()==203,"missing native recent file never receives a read action");
+    require(QFile::rename(epubPath+".recent-test",epubPath),"restore isolated recent candidate");
+    fakeProfile="empty-profile"; fakeRecents.clear(); features.refreshRecents();
+    require(features.recentBook().isEmpty(), "profile switch clears the previous recent snapshot immediately");
+    QCoreApplication::processEvents(); fakeProfile="default";
+    historyReadable=false; features.refreshRecents(); QCoreApplication::processEvents();
+    require(!features.historyAvailable() && features.recentBook().isEmpty(), "unavailable native history has no client-only fallback");
+    historyReadable=true; fakeRecents.clear(); features.refreshRecents(); QCoreApplication::processEvents();
     features.selectFile(201);
     require(!wait(features, [&] { features.syncSelected(); }) && features.status().contains("только для EPUB"), "PDF never enters EPUB synchronization");
     opened = false;
@@ -834,8 +952,8 @@ int main(int argc, char **argv) {
     require(wait(features, [&] { features.refresh(0, "Автор коллекции"); }) && features.total() == 20,
             "Cyrillic collection search is URL encoded and scoped");
     write(fault, "error");
-    require(!wait(features, [&] { features.refresh(0, "Автор коллекции"); }) && features.books().isEmpty(),
-            "collection failure cannot display previous books as current");
+    require(!wait(features, [&] { features.refresh(0, "Автор коллекции"); }) && features.books().size()==10 && features.catalogQuery()=="Автор коллекции",
+            "collection failure preserves the validated page and committed query");
     write(fault, "features");
     require(wait(features, [&] { features.retry(); }) && features.collectionId() == 12 && features.total() == 20,
             "retry preserves collection and search");

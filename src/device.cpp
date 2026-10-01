@@ -155,6 +155,63 @@ QString readerProfile() {
 #endif
 }
 
+ReaderRecents readerRecents(const QStringList &paths) {
+    ReaderRecents result; result.profile=readerProfile();
+#ifdef POCKETBOOK_DEVICE
+    const QString connection="bookorbit-native-recents";
+    {
+        auto db=QSqlDatabase::addDatabase("QSQLITE",connection);
+        db.setDatabaseName("/mnt/ext1/system/explorer-3/explorer-3.db");
+        db.setConnectOptions("QSQLITE_OPEN_READONLY;QSQLITE_BUSY_TIMEOUT=100");
+        if (db.open() && db.transaction()) {
+            bool ok=true;
+            const QMap<QString,QStringList> columns{
+                {"files",{"book_id","folder_id","filename"}}, {"folders",{"id","name"}},
+                {"profiles",{"id","name"}}, {"books_settings",{"bookid","profileid","opentime"}}};
+            for (auto it=columns.begin();it!=columns.end();++it) {
+                QSqlQuery schema(db); QStringList found;
+                ok=ok && schema.exec("PRAGMA table_info("+it.key()+")");
+                while (schema.next()) found << schema.value(1).toString();
+                for (const auto &column:it.value()) ok=ok && found.contains(column);
+            }
+            QSqlQuery profile(db);
+            profile.prepare("SELECT id FROM profiles WHERE name=? OR (?='' AND name='default' AND (SELECT COUNT(*) FROM profiles)=1)");
+            profile.addBindValue(result.profile); profile.addBindValue(result.profile);
+            qint64 profileId=0;
+            if (ok) {
+                ok=profile.exec() && profile.next();
+                if (ok) { profileId=profile.value(0).toLongLong(); ok=!profile.next(); }
+            }
+            if (ok) {
+                QSqlQuery q(db);
+                ok=q.prepare("SELECT f.book_id,s.opentime FROM files f JOIN folders d ON d.id=f.folder_id "
+                    "LEFT JOIN books_settings s ON s.bookid=f.book_id AND s.profileid=? "
+                    "WHERE d.name=? AND f.filename=? AND f.book_id>0");
+                for (const auto &path:paths) {
+                    if (!ok) break;
+                    const QFileInfo info(path);
+                    q.bindValue(0,profileId); q.bindValue(1,info.absolutePath()); q.bindValue(2,info.fileName());
+                    ok=q.exec();
+                    if (ok && q.next()) {
+                        const ReaderRecent entry{q.value(0).toLongLong(),qMax(qint64(0),q.value(1).toLongLong())};
+                        ok=!q.next();
+                        if (ok) result.files.insert(path,entry);
+                    }
+                    q.finish();
+                }
+            }
+            result.available=ok && readerProfile()==result.profile;
+            db.rollback(); // End the read snapshot; never checkpoint or mutate the native database.
+        }
+    }
+    QSqlDatabase::removeDatabase(connection);
+#else
+    Q_UNUSED(paths)
+#endif
+    if (!result.available) result.files.clear();
+    return result;
+}
+
 static bool readReaderPosition(const QString &path, QString *position, qint64 *bookId) {
 #ifdef POCKETBOOK_DEVICE
     const QString profileName = readerProfile();

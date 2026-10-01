@@ -1,5 +1,6 @@
 #pragma once
 #include <QObject>
+#include "device.h"
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
@@ -23,6 +24,13 @@ class Client : public QObject {
     Q_PROPERTY(QVariantList conflictPositions READ conflictPositions NOTIFY changed)
     Q_PROPERTY(int conflictRevision READ conflictRevision NOTIFY changed)
     Q_PROPERTY(QVariantMap syncSummary READ syncSummary NOTIFY changed)
+    Q_PROPERTY(QVariantMap feedback READ feedback NOTIFY changed)
+    Q_PROPERTY(QVariantMap syncBatch READ syncBatch NOTIFY changed)
+    Q_PROPERTY(QString localQuery READ localQuery NOTIFY changed)
+    Q_PROPERTY(QString localSort READ localSort NOTIFY changed)
+    Q_PROPERTY(QString catalogQuery READ catalogQuery NOTIFY changed)
+    Q_PROPERTY(QVariantMap recentBook READ recentBook NOTIFY changed)
+    Q_PROPERTY(bool historyAvailable READ historyAvailable NOTIFY changed)
     Q_PROPERTY(QString status READ status NOTIFY changed)
     Q_PROPERTY(bool busy READ busy NOTIFY changed)
     Q_PROPERTY(bool authenticated READ authenticated NOTIFY changed)
@@ -76,6 +84,19 @@ public:
     bool verifyingLibrary() const { return checkingLibrary; }
     Q_INVOKABLE void resolveProgress(bool useLocal);
     Q_INVOKABLE void dismissConflict();
+    QVariantMap feedback() const;
+    Q_INVOKABLE void setUiContext(const QString &context);
+    QVariantMap syncBatch() const;
+    Q_INVOKABLE void stopSyncAfterCurrent();
+    QString localQuery() const { return libraryQuery; }
+    QString localSort() const { return librarySort; }
+    QString catalogQuery() const { return committedQuery; }
+    Q_INVOKABLE void searchDownloaded(const QString &query);
+    Q_INVOKABLE void setLocalSort(const QString &sort);
+    Q_INVOKABLE void refreshRecents();
+    QVariantMap recentBook() const;
+    bool historyAvailable() const { return nativeRecents.available; }
+    Q_INVOKABLE void openFile(int fileId, bool applyIncoming=false);
     QString status() const { return message; }
     bool busy() const { return working; }
     bool authenticated() const { return !token.isEmpty(); }
@@ -125,7 +146,16 @@ private:
     QString syncingId;
     QStringList syncQueue;
     QJsonObject syncResults;
-    bool syncingAll=false;
+    void beginFeedback(const QString &context, int bookId=0, int fileId=0);
+    QString feedbackContext="catalog", feedbackResult="success", uiContext;
+    int feedbackBookId=0, feedbackFileId=0;
+    bool feedbackHidden=false;
+    QString libraryQuery, librarySort="recent", committedQuery;
+    ReaderRecents nativeRecents;
+    bool recentsRequested=false, recentsScheduled=false;
+    QJsonObject recentFile(QJsonObject book) const;
+    bool syncingAll=false, syncStopRequested=false;
+    int syncCompleted=0;
     bool checkingLibrary=false, verificationCancelled=false;
     int syncCount=0, syncSucceeded=0;
     int verificationDifferent=0, verificationErrors=0;
@@ -146,7 +176,7 @@ private:
     void queueCovers();
     void fetchNextCover();
     void stopCovers();
-    QJsonArray visibleItems() const;
+    QJsonArray visibleItems(bool applyQuery=true) const;
     QString localFile(const QJsonObject &book) const;
     void downloadBook(const QJsonObject &book, bool renew = true);
     void openBook(const QJsonObject &book, bool applyIncoming);

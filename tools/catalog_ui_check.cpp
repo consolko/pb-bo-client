@@ -65,6 +65,7 @@ int main(int argc, char **argv) {
         return nullptr;
     };
     auto tap = [&](const char *name, double x = 0.5, double y = 0.5) {
+        settle(40);
         auto item = findItem(window->contentItem(), QString::fromLatin1(name));
         require(item && item->isVisible() && item->isEnabled(), name);
         const auto point = item->mapToScene(QPointF(item->width()*x, item->height()*y));
@@ -80,9 +81,9 @@ int main(int argc, char **argv) {
     };
     require(wait(client, [&] { client.login(client.server(), "demo", "demo"); }), "load catalog into production QML"); capture("catalog");
     auto item = [&](const char *name) { return findItem(window->contentItem(), QString::fromLatin1(name)); };
-    require(item("reading-1")->property("text").toString() == "Читаю · 37,5 %", "catalog shows reading progress");
-    require(item("reading-2")->property("text").toString() == "Прочитано", "finished books show status without percentage");
-    require(item("reading-3")->property("text").toString() == "Читаю", "invalid progress has no fabricated percentage");
+    require(item("reading-1")->property("text").toString() == "В BookOrbit: читаю · 37,5 %", "catalog shows reading progress");
+    require(item("reading-2")->property("text").toString() == "В BookOrbit: прочитано", "finished books show status without percentage");
+    require(item("reading-3")->property("text").toString() == "В BookOrbit: читаю", "invalid progress has no fabricated percentage");
     for (const auto name : {"syncButtonIcon", "navigationButtonIcon", "exitButtonIcon", "bookAction-1Icon"})
         require(item(name) && item(name)->property("status").toInt() == 1, "SVG icon loaded by native Qt image plugin");
     require(item("nextPage")->width() >= 100*screen.width()/600.0 &&
@@ -131,11 +132,15 @@ int main(int argc, char **argv) {
     tap("showPassword"); tap("navigationButton"); settle(); tap("addConnection"); settle();
     require(password->property("text").toString().isEmpty() && !item("showPassword")->property("checked").toBool(), "reopening connection form clears password and resets visibility");
     capture("connection"); tap("navigationButton"); tap("navigationButton"); settle();
+    item(window->property("coverGrid").toBool() ? "coverCatalog" : "catalog")->setProperty("contentY", 100000); settle();
     require(wait(client, [&] { tap("nextPage"); }) && client.page() == 1, "wide next-page button works");
+    item(window->property("coverGrid").toBool() ? "coverCatalog" : "catalog")->setProperty("contentY", 0); settle();
     require(wait(client, [&] { tap("previousPage"); }) && client.page() == 0, "wide previous-page button works");
+    require(item("catalog")->property("contentY").toDouble()>0,"previous portion opens at its end");
+    item("catalog")->setProperty("contentY",0); settle();
     for (const auto point : {QPointF(0.05,0.4), QPointF(0.5,0.15), QPointF(0.5,0.42), QPointF(0.6,0.92)}) {
         require(wait(client, [&] { tap("book-1", point.x(), point.y()); }), "cover title author and blank row area open details");
-        require(item("detailReading")->property("text").toString() == "Читаю · 37,5 %", "details keep catalog percentage beside author");
+        require(item("detailReading")->property("text").toString() == "В BookOrbit: читаю · 37,5 %", "details keep catalog percentage beside author");
         tap("navigationButton"); settle();
     }
     tap("coverGridToggle"); settle();
@@ -156,8 +161,11 @@ int main(int argc, char **argv) {
     require(client.detail()["bookId"].toInt() == 4, "grid delegates retain correct book identity");
     tap("navigationButton"); settle();
     require(qAbs(grid->property("contentY").toDouble()-gridOffset) < 1, "back restores grid scroll offset");
+    item(window->property("coverGrid").toBool() ? "coverCatalog" : "catalog")->setProperty("contentY", 100000); settle();
     require(wait(client, [&] { tap("nextPage"); }) && client.page() == 1 && grid->isVisible(), "pagination keeps cover grid mode");
+    item(window->property("coverGrid").toBool() ? "coverCatalog" : "catalog")->setProperty("contentY", 0); settle();
     require(wait(client, [&] { tap("previousPage"); }) && client.page() == 0, "grid previous page works");
+    grid->setProperty("contentY",0); settle();
     item("searchField")->setProperty("text", "grid-no-such-book");
     require(wait(client, [&] { tap("searchButton"); }) && client.total() == 0 && !grid->isVisible() && item("catalog")->isVisible(), "empty grid search uses existing empty-state message");
     item("searchField")->setProperty("text", "");
@@ -176,11 +184,12 @@ int main(int argc, char **argv) {
     require(qAbs(item("detailCoverFrame")->width() - 180*screen.width()/600.0) < 1, "detail cover uses enlarged reference proportions");
     require(qAbs(item("detailCoverFrame")->mapToScene(QPointF()).y()-item("detailTitle")->mapToScene(QPointF()).y()) < 1, "detail cover and title align at top");
     require(item("downloadButton")->mapToScene(QPointF()).x() > item("detailCoverFrame")->mapToScene(QPointF(item("detailCoverFrame")->width(),0)).x(), "primary action stays beside cover");
-    require(item("detailEdition")->property("text").toString().contains("240 стр.") && item("detailRating")->isVisible() && item("detailGenres")->isVisible(), "edition rating and genre are visible in summary");
+    require(!item("detailEdition")->isVisible() && item("detailEdition")->property("text").toString().contains("240 стр.") && item("detailEdition")->property("text").toString().contains("Научная фантастика"), "full edition metadata stays in collapsed section after primary action");
     require(item("detailProgress")->isVisible() && item("detailProgress")->property("value").toDouble() == 37.5, "detail bar uses server percentage");
     require(item("detailDescription")->mapToScene(QPointF()).y() >= item("downloadButton")->mapToScene(QPointF(0,item("downloadButton")->height())).y(), "description follows hero without overlap");
     require(!item("descriptionToggle")->isVisible(), "short description does not show redundant expansion action");
     tap("formatButton"); settle(); capture("formats");
+    require(!item("file-201")->property("text").toString().isEmpty() && item("file-101")->property("text").toString().contains("Чтение и синхронизация позиции") && item("file-201")->property("text").toString().contains("без синхронизации") && item("file-205")->property("text").toString().contains("Только скачивание"),"format choices expose accessible labels and limitations before download");
     tap("file-201"); tap("formatCancel"); settle();
     require(client.detail()["fileId"].toInt() == 101, "cancel format selection preserves original file");
     tap("formatButton"); settle(); tap("file-201"); tap("formatConfirm"); settle();
@@ -203,6 +212,18 @@ int main(int argc, char **argv) {
     capture("collection-search");
     tap("downloadsTab"); settle(); capture("downloads");
     require(client.books().size() == 2, "UI groups two formats plus a separate downloaded book");
+    if (!client.recentBook().isEmpty()) {
+        const double headingY=item("recentHeading")->mapToScene(QPointF()).y();
+        const double viewY=item("catalog")->mapToScene(QPointF()).y();
+        std::printf("recentHeadingY=%.1f viewY=%.1f contentY=%.1f originY=%.1f\n",headingY,viewY,item("catalog")->property("contentY").toDouble(),item("catalog")->property("originY").toDouble());
+        require(headingY>=viewY && headingY<viewY+100*screen.width()/600.0,"native recent heading is visible at the beginning of Downloads");
+    }
+    item("searchField")->setProperty("text","Очень ДЛИННОЕ"); tap("searchButton"); settle();
+    require(client.localQuery()=="Очень ДЛИННОЕ" && item("catalog")->property("count").toInt()==1,"local Find submits Cyrillic query in real QML");
+    capture("downloads-search"); tap("clearSearch"); settle();
+    require(client.localQuery().isEmpty() && item("catalog")->property("count").toInt()==2,"local clear restores all books");
+    require(QMetaObject::invokeMethod(item("localSort"),"activated",Q_ARG(int,2)),"choose author sorting in real QML"); settle();
+    require(client.localSort()=="author","local sorting selector changes controller preference");
     tap("book-1"); settle(); capture("offline-details");
     for (int i=0; i<30 && (!readerBookIndexed(pdfPath) || !readerBookIndexed(fb2Path)); ++i) settle(200);
     require(readerBookIndexed(pdfPath) && readerBookIndexed(fb2Path), "native scanner indexes PDF and FB2");
@@ -240,6 +261,7 @@ int main(int argc, char **argv) {
     tap("navigationButton"); settle();
     client.showDetail(1); settle(); client.selectFile(101); settle();
     require(client.detail()["remoteFileChanged"].toBool() && item("fileCheckResult")->property("text").toString().contains("приостановлен"), "card exposes durable mismatch warning");
+    require(item("downloadButton")->property("text").toString()=="Читать локально", "valid local file remains readable when the server file differs");
     reveal("detailScroll","redownloadButton"); capture("library-check-mismatch");
     setFault("features");
     require(wait(client,[&] { tap("redownloadButton"); }) && !client.detail()["remoteFileChanged"].toBool(), "card redownload action clears verified mismatch");
@@ -248,11 +270,11 @@ int main(int argc, char **argv) {
     require(item("syncList")->isVisible() && item("syncList")->property("count").toInt()==1 && client.syncSummary()["total"].toInt()==1,
             "sync list opens with one EPUB book, independently of catalog and other formats");
     capture("sync-list");
-    tap("syncFilter-synced"); settle();
+    require(QMetaObject::invokeMethod(item("syncFilter"),"activated",Q_ARG(int,3)),"select synced in native combo"); settle();
     require(item("syncList")->property("count").toInt()==0, "unverified book does not appear under synchronized filter");
-    tap("syncFilter-attention"); settle();
-    require(item("syncList")->property("count").toInt()==1, "attention filter exposes the unverified book");
-    tap("syncFilter-all"); settle(); tap("syncBook-book:1"); settle();
+    require(QMetaObject::invokeMethod(item("syncFilter"),"activated",Q_ARG(int,1)),"select waiting in native combo"); settle();
+    require(item("syncList")->property("count").toInt()==1, "waiting filter exposes the unverified book");
+    require(QMetaObject::invokeMethod(item("syncFilter"),"activated",Q_ARG(int,0)),"select all in native combo"); settle(); tap("syncBook-book:1"); settle();
     require(item("syncDetails")->isVisible() && item("syncState-101")->property("text").toString()=="Ещё не проверено", "book opens file-specific sync actions");
     capture("sync-details");
     // Seed only this test account's own journal; no native reader database is changed.
@@ -315,6 +337,68 @@ int main(int argc, char **argv) {
     require(wait(client,[&] { tap("loginButton"); }) && configured==1 && client.authenticated(),
             "QML login configures account once and restores catalog access");
     QObject::disconnect(settingsConnection);
+    auto edge=[&](const char *view,int direction) {
+        auto v=item(view); v->setProperty("contentY",direction>0 ? qMax(0.0,v->property("contentHeight").toDouble()-v->height()) : 0.0); settle();
+    };
+    const auto oldBooks=client.books(); const int oldPage=client.page();
+    edge("catalog",1); const double oldOffset=item("catalog")->property("contentY").toDouble();
+    setFault("error");
+    require(!wait(client,[&] { tap("nextPage"); }) && client.page()==oldPage && client.books()==oldBooks &&
+        qAbs(item("catalog")->property("contentY").toDouble()-oldOffset)<1,"failed next portion preserves actual QML books and scroll offset");
+    capture("catalog-page-error"); setFault("features");
+    require(wait(client,[&] { tap("retryOperation"); }) && client.page()==oldPage+1 && item("catalog")->property("contentY").toDouble()==0,
+        "context retry loads the exact failed next portion at its beginning");
+    edge("catalog",1); require(wait(client,[&] { tap("nextPage"); }) && client.page()==2 && client.books().size()==3,
+        "list reaches the final three of 23 books");
+    require(item("catalogRange")->property("text").toString()=="Книги 21–23 из 23","range reports book numbers instead of ambiguous pages");
+    edge("catalog",-1); require(wait(client,[&] { tap("previousPage"); }) && client.page()==1,"list returns to middle portion");
+    edge("catalog",-1); require(wait(client,[&] { tap("previousPage"); }) && client.page()==0,"list returns to first portion");
+    edge("catalog",-1); tap("coverGridToggle"); settle();
+    edge("coverCatalog",1); require(wait(client,[&] { tap("nextPage"); }) && client.page()==1,"grid middle portion");
+    edge("coverCatalog",1); require(wait(client,[&] { tap("nextPage"); }) && client.page()==2 && client.books().size()==3,"grid final portion");
+    edge("coverCatalog",-1); require(wait(client,[&] { tap("previousPage"); }) && client.page()==1,"grid back middle");
+    edge("coverCatalog",-1); require(wait(client,[&] { tap("previousPage"); }) && client.page()==0,"grid back first");
+    tap("coverGridToggle"); settle(); item("catalog")->setProperty("contentY",0); settle();
+    setFault("long_ui"); require(wait(client,[&] { client.showDetail(1); }),"load unusually long metadata in real QML");
+    capture("long-metadata");
+    require(item("detailTitle")->property("truncated").toBool() &&
+        item("downloadButton")->mapToScene(QPointF(0,item("downloadButton")->height())).y()<window->height() &&
+        item("detailEdition")->property("text").toString().contains("Жанр 49"),"long title authors and 50 genres keep the primary action on the first screen");
+    tap("formatButton"); settle();
+    const double blockedY=item("catalog")->property("contentY").toDouble();
+    QMetaObject::invokeMethod(window,"pageContent",Q_ARG(QVariant,1)); settle();
+    require(item("catalog")->property("contentY").toDouble()==blockedY,"format dialog has priority over page navigation");
+    tap("file-205"); tap("formatConfirm"); setFault("features");
+    require(wait(client,[&] { tap("downloadButton"); }) && !item("downloadButton")->isVisible(),"download-only format never offers an active reading button");
+    capture("download-only"); client.closeDetail(); client.showDownloaded(true); settle();
+    tap("syncStatusButton"); settle();
+    QMetaObject::invokeMethod(item("syncFilter"),"activated",Q_ARG(int,1)); settle(); setFault("slow_progress");
+    require(!wait(client,[&] {
+        tap("syncAllStatusButton");
+        QTimer::singleShot(100,&client,[&] {
+            require(client.syncBatch()["running"].toBool() && item("stopSync")->isVisible(),"stop control appears during the native QML batch");
+            require(window->grabWindow().save(root+"/sync-running.png"),"capture running batch");
+            tap("stopSync"); require(!item("stopSync")->isEnabled(),"repeated stop is disabled");
+        });
+    }) && !client.busy() && window->property("syncFilter")=="waiting","stop returns control to local reading and preserves the selected filter");
+    capture("sync-stopped"); tap("navigationButton"); tap("navigationButton"); tap("addConnection"); settle();
+    require(item("operationMessage")->property("text").toString().isEmpty(),"sync result never appears on the connection form");
+    tap("navigationButton"); tap("navigationButton"); settle();
+    // Only the isolated client journal is seeded for pending and conflict UI states.
+    require(recordFile.open(QIODevice::ReadOnly),"read isolated state for pending card");
+    record=QJsonDocument::fromJson(recordFile.readAll()).object(); recordFile.close();
+    record["progress"]=QJsonObject{{"profile",readerProfile()},{"pending",QJsonObject{{"cfi","epubcfi(/6/2!/4/42/1:0)"},{"percentage",40}}}};
+    require(recordFile.open(QIODevice::WriteOnly|QIODevice::Truncate) && recordFile.write(QJsonDocument(record).toJson())>0,"seed pending client journal"); recordFile.close();
+    require(client.configure(client.server(),client.username()),"reload pending state"); client.showSyncFile(101); settle();
+    require(item("downloadButton")->property("text").toString()=="Читать с позиции ридера" && item("reconcilePositions")->isVisible(),"pending card exposes local reading and a separate reconciliation action");
+    capture("card-pending");
+    record["progress"]=QJsonObject{{"profile",readerProfile()},{"conflictLocal","epubcfi(/6/2!/4/14/1:0)"},
+        {"conflictRemote",QJsonObject{{"cfi","epubcfi(/6/2!/4/42/1:0)"},{"percentage",40}}}};
+    require(recordFile.open(QIODevice::WriteOnly|QIODevice::Truncate) && recordFile.write(QJsonDocument(record).toJson())>0,"seed conflict card journal"); recordFile.close();
+    require(client.configure(client.server(),client.username()),"reload card conflict"); client.showSyncFile(101); settle();
+    require(item("downloadButton")->property("text").toString()=="Выбрать позицию" && item("readReaderPosition")->isVisible(),"conflict primary action and secondary local reading stay distinct");
+    capture("card-conflict"); tap("downloadButton"); settle(); require(client.progressConflict(),"primary conflict action opens the checked position dialog"); tap("deferConflict");
+
     std::printf("PDF=%s\nFB2=%s\n", qPrintable(pdfPath), qPrintable(fb2Path));
     require(warnings == 0, "no QML warnings during navigation and downloads");
     if (argc > 3) { QTimer::singleShot(180000, &app, &QCoreApplication::quit); return app.exec(); }

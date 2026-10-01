@@ -1,6 +1,12 @@
 #pragma once
 #include <QString>
 #include <QSize>
+#include <QMap>
+#include <QStringList>
+
+struct ReaderRecent { qint64 bookId=0, openTime=0; };
+struct ReaderRecents { QString profile; bool available=false; QMap<QString,ReaderRecent> files; };
+ReaderRecents readerRecents(const QStringList &paths);
 
 QSize setupDevice();
 QString deviceFont();
