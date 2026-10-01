@@ -179,6 +179,7 @@ private:
     QJsonArray visibleItems(bool applyQuery=true) const;
     QString localFile(const QJsonObject &book) const;
     void downloadBook(const QJsonObject &book, bool renew = true);
+    void transferBook(const QJsonObject &book, bool renew);
     void openBook(const QJsonObject &book, bool applyIncoming);
     QJsonObject selectBookFile(QJsonObject book) const;
     QVariantMap bookSummary(const QJsonObject &book) const;
@@ -198,7 +199,7 @@ private:
     QJsonArray items;
     QJsonArray collectionItems;
     QList<QJsonObject> browseHistory;
-    QJsonObject detailBook, fileChoices, coverVersions;
+    QJsonObject detailBook, fileChoices, coverVersions, coverRevisions;
     QString detailMessage, activeCollectionName;
     int activeCollection = 0, detailGeneration = 0;
     bool collectionList = false;

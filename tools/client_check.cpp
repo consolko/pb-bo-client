@@ -3,7 +3,7 @@
 #include "device.h"
 #include "progress.h"
 #include "check_wait.h"
-#include <QCoreApplication>
+#include <QGuiApplication>
 #include <QEventLoop>
 #include <QTimer>
 #include <QFile>
@@ -63,7 +63,7 @@ int rssKiB() {
 }
 
 int main(int argc, char **argv) {
-    QCoreApplication app(argc, argv);
+    QGuiApplication app(argc, argv);
     if (argc==4 && QString::fromLocal8Bit(argv[1])=="--resolve-cfi") {
         QString point; double percentage=0;
         require(epubPosition(QString::fromLocal8Bit(argv[2]),QString::fromLocal8Bit(argv[3]),&percentage,&point),
@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
     }
     require(argc == 3, "data directory and fixture fault file supplied");
     const QString root = QString::fromLocal8Bit(argv[1]), fault = QString::fromLocal8Bit(argv[2]);
-    const QUrl endpoint("http://host.containers.internal:8766");
+    const QUrl endpoint(qEnvironmentVariable("BOOKORBIT_TEST_ENDPOINT", "http://host.containers.internal:8766"));
     Client c(endpoint, root);
     write(fault, "");
     require(!c.configure("http://example.com", "demo"), "reject non-local HTTP");

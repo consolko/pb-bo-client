@@ -14,3 +14,6 @@ build/
 !/tools/test_mock.py
 !/tools/fixture_position.py
 !/tools/inspect_position.py
+!/tools/audit_check.cpp
+!/tools/audit_fixtures.py
+!/tools/run_desktop_checks.py

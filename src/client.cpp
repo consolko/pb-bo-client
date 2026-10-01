@@ -1,6 +1,7 @@
 #include "client.h"
 #include "device.h"
 #include "progress.h"
+#include "sync_decision.h"
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
@@ -115,7 +116,8 @@ bool validContent(const QString &path, const QString &format) {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) return false;
     const auto head = file.peek(1024);
-    if (format == "epub" || format == "kepub" || format == "docx" || format == "cbz") return head.startsWith(QByteArray("PK\003\004", 4));
+    if (format == "epub" || format == "kepub") return validEpub(path);
+    if (format == "docx" || format == "cbz") return head.startsWith(QByteArray("PK\003\004", 4));
     if (format == "pdf") return head.startsWith("%PDF-");
     if (format == "djvu") return head.startsWith("AT&TFORM");
     if (format == "fb2") {
@@ -348,7 +350,7 @@ void Client::removeCover(int bookId) {
         writeObject(scopeDir+"/cover-index.json", coverVersions);
     }
     if (QFile::remove(scopeDir+"/cover-"+key+".png")) {
-        ++coverVersion;
+        coverRevisions[scopeDir+"/cover-"+key+".png"]=++coverVersion;
         emit coversChanged();
     }
 }
@@ -499,7 +501,14 @@ QVariantMap Client::bookSummary(const QJsonObject &book) const {
 }
 
 void Client::beginFeedback(const QString &context,int bookId,int fileId) {
-    feedbackContext=context; feedbackBookId=bookId; feedbackFileId=fileId;
+    // Entity identity is independent from the screen that initiated the action.
+    // Inline downloads/opens stay in the catalog; login's initial catalog request
+    // remains visible on the connection screen if that request fails.
+    feedbackContext=context;
+    if ((context=="book" && !detailVisible() && (uiContext=="catalog" || uiContext=="sync")) ||
+        (context=="catalog" && (uiContext=="connection" || uiContext=="settings")))
+        feedbackContext=uiContext;
+    feedbackBookId=bookId; feedbackFileId=fileId;
     feedbackResult="running"; feedbackHidden=false; message.clear();
 }
 
@@ -1119,7 +1128,17 @@ void Client::jsonRequest(const QString &path, const QJsonObject &payload, const 
         const int code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         logEvent(path.section('?', 0, 0), int(reply->error()), code);
         if (code == 401 && renew && (path.startsWith("/api/v1/books/") || path.startsWith("/api/v1/collections")) && !refreshToken.isEmpty()) {
-            renewSession([this, path, payload, callback, get, arrayResponse] { jsonRequest(path, payload, callback, false, get, arrayResponse); });
+            if (!get && path.endsWith("/progress")) {
+                // A refreshed token is not permission to replay an old sync
+                // decision. Keep the outgoing journal; the next sync starts with
+                // fresh reader/profile/server snapshots, including explicit choices.
+                renewSession([this] {
+                    finish("Вход восстановлен. Повторите сверку: прежняя позиция не отправлена повторно.",
+                           false,"progress","uncertain");
+                });
+            } else {
+                renewSession([this, path, payload, callback, get, arrayResponse] { jsonRequest(path, payload, callback, false, get, arrayResponse); });
+            }
             return;
         }
         if (reply->error() != QNetworkReply::NoError || code < 200 || code >= 300 || bytes->size() > maxJson) {
@@ -1241,6 +1260,43 @@ void Client::download(int index) {
 }
 
 void Client::downloadBook(const QJsonObject &book, bool renew) {
+    const int bookId=book["id"].toInt(), fileId=book["selectedFile"].toObject()["id"].toInt();
+    const auto previous=downloads.value(QString::number(fileId)).toObject();
+    if (previous.isEmpty()) { transferBook(book,renew); return; }
+    beginFeedback("book",bookId,fileId);
+    retryKind=2; retryBook=book;
+    if (bookId<=0 || fileId<=0 || previous["bookId"].toInt()!=bookId) {
+        finish("Этот файл уже связан с другой книгой. Обновите сведения.",false,"download"); return;
+    }
+    // Repairs and retries resolve file metadata again. A known replacement may
+    // have a different byte count under the same fileId; never use cached size.
+    working=true; message="Проверяем актуальную версию файла…"; emit changed();
+    jsonRequest("/api/v1/books/"+QString::number(bookId),{},
+        [this,book,bookId,fileId,renew](const QJsonObject &response) {
+            if (response["id"].toInt()!=bookId || !response["files"].isArray()) {
+                finish("Не удалось получить актуальные сведения о файле.",false,"download"); return;
+            }
+            QJsonObject selected;
+            for (const auto value:bookFiles(response))
+                if (value.toObject()["id"].toInt()==fileId) selected=value.toObject();
+            if (selected.isEmpty()) {
+                finish("Выбранного файла больше нет на сервере. Обновите карточку книги.",false,"download"); return;
+            }
+            if (fileFormat(selected)!=fileFormat(book["selectedFile"].toObject())) {
+                finish("Формат серверного файла изменился. Обновите карточку книги.",false,"download"); return;
+            }
+            auto refreshed=book;
+            refreshed["selectedFile"]=selected;
+            auto files=book["files"].toArray();
+            for (int i=0;i<files.size();++i)
+                if (files[i].toObject()["id"].toInt()==fileId) files[i]=selected;
+            refreshed["files"]=files;
+            working=false;
+            transferBook(refreshed,renew);
+        },renew,true);
+}
+
+void Client::transferBook(const QJsonObject &book, bool renew) {
     beginFeedback("book",book["id"].toInt(),book["selectedFile"].toObject()["id"].toInt());
     if (!ensureNetwork()) return;
     retryKind = 2; retryBook = book;
@@ -1624,7 +1680,7 @@ void Client::retry() {
 
 QString Client::coverUrl(int bookId) const {
     const QString path = scopeDir+"/cover-"+QString::number(bookId)+".png";
-    return bookId > 0 && QFileInfo::exists(path) ? QUrl::fromLocalFile(path).toString()+"?v="+QString::number(coverVersion) : QString{};
+    return bookId > 0 && QFileInfo::exists(path) ? QUrl::fromLocalFile(path).toString()+"?v="+QString::number(coverRevisions.value(path).toInt()) : QString{};
 }
 
 void Client::stopCovers() {
@@ -1688,7 +1744,7 @@ void Client::fetchNextCover() {
                     if (version.isEmpty()) coverVersions.remove(QString::number(id));
                     else coverVersions[QString::number(id)]=version;
                     writeObject(scopeDir+"/cover-index.json",coverVersions);
-                    ++coverVersion; emit coversChanged();
+                    coverRevisions[path]=++coverVersion; emit coversChanged();
                     cleanupCovers();
                 }
             }
@@ -1835,8 +1891,7 @@ void Client::syncBook(const QString &id, int choice) {
         finish("Не удалось проверить состояние читалки. Позиции не изменены; повторите проверку.",false,"progress","reader_unknown"); return;
     }
     const QString local=nativeCfi(position);
-    double percentage=0;
-    if ((!position.isEmpty() && local.isEmpty()) || (!local.isEmpty() && !epubPosition(path,local,&percentage))) {
+    if ((!position.isEmpty() && local.isEmpty()) || (!local.isEmpty() && !epubPosition(path,local,nullptr))) {
         finish("Формат локальной позиции не поддерживается. Прогресс не изменён.",false,"progress","position"); return;
     }
     working=true; retryKind=0; stopCovers();
@@ -1845,7 +1900,7 @@ void Client::syncBook(const QString &id, int choice) {
     emit changed();
     const QString route="/api/v1/books/files/"+id+"/progress";
     // ponytail: trust the downloaded file identity; explicit library verification detects server replacements.
-        jsonRequest(route,{},[this,id,path,position,local,percentage,choice,route,profile](const QJsonObject &remote) {
+        jsonRequest(route,{},[this,id,path,position,local,choice,route,profile](const QJsonObject &remote) {
             QString current;
             if (readerProfile()!=profile || readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position) {
                 finish("Состояние читалки изменилось. Повторите синхронизацию.",false,"progress"); return;
@@ -1885,22 +1940,28 @@ void Client::syncBook(const QString &id, int choice) {
                 state={{"localBase",local},{"remoteBase",remote}};
                 if (persist()) { dismissConflict(); finish("Прогресс синхронизирован",true,"progress"); }
             };
-            if (local==cfi) { acknowledge(); return; }
+            const auto equivalent=[&path](const QString &a,const QString &b,bool range=false) {
+                return a==b || sameEpubPosition(path,a,b,range);
+            };
+            if (equivalent(local,cfi)) { acknowledge(); return; }
             const bool known=state.contains("profile") && state["profile"].toString()==profile &&
                 state.contains("localBase") && state["remoteBase"].isObject();
-            const bool localChanged=known ? local!=state["localBase"].toString() : !local.isEmpty();
-            const bool remoteChanged=known ? remoteCfi!=state["remoteBase"].toObject()["cfi"].toString() : !remoteEmpty;
+            const bool localChanged=known ? !equivalent(local,state["localBase"].toString()) : !local.isEmpty();
+            const bool remoteChanged=known ? !equivalent(remoteCfi,state["remoteBase"].toObject()["cfi"].toString(),true) : !remoteEmpty;
             int action=0;
             const bool changedChoice=choice && (conflictId!=id || conflictProfile!=profile || conflictLocal!=local || conflictRemote!=remote);
             if (changedChoice) action=0; // A stale explicit choice must never become an automatic write.
             else if (choice) action=choice;
             else if (state.contains("profile") && !pending.isEmpty() && pending==remote && state["pendingLocal"].toString()==local && state["profile"].toString()==profile) action=2;
-            else if (!known || localChanged || remoteChanged) {
-                if (localChanged && !remoteChanged) action=1;
-                else if (remoteChanged && !localChanged) action=2;
-            } else {
-                if (persist()) finish("Прогресс не изменился",true,"progress");
-                return;
+            else {
+                switch (decideSync(known,localChanged,remoteChanged)) {
+                case SyncDecision::Upload: action=1; break;
+                case SyncDecision::ApplyRemote: action=2; break;
+                case SyncDecision::Unchanged:
+                    if (persist()) finish("Прогресс не изменился",true,"progress");
+                    return;
+                case SyncDecision::Conflict: break;
+                }
             }
             if (!action) {
                 // Persist both versions; after restart the next GET rechecks the conflict.
@@ -1926,6 +1987,11 @@ void Client::syncBook(const QString &id, int choice) {
                 finish(hasPage ? "Серверная позиция содержит номер страницы. Отправка остановлена, чтобы не стереть его." :
                        other ? "Серверная запись содержит другие координаты чтения. Отправка остановлена, чтобы сохранить их." :
                                "На ридере ещё нет точной позиции.",false,"progress"); return;
+            }
+            double percentage=0;
+            if (!epubPosition(path,local,&percentage)) {
+                finish("Координата распознана, но не удалось оценить процент книги для отправки. Позиции не изменены.",
+                       false,"progress","position"); return;
             }
             // Save before POST. An uncertain result is reconciled by the next GET, never blindly retried.
             const QJsonObject outgoing{{"source","text"},{"cfi",local},{"pageNumber",QJsonValue::Null},{"percentage",percentage}};

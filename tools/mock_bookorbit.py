@@ -31,6 +31,17 @@ def epub(number):
     return out.getvalue()
 
 
+def changed_epub():
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(epub(1))) as original, zipfile.ZipFile(output, "w") as archive:
+        for name in original.namelist():
+            raw = original.read(name)
+            if name == "chapter.xhtml":
+                raw = raw.replace(b"</body>", b"<p>A longer replacement edition.</p></body>")
+            archive.writestr(zipfile.ZipInfo(name, (2026, 9, 28, 0, 0, 0)), raw)
+    return output.getvalue()
+
+
 def cover(number):
     """Small deterministic PNG cover; no image library needed by the fixture."""
     w, h = 160, 240
@@ -131,6 +142,11 @@ class Handler(BaseHTTPRequestHandler):
                 temporary.replace(self.server.count_file)
         fault = self.server.fault_file
         mode = fault.read_text().strip() if fault and fault.exists() else ""
+        if mode == "audit_catalog_error" and path == "/api/v1/books/query":
+            return self.send(503, {})
+        if mode == "audit_post401" and path == "/api/v1/books/files/101/progress" and self.command == "POST":
+            fault.write_text("audit_refresh_race")
+            return self.send(401, {})
         if path == "/api/v1/auth/login" and self.command == "POST":
             if (body.get("username"), body.get("password"), body.get("clientKind")) != ("demo", "demo", "native"):
                 return self.send(401, {"message": "Use demo / demo on this local fixture"})
@@ -139,6 +155,9 @@ class Handler(BaseHTTPRequestHandler):
             expiry = (datetime.now(timezone.utc)+timedelta(hours=1)).isoformat()
             return self.send(200, {"accessToken": TOKEN, "refreshToken": "0"*64, "accessTokenExpiresAt": expiry, "refreshTokenExpiresAt": expiry, "user": {"id": 1, "username": "demo"}})
         if path in ("/api/v1/auth/refresh", "/api/v1/auth/logout") and self.command == "POST":
+            if mode == "audit_refresh_race":
+                self.server.progress["101"] = {"cfi": "epubcfi(/6/2!/4/82/1)", "pageNumber": None, "percentage": 40}
+                fault.write_text("")
             if mode == "slow_refresh":
                 time.sleep(0.5)
                 fault.write_text("")
@@ -198,6 +217,10 @@ class Handler(BaseHTTPRequestHandler):
             if mode == "long_ui":
                 book.update(title="Очень длинное название книги "*20, authors=[{"name":"Автор с длинным именем "+str(i)} for i in range(8)],
                             genres=["Жанр "+str(i) for i in range(50)], publisher="Длинное издательство "*20)
+            if mode in ("audit_new_file", "audit_zip_file"):
+                from audit_fixtures import ordinary_zip
+                raw = changed_epub() if mode == "audit_new_file" else ordinary_zip()
+                book["files"] = [dict(entry, sizeBytes=len(raw)) if entry["id"] == 101 else entry for entry in book["files"]]
             book.pop("readingProgress", None)  # Real detail API has no book-level percentage.
             if mode == "bad_files":
                 book["files"] = [{"id": 201, "format": "../pdf", "role": "primary", "sizeBytes": 1}]
@@ -270,6 +293,9 @@ class Handler(BaseHTTPRequestHandler):
             if mode == "html_error" and match[1] == "101":
                 return self.send(200, b"<html>Login required</html>", "text/html")
             raw = epub(9 if mode == "changed" and match[1] == "101" else int(match[1])-100)
+            if match[1] == "101" and mode in ("audit_new_file", "audit_zip_file"):
+                from audit_fixtures import ordinary_zip
+                raw = changed_epub() if mode == "audit_new_file" else ordinary_zip()
             if mode == "slow":
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(raw)))

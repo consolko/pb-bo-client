@@ -271,7 +271,9 @@ bool saveReaderPosition(const QString &path, const QString &expectedPosition,
     double percentage=0;
     QString point;
     *error = "Координата не подходит к этому EPUB.";
-    if (!epubPosition(path,cfi,&percentage,&point)) return false;
+    if (!epubPosition(path,cfi,nullptr,&point)) return false;
+    *error = "Координата распознана, но не удалось оценить процент книги для штатной библиотеки.";
+    if (!epubPosition(path,cfi,&percentage)) return false;
     *error = "Закройте все книги в штатной читалке и повторите синхронизацию.";
     if (readerFileState(path) != ReaderFileState::Closed) return false;
     // Different paths can share one native book_id. Block all open books, including aliases.
