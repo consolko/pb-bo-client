@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
         settle(400);
         require(window->grabWindow().save(root+"/"+QString::fromLatin1(name)+".png"), name);
     };
-    require(wait(client, [&] { client.login("demo", "demo"); }), "load catalog into production QML"); capture("catalog");
+    require(wait(client, [&] { client.login(client.server(), "demo", "demo"); }), "load catalog into production QML"); capture("catalog");
     auto item = [&](const char *name) { return findItem(window->contentItem(), QString::fromLatin1(name)); };
     require(item("reading-1")->property("text").toString() == "Читаю · 37,5 %", "catalog shows reading progress");
     require(item("reading-2")->property("text").toString() == "Прочитано", "finished books show status without percentage");
@@ -301,6 +301,20 @@ int main(int argc, char **argv) {
     tap("navigationButton"); settle(); capture("sync-list-conflict");
     tap("navigationButton"); settle();
     require(item("catalog")->isVisible() && !item("syncList")->isVisible(), "back restores the downloaded library");
+    require(window->property("syncData").toMap()["books"].toList().size() == client.syncBooks().size(),
+            "QML sync list and counters share the same snapshot");
+    setFault("always401");
+    require(!wait(client,[&] { client.showDownloaded(false); }) && !client.hasSavedSession(), "UI final 401 invalidates saved connection");
+    tap("navigationButton"); settle(); tap("connectButton"); settle();
+    require(window->property("addingConnection").toBool() && password->isVisible(), "connect opens password form after final 401");
+    password->setProperty("text","demo"); setFault("features");
+    int configured = 0;
+    const auto settingsConnection = QObject::connect(&client,&Client::completed,&client,[&](const QString &operation,bool) {
+        if (operation=="settings") ++configured;
+    });
+    require(wait(client,[&] { tap("loginButton"); }) && configured==1 && client.authenticated(),
+            "QML login configures account once and restores catalog access");
+    QObject::disconnect(settingsConnection);
     std::printf("PDF=%s\nFB2=%s\n", qPrintable(pdfPath), qPrintable(fb2Path));
     require(warnings == 0, "no QML warnings during navigation and downloads");
     if (argc > 3) { QTimer::singleShot(180000, &app, &QCoreApplication::quit); return app.exec(); }

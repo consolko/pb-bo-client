@@ -76,14 +76,36 @@ int main(int argc, char **argv) {
     require(!c.configure("http://example.com", "demo"), "reject non-local HTTP");
     require(!c.configure("https://user:secret@example.com", "a"), "reject URL credentials");
     require(!c.configure("https://example.com?token=secret", "a"), "reject URL query");
-    require(wait(c, [&] { c.login("demo", "demo"); }), "login and catalog");
+    int configured = 0;
+    const auto settingsConnection = QObject::connect(&c, &Client::completed, &c, [&](const QString &operation, bool) {
+        if (operation == "settings") ++configured;
+    });
+    require(wait(c, [&] { c.login(c.server(), "demo", "demo"); }) && configured == 1, "login configures account exactly once");
+    QObject::disconnect(settingsConnection);
     const QString sessionFile = root+"/"+QString::fromLatin1(QCryptographicHash::hash((endpoint.toString()+"\ndemo").toUtf8(), QCryptographicHash::Sha256).toHex().left(24))+"/session.json";
     require(c.hasSavedSession() && contents(sessionFile).contains("refreshToken") && !contents(sessionFile).contains("password"),
             "successful login saves refresh token without password");
     Client resumed(endpoint, root);
-    require(resumed.hasSavedSession() && wait(resumed, [&] { resumed.restoreSession(); }) && resumed.authenticated(),
+    int restoredSettings = 0;
+    QObject::connect(&resumed, &Client::completed, &resumed, [&](const QString &operation, bool) {
+        if (operation == "settings") ++restoredSettings;
+    });
+    require(resumed.hasSavedSession() && wait(resumed, [&] { resumed.login(resumed.server()+"/", "demo", ""); }) &&
+            resumed.authenticated() && restoredSettings == 0,
             "restart restores the session without entering a password");
+    Client pending(endpoint,root);
+    const int refreshBefore = requests(root,"POST /api/v1/auth/refresh");
+    require(!wait(pending,[&] { pending.login("https://other.example.test","demo",""); }) &&
+            !wait(pending,[&] { pending.login(pending.server(),"other-user",""); }) &&
+            pending.hasSavedSession() && !pending.authenticated() && pending.server()==endpoint.toString() &&
+            requests(root,"POST /api/v1/auth/refresh")==refreshBefore, "blank password cannot restore another server or user");
+    write(fault,"error");
+    require(!wait(pending,[&] { pending.restoreSession(); }) && pending.hasSavedSession() && QFile::exists(sessionFile),
+            "refresh 503 retains saved session for a later retry");
+    write(fault,"");
+    require(wait(pending,[&] { pending.restoreSession(); }) && pending.authenticated(), "saved session can be restored after transient refresh failure");
     write(sessionFile, QJsonDocument(QJsonObject{{"refreshToken", QString(64, '0')}, {"password", "legacy secret"}}).toJson());
+    require(QFile::setPermissions(sessionFile, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ReadGroup | QFileDevice::ReadOther), "seed permissive legacy session");
     Client migrated(endpoint, root);
     require(migrated.hasSavedSession() && !contents(sessionFile).contains("password") &&
             !(QFileInfo(sessionFile).permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther)),
@@ -92,9 +114,14 @@ int main(int argc, char **argv) {
     const QString accountKey=QString::fromLatin1(QCryptographicHash::hash((endpoint.toString()+"\ndemo").toUtf8(),QCryptographicHash::Sha256).toHex().left(24));
     require(QDir().mkpath(unprotectedRoot+"/"+accountKey+"/session.json"), "inject session storage failure");
     Client unprotected(endpoint,unprotectedRoot,nullptr,false);
-    require(wait(unprotected,[&] { unprotected.login("demo","demo"); }) && unprotected.authenticated() &&
+    require(wait(unprotected,[&] { unprotected.login(unprotected.server(), "demo","demo"); }) && unprotected.authenticated() &&
             !unprotected.hasSavedSession() && !unprotected.sessionWarning().isEmpty(),
             "unsafe session storage does not undo successful login");
+    write(fault, "always401");
+    require(!wait(unprotected, [&] { unprotected.refresh(); }) && !unprotected.authenticated() &&
+            !unprotected.hasSavedSession() && !unprotected.sessionWarning().isEmpty(),
+            "failed session deletion still invalidates in-memory state and leaves a warning");
+    write(fault, "");
     require(wait(c, [&] { c.showDownloaded(false); }), "opening catalog fetches online");
     require(c.books().size() == 3, "catalog contains three books");
     const QString catalogPath = QFileInfo(sessionFile).absolutePath()+"/catalog.json";
@@ -153,7 +180,7 @@ int main(int argc, char **argv) {
     require(!epubPosition(root+"/multi.epub","epubcfi(/6/4[wrong]!/4/14/1)",nullptr), "reject wrong CFI ID assertion");
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/14/1:65)";
     const int syncDownloads=requests(root,"GET /api/v1/books/files/101/download")+requests(root,"GET /api/v1/books/files/102/download");
-    require(wait(c,[&] { c.syncProgress(0); }), "upload native reading position to empty server");
+    require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }), "upload native reading position to empty server");
     require(c.syncSummary()["synced"].toInt()==1, "only confirmed sync contributes to success count");
     Client statusRestart(endpoint,root);
     require(statusRestart.syncSummary()["synced"].toInt()==1, "confirmed status survives restart without a network session");
@@ -163,48 +190,48 @@ int main(int argc, char **argv) {
     require(wait(c,[&] { c.syncFile(101); }), "retry restores the confirmed state");
     require(QJsonDocument::fromJson(contents(scope+"/records/101.json")).object()["progress"].toObject()["localBase"]==nativeCfi(fakePosition), "persist agreed baseline");
     const int firstDownloads = requests(root, "GET /api/v1/books/files/101/download");
-    require(wait(c,[&] { c.syncProgress(0); }) && requests(root, "GET /api/v1/books/files/101/download") == firstDownloads,
+    require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && requests(root, "GET /api/v1/books/files/101/download") == firstDownloads,
             "unchanged progress uses GET without downloading EPUB again");
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/6/1)";
     const int beforeMovedDownload=requests(root,"GET /api/v1/books/files/101/download");
-    require(wait(c,[&] { c.syncProgress(0); }), "sync deliberate backwards reading without percentage ordering");
+    require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }), "sync deliberate backwards reading without percentage ordering");
     require(requests(root,"GET /api/v1/books/files/101/download")==beforeMovedDownload,
             "changed local position uploads without downloading EPUB");
     write(fault,"progress_remote");
     applyAllowed=false; opened=false;
-    require(!wait(c,[&] { c.syncProgress(0); }), "native write failure is not reported as synchronization success");
+    require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }), "native write failure is not reported as synchronization success");
     Client pendingRestart(endpoint,root);
     pendingRestart.showDownloaded(true);
     require(pendingRestart.books()[0].toMap()["pendingProgress"].toBool(), "incoming position survives restart");
     fakeReader=ReaderFileState::Open;
-    require(!wait(c,[&] { c.syncProgress(0); }) && appliedCfi.isEmpty(), "never apply incoming position to an open reader");
+    require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && appliedCfi.isEmpty(), "never apply incoming position to an open reader");
     require(c.syncBooks()[0].toMap()["state"]=="reader", "open reader has an actionable status");
     fakeReader=ReaderFileState::Unknown;
     require(!wait(c,[&] { c.syncFile(101); }) && c.syncBooks()[0].toMap()["state"]=="reader_unknown", "unknown reader is not described as definitely open");
     fakeReader=ReaderFileState::Closed;
     applyAllowed=true;
-    require(wait(c,[&] { c.syncProgress(0); }) && appliedCfi=="epubcfi(/6/2!/4/62/1)" && !opened,
+    require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && appliedCfi=="epubcfi(/6/2!/4/62/1)" && !opened,
             "retry saves pending incoming CFI without opening any book");
     require(!c.books()[0].toMap()["pendingProgress"].toBool(), "confirmed native write clears pending state");
-    require(wait(c,[&] { c.syncProgress(0); }), "acknowledge applied position without echo upload");
+    require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }), "acknowledge applied position without echo upload");
     write(fault,"progress_range");
-    require(wait(c,[&] { c.syncProgress(0); }) && appliedCfi=="epubcfi(/6/2!/4/42/1:0)" && !opened,
+    require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && appliedCfi=="epubcfi(/6/2!/4/42/1:0)" && !opened,
             "incoming server range saves a point without launching reader");
-    require(wait(c,[&] { c.syncProgress(0); }) &&
+    require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) &&
             QJsonDocument::fromJson(contents(scope+"/records/101.json")).object()["progress"].toObject()["remoteBase"].toObject()["cfi"].toString().contains(','),
             "repeat sync preserves original server range without echo upload");
     fakeProfile="range-first-sync";
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/6/1)";
-    require(!wait(c,[&] { c.syncProgress(0); }) && c.progressConflict(), "first sync with local point and remote range requires explicit choice");
+    require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && c.progressConflict(), "first sync with local point and remote range requires explicit choice");
     require(wait(c,[&] { c.resolveProgress(false); }) && appliedCfi=="epubcfi(/6/2!/4/42/1:0)",
             "explicit range choice saves validated start");
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/8/1)";
-    require(wait(c,[&] { c.syncProgress(0); }) && !c.progressConflict(), "reading after incoming range uploads against original server baseline");
+    require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && !c.progressConflict(), "reading after incoming range uploads against original server baseline");
     fakeProfile="default";
-    require(wait(c,[&] { c.syncProgress(0); }), "same positions acknowledge current default profile");
+    require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }), "same positions acknowledge current default profile");
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/10/1)";
     write(fault,"progress_other");
-    require(!wait(c,[&] { c.syncProgress(0); }) && c.progressConflict(), "two changed sides create explicit conflict");
+    require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && c.progressConflict(), "two changed sides create explicit conflict");
     const int conflictGets=requests(root,"GET /api/v1/books/files/101/progress");
     c.dismissConflict(); networkAvailable=false;
     c.inspectConflict(101);
@@ -218,10 +245,10 @@ int main(int argc, char **argv) {
     require(wait(c,[&] { c.resolveProgress(true); }) && !c.progressConflict(), "explicit local conflict choice rechecks and uploads");
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/12/1)";
     write(fault,"progress_metadata");
-    require(wait(c,[&] { c.syncProgress(0); }) && !c.progressConflict(), "server timestamp alone is not a competing reading position");
+    require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && !c.progressConflict(), "server timestamp alone is not a competing reading position");
     fakeProfile="another-profile";
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/16/1)";
-    require(!wait(c,[&] { c.syncProgress(0); }) && c.progressConflict(), "another native profile cannot reuse an agreed baseline");
+    require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && c.progressConflict(), "another native profile cannot reuse an agreed baseline");
     require(wait(c,[&] { c.resolveProgress(false); }) && !opened, "explicit server choice saves without launching reader");
     fakeProfile="default";
     blockedPath=file;
@@ -233,20 +260,20 @@ int main(int argc, char **argv) {
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/18/1)";
     const int beforePagePosts = requests(root, "POST /api/v1/books/files/101/progress");
     write(fault,"progress_page");
-    require(!wait(c,[&] { c.syncProgress(0); }) && c.status().contains("страниц") &&
+    require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && c.status().contains("страниц") &&
             requests(root, "POST /api/v1/books/files/101/progress") == beforePagePosts,
             "server page number blocks outgoing POST and remains intact on retry");
-    require(!wait(c,[&] { c.syncProgress(0); }) && c.status().contains("страниц") &&
+    require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && c.status().contains("страниц") &&
             requests(root, "POST /api/v1/books/files/101/progress") == beforePagePosts,
             "server page number survives blocked upload");
     write(fault,"progress_page_conflict");
-    require(!wait(c,[&] { c.syncProgress(0); }) && c.progressConflict(), "page-number record can still require explicit conflict choice");
+    require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && c.progressConflict(), "page-number record can still require explicit conflict choice");
     require(!wait(c,[&] { c.resolveProgress(true); }) && c.status().contains("страниц") &&
             requests(root, "POST /api/v1/books/files/101/progress") == beforePagePosts,
             "explicit local choice cannot erase remote page number");
     write(fault,"changed");
     const int beforeChangedPosts=requests(root,"POST /api/v1/books/files/101/progress");
-    require(!wait(c,[&] { c.syncProgress(0); }) && c.progressConflict(), "ordinary sync trusts downloaded identity until a full check");
+    require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && c.progressConflict(), "ordinary sync trusts downloaded identity until a full check");
     require(requests(root,"GET /api/v1/books/files/101/download")+requests(root,"GET /api/v1/books/files/102/download")==syncDownloads,
             "first, incoming, changed, conflict and batch progress checks never download books");
     const QByteArray beforeCheck=contents(scope+"/records/101.json"), beforeFile=contents(file);
@@ -260,13 +287,13 @@ int main(int argc, char **argv) {
             requests(root,"GET /api/v1/books/files/101/progress")+requests(root,"GET /api/v1/books/files/102/progress")==beforeProgressGets &&
             requests(root,"POST /api/v1/books/files/101/progress")==beforeChangedPosts,
             "verification preserves books and progress and never calls progress API");
-    require(!wait(c,[&] { c.syncProgress(0); }) && c.status().contains("приостановлен"), "known mismatch blocks progress before network access");
+    require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && c.status().contains("приостановлен"), "known mismatch blocks progress before network access");
     Client mismatchRestart(endpoint,root);
     require(mismatchRestart.books()[0].toMap()["remoteFileChanged"].toBool() &&
             wait(mismatchRestart,[&] { mismatchRestart.restoreSession(); }), "mismatch survives restart and login");
     opened=false;
     require(wait(mismatchRestart,[&] { mismatchRestart.open(0); }) && opened, "known server mismatch still permits local reading");
-    require(!wait(mismatchRestart,[&] { mismatchRestart.syncProgress(0); }) && mismatchRestart.status().contains("приостановлен"), "restarted client blocks incoming and outgoing progress for mismatched file");
+    require(!wait(mismatchRestart,[&] { mismatchRestart.syncFile(mismatchRestart.books().first().toMap()["fileId"].toInt()); }) && mismatchRestart.status().contains("приостановлен"), "restarted client blocks incoming and outgoing progress for mismatched file");
     write(fault,"");
     require(wait(c,[&] { c.verifyLibrary(); }) && !c.books()[0].toMap()["remoteFileChanged"].toBool() &&
             c.status().contains("совпало: 2"), "matching full check clears durable mismatch");
@@ -317,10 +344,10 @@ int main(int argc, char **argv) {
     const int authNextDownloads=requests(root,"GET /api/v1/books/files/102/download");
     require(!wait(c,[&] { c.verifyLibrary(); }) && !c.authenticated() && c.status().contains("не проверено: 1") &&
             requests(root,"GET /api/v1/books/files/102/download")==authNextDownloads, "lost authorization stops remaining verification queue");
-    require(wait(c,[&] { c.login("demo","demo"); }), "restore synthetic login after verification auth failure");
+    require(wait(c,[&] { c.login(c.server(), "demo","demo"); }), "restore synthetic login after verification auth failure");
     write(fault,"");
     networkAvailable=false;
-    require(!wait(c,[&] { c.syncProgress(0); }) && !c.busy(), "network failure leaves durable progress available for retry");
+    require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && !c.busy(), "network failure leaves durable progress available for retry");
     networkAvailable=true;
     require(c.setDiagnosticLogging(true) && c.diagnosticLogPath()==root+"/diagnostic.log", "diagnostics stay in application directory");
     fakePosition.clear();
@@ -427,9 +454,15 @@ int main(int argc, char **argv) {
     const QString orphanPart = scope+"/101-"+QUuid::createUuid().toString(QUuid::WithoutBraces)+".part";
     write(orphanPart, "partial");
     write(orphanPart+".ABC123", "partial temporary");
+    const QString firstOrphan = scope+"/999-"+QUuid::createUuid().toString(QUuid::WithoutBraces)+".epub";
+    const QString pdfOrphan = scope+"/998-"+QUuid::createUuid().toString(QUuid::WithoutBraces)+".pdf";
+    const QString legacyOrphan = scope+"/997.epub";
+    write(firstOrphan, "first interrupted download"); write(pdfOrphan, "%PDF-old"); write(legacyOrphan, "unproven legacy file");
     Client afterCrash(endpoint, root);
     require(!QFile::exists(orphan) && !QFile::exists(orphanPart) && !QFile::exists(orphanPart+".ABC123"),
             "restart removes only owned unreferenced versions and partial downloads");
+    require(!QFile::exists(firstOrphan) && !QFile::exists(pdfOrphan) && QFile::exists(legacyOrphan),
+            "cleanup removes first-download and non-EPUB UUID orphans but preserves unproven legacy files");
     require(QFile::rename(recordPath, recordPath+".saved"), "save record before corruption test");
     write(recordPath, "{");
     Client badRecord(endpoint, root);
@@ -440,10 +473,16 @@ int main(int argc, char **argv) {
     Client incompleteRecord(endpoint, root);
     require(QFile::exists(changedFile), "incomplete record never deletes an EPUB");
     require(QFile::remove(recordPath) && QFile::rename(recordPath+".saved", recordPath), "restore record after corruption test");
+    const QString transfers = scope+"/transfers";
+    require(QDir().rename(transfers, transfers+".saved"), "save transfer directory before failure test");
+    write(transfers, "blocked"); write(fault, "");
+    require(!wait(c, [&] { c.download(0); }) && c.localFile(0) == changedFile,
+            "journal persistence failure keeps previous book and blocks promotion");
+    require(QFile::remove(transfers) && QDir().rename(transfers+".saved", transfers), "restore transfer directory");
     write(fault, "expired");
     require(!wait(c, [&] { c.download(0); }) && !c.authenticated(), "download 401 expires session");
     write(fault, "");
-    require(wait(c, [&] { c.login("demo", "demo"); }), "login after expiry");
+    require(wait(c, [&] { c.login(c.server(), "demo", "demo"); }), "login after expiry");
     write(fault, "error");
     require(!wait(c, [&] { c.refresh(0, ""); }) && c.canRetry() && c.books().isEmpty(), "catalog outage clears previous page and offers retry");
     write(fault, "");
@@ -451,11 +490,29 @@ int main(int argc, char **argv) {
     require(wait(c, [&] { c.logout(); }), "server logout completes");
     require(!c.authenticated() && !c.hasSavedSession() && !QFile::exists(sessionFile) && c.books().size() == 2,
             "logout clears saved credentials and keeps downloads");
-    require(wait(c, [&] { c.login("demo", "demo"); }), "new session after logout");
+    require(wait(c, [&] { c.login(c.server(), "demo", "demo"); }), "new session after logout");
     write(fault, "always401");
     require(!wait(c, [&] { c.refresh(); }) && !c.authenticated(), "persistent 401 stops after one renewal");
     write(fault, "");
-    require(wait(c, [&] { c.login("demo", "demo"); }), "new session after rejected renewal");
+    require(wait(c, [&] { c.login(c.server(), "demo", "demo"); }), "new session after rejected renewal");
+    for (int operation = 0; operation < 3; ++operation) {
+        const int renewals = requests(root, "POST /api/v1/auth/refresh");
+        write(fault, "always401");
+        require(!wait(c, [&] {
+            if (operation == 0) c.refresh();
+            else if (operation == 1) c.download(0);
+            else c.verifyLibrary();
+        }) && !c.authenticated() && !c.hasSavedSession() && !QFile::exists(sessionFile) &&
+            requests(root, "POST /api/v1/auth/refresh") == renewals+1,
+            "final 401 clears stored session after one successful renewal for every request path");
+        write(fault, "");
+        require(wait(c, [&] { c.login(c.server(), "demo", "demo"); }), "manual login works after final 401");
+    }
+    write(fault, "bad_auth");
+    require(!wait(c, [&] { c.login(c.server(), "demo", "demo"); }) && !c.authenticated() &&
+            !c.hasSavedSession() && !QFile::exists(sessionFile), "invalid credentials response removes stale saved session");
+    write(fault, "");
+    require(wait(c, [&] { c.login(c.server(), "demo", "demo"); }), "manual login works after malformed credentials");
     QEventLoop finalCover;
     auto coverConnection = QObject::connect(&c, &Client::coversChanged, &finalCover, [&] {
         if (!c.coverUrl(1).isEmpty()) finalCover.quit();
@@ -496,16 +553,20 @@ int main(int argc, char **argv) {
     require(partial.books().size() == 2 && !partial.localFile(0).isEmpty() && QFile::exists(legacyScope+"/downloads.json"), "partial migration keeps legacy data");
     require(QDir().rmdir(legacyScope+"/records/102.json"), "clear migration fault");
     require(QDir().mkdir(legacyScope+"/downloads-v1.json"), "inject backup rename failure");
+    const QString migrationOrphan = legacyScope+"/999-"+QUuid::createUuid().toString(QUuid::WithoutBraces)+".epub";
+    write(migrationOrphan,"defer cleanup until migration backup succeeds");
     Client beforeBackup(endpoint, legacyRoot);
     beforeBackup.showDownloaded(true);
     require(beforeBackup.books().size() == 2 && QFile::exists(legacyScope+"/records/101.json") &&
             QFile::exists(legacyScope+"/records/102.json") && QFile::exists(legacyScope+"/downloads.json"),
             "restart after all records written keeps old registry until backup succeeds");
+    require(QFile::exists(migrationOrphan), "failed migration backup blocks cleanup");
     require(QDir().rmdir(legacyScope+"/downloads-v1.json"), "clear backup rename fault");
     Client legacy(endpoint, legacyRoot);
     legacy.showDownloaded(true);
     require(legacy.books().size() == 2 && !legacy.localFile(0).isEmpty() &&
             QFile::exists(legacyScope+"/downloads-v1.json") && !QFile::exists(legacyScope+"/downloads.json"), "migration resumes and keeps backup");
+    require(!QFile::exists(migrationOrphan), "completed migration permits owned orphan cleanup");
     const QString manyRoot = root+"/many-check";
     const QString manyScope = manyRoot+"/"+QFileInfo(scope).fileName();
     require(QDir().mkpath(manyScope+"/records"), "create large isolated library");
@@ -549,7 +610,7 @@ int main(int argc, char **argv) {
     Client folders(endpoint, folderRoot, nullptr, false);
     require(folders.setDiagnosticLogging(true) && folders.diagnosticLogging() &&
             contents(folders.diagnosticLogPath()).contains("diagnostics enabled"), "diagnostic logging is opt-in");
-    require(wait(folders, [&] { folders.login("demo", "demo"); }), "folder check login");
+    require(wait(folders, [&] { folders.login(folders.server(), "demo", "demo"); }), "folder check login");
     require(wait(folders, [&] { folders.download(0); }), "download before choosing folder");
     const QString beforeChoice = folders.localFile(0);
     require(!folders.setDownloadDirectory("/mnt/ext1/system") &&
@@ -598,11 +659,102 @@ int main(int argc, char **argv) {
             folders.username() == "demo", "failed account save reports file error and preserves connection");
     require(QDir().rmdir(accountsFile) && QFile::rename(accountsFile+".saved", accountsFile), "restore account settings");
     require(savedFolders.configure("https://books.example.test", "other") && savedFolders.books().isEmpty(), "shared folder does not expose another account's books");
+
+    const QByteArray recoveryEpub = contents(changedFile);
+    for (const auto &format : {QString("epub"), QString("pdf")}) {
+        for (bool shared : {false, true}) for (bool replacement : {false, true}) for (int phase = 0; phase < 3; ++phase) {
+            const QString caseName = "bookorbit-check-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
+            const QString caseRoot = root+"/"+caseName;
+            Client setup(endpoint, caseRoot, nullptr, false);
+            require(setup.configure(endpoint.toString(), "demo"), "prepare isolated transfer recovery account");
+            const QString caseScope = caseRoot+"/"+accountKey;
+            const QString directory = shared ? "/mnt/ext1/books/"+caseName : caseScope;
+            require(QDir().mkpath(directory) && QDir().mkpath(caseScope+"/transfers"), "prepare recovery paths");
+            const QString nextStem = "700-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
+            const QString previousStem = "700-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
+            const QString nextPath = directory+"/"+nextStem+"."+format, previousPath = directory+"/"+previousStem+"."+format;
+            const QString part = caseScope+"/"+nextStem+".part", journal = caseScope+"/transfers/"+nextStem+".json";
+            const QByteArray nextBytes = format == "epub" ? recoveryEpub : QByteArray("%PDF-1.4\nsynthetic recovery\n");
+            const QByteArray previousBytes = nextBytes+"previous";
+            auto recordFor = [&](const QString &stem, const QByteArray &bytes) {
+                QJsonObject file{{"id",700},{"format",format},{"role","primary"},{"sizeBytes",double(bytes.size())}};
+                QJsonObject book{{"id",700},{"title","Recovery"},{"selectedFile",file},{"files",QJsonArray{file}}};
+                QJsonObject record{{"bookId",700},{"fileId",700},{"filename",stem+"."+format},{"format",format},
+                    {"sha256",QString::fromLatin1(QCryptographicHash::hash(bytes,QCryptographicHash::Sha256).toHex())},
+                    {"bytes",double(bytes.size())},{"book",book}};
+                if (shared) record["directory"]=directory;
+                return record;
+            };
+            const auto next = recordFor(nextStem,nextBytes);
+            const auto previous = replacement ? recordFor(previousStem,previousBytes) : QJsonObject{};
+            if (replacement) write(previousPath,previousBytes);
+            if (phase == 0) write(part,nextBytes); else write(nextPath,nextBytes);
+            const QString recordPath = caseScope+"/records/700.json";
+            if (phase == 2 || replacement) write(recordPath,QJsonDocument(phase == 2 ? next : previous).toJson());
+            write(journal,QJsonDocument(QJsonObject{{"fileId",700},{"previous",previous},{"next",next}}).toJson());
+            // Confirmed replacement keeps both versions while the reader state is uncertain.
+            if (phase == 2 && replacement) {
+                const auto savedJournal = contents(journal);
+                write(journal,"{");
+                Client malformedJournal(endpoint,caseRoot);
+                require(QFile::exists(previousPath) && QFile::exists(nextPath), "malformed transfer journal blocks private fallback cleanup");
+                write(journal,savedJournal);
+                const QString transfers = caseScope+"/transfers";
+                require(QDir().rename(transfers,transfers+".saved"), "save journal directory before substitution");
+                write(transfers,"not a directory");
+                Client blockedJournals(endpoint,caseRoot);
+                require(QFile::exists(previousPath) && QFile::exists(nextPath), "unreadable journal directory blocks private fallback cleanup");
+                require(QFile::remove(transfers) && QDir().rename(transfers+".saved",transfers), "restore journal directory");
+                for (auto state : {ReaderFileState::Open,ReaderFileState::Unknown}) {
+                    fakeReader=state;
+                    Client deferred(endpoint,caseRoot);
+                    require(QFile::exists(previousPath) && QFile::exists(nextPath) && QFile::exists(journal),
+                            "open or unknown reader retains transfer journal and both versions");
+                }
+                fakeReader=ReaderFileState::Closed;
+                write(nextPath,nextBytes+"damaged");
+                Client damaged(endpoint,caseRoot);
+                require(QFile::exists(previousPath) && QFile::exists(journal), "unconfirmed current file preserves previous version");
+                write(nextPath,nextBytes);
+                const QString foreignPath=directory+"/foreign."+format;
+                write(foreignPath,previousBytes);
+                require(QFile::remove(previousPath) && QFile::link(foreignPath,previousPath), "inject symlink instead of retired version");
+                Client linked(endpoint,caseRoot);
+                require(QFileInfo(previousPath).isSymLink() && QFile::exists(journal) && contents(foreignPath)==previousBytes,
+                        "recovery preserves symlinks and their unrelated targets");
+                require(QFile::remove(previousPath), "remove test symlink");
+            }
+            Client recovered(endpoint,caseRoot);
+            require(!QFile::exists(journal) && !QFile::exists(part), "restart resolves durable transfer journal and staging file");
+            require(phase == 2 ? QFile::exists(nextPath) && !QFile::exists(previousPath) && contents(nextPath)==nextBytes :
+                    !QFile::exists(nextPath) && (!replacement || (QFile::exists(previousPath) && contents(previousPath)==previousBytes)),
+                    "recovery follows committed record for initial and replacement downloads in every format and directory");
+            Client repeated(endpoint,caseRoot);
+            require(repeated.books().size() == ((phase == 2 || replacement) ? 1 : 0), "recovery is idempotent and preserves registered books");
+        }
+    }
+    const QString guardedRoot=root+"/guarded-cleanup";
+    Client guarded(endpoint,guardedRoot,nullptr,false);
+    require(guarded.configure(endpoint.toString(),"demo"), "prepare cleanup guard account");
+    const QString guardedScope=guardedRoot+"/"+accountKey;
+    write(guardedScope+"/records/999.json","{");
+    const QString guardedOrphan=guardedScope+"/999-"+QUuid::createUuid().toString(QUuid::WithoutBraces)+".pdf";
+    write(guardedOrphan,"%PDF-retain");
+    require(wait(guarded,[&] { guarded.login(guarded.server(),"demo","demo"); }) &&
+            wait(guarded,[&] { guarded.download(0); }) && QFile::exists(guardedOrphan),
+            "invalid registry blocks cleanup after successful downloads as well as startup");
+
+    const auto guardedJournals=QDir(guardedScope+"/transfers").entryList({"*.json"},QDir::Files);
+    require(guardedJournals.size()==1, "deferred transfer keeps a durable journal");
+    const auto journalBytes=contents(guardedScope+"/transfers/"+guardedJournals.first());
+    const auto guardedJournal=QJsonDocument::fromJson(journalBytes).object();
+    require(journalBytes.size()<2048 && !guardedJournal["next"].toObject().contains("book") &&
+            guardedJournal["next"].toObject()["fileId"]==101, "transfer journal stores bounded file identity without duplicate book metadata");
     // New screens use the same downloader and durable records, with an isolated library.
     const QString featureRoot = root+"/features";
     Client features(endpoint, featureRoot, nullptr, false);
     write(fault, "features");
-    require(wait(features, [&] { features.login("demo", "demo"); }) && features.total() == 23, "multi-format paginated catalog");
+    require(wait(features, [&] { features.login(features.server(), "demo", "demo"); }) && features.total() == 23, "multi-format paginated catalog");
     require(features.books()[0].toMap()["readStatus"].toMap()["status"] == "reading" &&
             features.books()[0].toMap()["readingProgress"].toDouble() == 37.5, "catalog exposes server reading status and percentage");
     require(!features.books()[3].toMap()["readingProgress"].isNull() &&
@@ -695,11 +847,28 @@ int main(int argc, char **argv) {
     write(fault, "relogin");
     require(!wait(features, [&] { features.refresh(1); }) && !features.authenticated() && !features.hasSavedSession(),
             "rejected refresh token clears saved session and requests a password");
-    require(wait(features, [&] { features.login("demo", "demo"); }) &&
+    require(wait(features, [&] { features.login(features.server(), "demo", "demo"); }) &&
             wait(features, [&] { features.openCollection(12, "Общая библиотека"); }) &&
             wait(features, [&] { features.refresh(1); }) &&
             features.collectionId() == 12 && features.page() == 1 && features.total() == 23,
             "explicit login restores access to collection page");
+    write(fault, "encoded_search");
+    for (const QString &query : {QString("C++"),QString("+"),QString(" "),QString("пробел"),QString("%"),
+                               QString("%2B"),QString("&"),QString("?"),QString("#"),QString("=")}) {
+        require(wait(features, [&] { features.refresh(0, query); }) && features.total() == 23 &&
+                features.books().first().toMap()["title"].toString() == query,
+                "collection search round-trips literal reserved characters and Cyrillic");
+    }
+    require(wait(features, [&] { features.refresh(2, "C++"); }) && features.books().size() == 3 &&
+            features.books().first().toMap()["title"].toString() == "C++",
+            "encoded search survives pagination");
+    write(fault, "error");
+    require(!wait(features, [&] { features.refresh(0, "%2B"); }) && features.hasSavedSession(),
+            "server failure retains saved session and encoded query");
+    write(fault, "encoded_search");
+    require(wait(features, [&] { features.retry(); }) && features.total() == 23 &&
+            features.books().first().toMap()["title"].toString() == "%2B",
+            "retry preserves literal percent encoding in collection search");
     write(fault, "bad_collections");
     require(!wait(features, [&] { features.showCollections(); }) && features.collections().isEmpty(), "reject wrong collection response shape");
     write(fault, "features");

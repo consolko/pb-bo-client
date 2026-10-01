@@ -134,6 +134,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/auth/login" and self.command == "POST":
             if (body.get("username"), body.get("password"), body.get("clientKind")) != ("demo", "demo", "native"):
                 return self.send(401, {"message": "Use demo / demo on this local fixture"})
+            if mode == "bad_auth": return self.send(200, {"accessToken": TOKEN, "refreshToken": "invalid"})
             if mode == "relogin": fault.write_text("")
             expiry = (datetime.now(timezone.utc)+timedelta(hours=1)).isoformat()
             return self.send(200, {"accessToken": TOKEN, "refreshToken": "0"*64, "accessTokenExpiresAt": expiry, "refreshTokenExpiresAt": expiry, "user": {"id": 1, "username": "demo"}})
@@ -175,8 +176,12 @@ class Handler(BaseHTTPRequestHandler):
             if int(collection[1]) not in (11, 12, 13):
                 return self.send(404, {})
             books = library_books() if collection[1] == "12" else library_books()[:1]+library_books()[2:3] if collection[1] == "11" else []
+            if mode == "encoded_search":
+                books = [dict(book, title="C++ + пробел % %2B & ? # =") for book in books]
             q = params.get("q", [""])[0].casefold()
             books = [book for book in books if q in (book["title"]+" "+" ".join(book["authors"])).casefold()]
+            if mode == "encoded_search":
+                books = [dict(book, title=params.get("q", [""])[0]) for book in books]
             return self.send(200, {"items": books[page*size:(page+1)*size], "total": len(books), "page": page, "size": size})
         detail = re.fullmatch(r"/api/v1/books/(\d+)", path)
         if detail and self.command == "GET":

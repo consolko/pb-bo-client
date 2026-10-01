@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
             }
             if (operation == "logout") app->exit(0);
         });
-        QTimer::singleShot(0, &client, [&client, &username, &password] { client.login(username, password); password.clear(); });
+        QTimer::singleShot(0, &client, [&client, &username, &password] { client.login(client.server(), username, password); password.clear(); });
         QTimer::singleShot(45000, app.get(), [&app] { app->exit(2); });
         return app->exec();
     }

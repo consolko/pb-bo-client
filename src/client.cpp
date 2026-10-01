@@ -50,6 +50,12 @@ bool writeObject(const QString &path, const QJsonObject &object, QString *error 
     }
     return true;
 }
+constexpr auto sessionPermissions = QFileDevice::ReadOwner | QFileDevice::WriteOwner;
+bool privateSessionPermissions(QFileDevice::Permissions permissions) {
+    constexpr auto shared = QFileDevice::ReadGroup | QFileDevice::WriteGroup | QFileDevice::ExeGroup |
+                            QFileDevice::ReadOther | QFileDevice::WriteOther | QFileDevice::ExeOther | QFileDevice::ExeOwner;
+    return (permissions & sessionPermissions) == sessionPermissions && !(permissions & shared);
+}
 bool validServer(const QUrl &url) {
 #ifdef BOOKORBIT_TEST_HTTP
     const bool local = url.scheme() == "http" &&
@@ -178,24 +184,29 @@ void Client::loadRecords() {
     const auto key = QCryptographicHash::hash((endpoint.toString()+"\n"+user).toUtf8(), QCryptographicHash::Sha256).toHex();
     scopeDir = rootDir + "/" + QString::fromLatin1(key.left(24));
     QDir().mkpath(scopeDir);
-    const auto session = readObject(scopeDir+"/session.json");
-    static const QRegularExpression nativeRefresh("^[a-f0-9]{64}$");
-    refreshToken = session["refreshToken"].toString();
-    if (!nativeRefresh.match(refreshToken).hasMatch()) refreshToken.clear();
-    sessionStored = false; sessionNotice.clear();
+    canCleanupBooks = false;
+    refreshToken.clear(); sessionStored = false; sessionNotice.clear();
     const QString sessionFile = scopeDir+"/session.json";
-    if (QFile::exists(sessionFile)) {
-        if (refreshToken.isEmpty()) {
-            if (!QFile::remove(sessionFile)) sessionNotice = "Не удалось удалить старые данные входа.";
-        } else if (session.contains("password")) {
-            // Migrate the old plaintext-password record before using its refresh token.
-            saveSession();
+    const QFileInfo sessionInfo(sessionFile);
+    if (sessionInfo.exists() || sessionInfo.isSymLink()) {
+        const bool protectedFile = sessionInfo.isFile() && !sessionInfo.isSymLink() &&
+            sessionInfo.canonicalPath() == sessionInfo.absolutePath() &&
+            (privateSessionPermissions(sessionInfo.permissions()) ||
+             (QFile::setPermissions(sessionFile, sessionPermissions) &&
+              privateSessionPermissions(QFileInfo(sessionFile).permissions())));
+        if (!protectedFile) {
+            sessionNotice = QFile::remove(sessionFile) ? "Не удалось защитить сохранённый вход. Войдите снова."
+                                                       : "Не удалось защитить или удалить данные входа. Проверьте память устройства.";
         } else {
-            const auto permissions = QFileInfo(sessionFile).permissions();
-            const auto shared = QFileDevice::ReadGroup | QFileDevice::WriteGroup | QFileDevice::ExeGroup |
-                                QFileDevice::ReadOther | QFileDevice::WriteOther | QFileDevice::ExeOther;
-            sessionStored = !(permissions & shared) && bool(permissions & QFileDevice::ReadOwner);
-            if (!sessionStored && !saveSession()) refreshToken.clear();
+            const auto session = readObject(sessionFile);
+            static const QRegularExpression nativeRefresh("^[a-f0-9]{64}$");
+            refreshToken = session["refreshToken"].toString();
+            if (!nativeRefresh.match(refreshToken).hasMatch()) {
+                refreshToken.clear();
+                if (!QFile::remove(sessionFile)) sessionNotice = "Не удалось удалить старые данные входа.";
+            } else if (session.contains("password")) {
+                if (!saveSession()) refreshToken.clear();
+            } else sessionStored = true;
         }
     }
     items = {}; collectionItems = {}; detailBook = {}; browseHistory.clear();
@@ -208,10 +219,15 @@ void Client::loadRecords() {
     syncResults = {};
     bool recordsReadable = true;
     const QString recordsDir = scopeDir+"/records";
-    QDir().mkpath(recordsDir);
-    for (const auto &name : QDir(recordsDir).entryList({"*.json"}, QDir::Files)) {
+    const bool createdRecords = QDir().mkpath(recordsDir);
+    const QFileInfo recordsInfo(recordsDir);
+    recordsReadable = createdRecords && recordsInfo.isDir() && recordsInfo.isReadable() &&
+                      recordsInfo.canonicalFilePath() == recordsDir;
+    for (const auto &name : QDir(recordsDir).entryList({"*.json"}, QDir::AllEntries | QDir::NoDotAndDotDot)) {
         const QString id = name.left(name.size()-5);
         if (!validId(id)) continue;
+        const QFileInfo info(recordsDir+"/"+name);
+        if (!info.isFile() || info.isSymLink()) { recordsReadable = false; continue; }
         const auto record = readObject(recordsDir+"/"+name);
         if (!recordFile(id, record).isEmpty()) downloads[id] = record;
         else recordsReadable = false;
@@ -249,27 +265,75 @@ void Client::loadRecords() {
         downloads[id] = record;
     }
     if (QFile::exists(oldPath) && migrated)
-        QFile::rename(oldPath, scopeDir+"/downloads-v1.json");
+        migrated = QFile::rename(oldPath, scopeDir+"/downloads-v1.json");
     if (migrated) QFile::remove(scopeDir+"/catalog.json");
-    if (migrated && recordsReadable) {
+    canCleanupBooks = migrated && recordsReadable;
+    if (canCleanupBooks) {
         cleanupBooks();
         cleanupCovers();
     }
 }
 
-void Client::cleanupBooks() {
-    static const QRegularExpression owned("^([1-9][0-9]*)(?:-[0-9a-f-]{36})?\\.(?:epub|part(?:\\.[A-Za-z0-9]+)?)$");
+void Client::cleanupBooks(const QString &verifiedFile) {
+    if (!canCleanupBooks || (activeDownload && !activeDownload->isFinished())) return;
+    QSet<QString> referenced;
+    for (auto it = downloads.begin(); it != downloads.end(); ++it)
+        referenced.insert(recordFile(it.key(), it.value().toObject()));
+    auto removeUnused = [&referenced](const QString &path) {
+        if (path.isEmpty()) return true;
+        const QFileInfo info(path);
+        if (!info.exists() && !info.isSymLink()) return true;
+        if (!info.isFile() || info.isSymLink() || info.canonicalPath() != info.absolutePath()) return false;
+        if (referenced.contains(path)) return false;
+        return readerFileState(path) == ReaderFileState::Closed && QFile::remove(path);
+    };
+    QSet<QString> retained;
+    const QString transfers = scopeDir+"/transfers";
+    const QFileInfo transfersInfo(transfers);
+    if ((transfersInfo.exists() || transfersInfo.isSymLink()) &&
+        (!transfersInfo.isDir() || !transfersInfo.isReadable() || transfersInfo.isSymLink() ||
+         transfersInfo.canonicalFilePath() != transfers)) return;
+    for (const auto &name : QDir(transfers).entryList({"*.json"}, QDir::AllEntries | QDir::NoDotAndDotDot)) {
+        const QFileInfo journalInfo(transfers+"/"+name);
+        if (!journalInfo.isFile() || journalInfo.isSymLink()) return;
+        const auto journal = readObject(transfers+"/"+name);
+        const QString id = QString::number(journal["fileId"].toInt());
+        const auto next = journal["next"].toObject(), previous = journal["previous"].toObject();
+        const QString newFile = recordFile(id, next), oldFile = previous.isEmpty() ? QString{} : recordFile(id, previous);
+        const QString stem = name.chopped(5);
+        if (!positiveId(journal["fileId"]) || !journal["previous"].isObject() || !journal["next"].isObject() || newFile.isEmpty() || (!previous.isEmpty() && oldFile.isEmpty()) ||
+            !stem.startsWith(id+"-") || QUuid::fromString(stem.mid(id.size()+1)).isNull() ||
+            next["filename"].toString() != stem+"."+next["format"].toString()) return;
+        const QString staging = scopeDir+"/"+stem+".part";
+        const auto current = downloads.value(id).toObject();
+        const bool registered = recordFile(id, current) == newFile;
+        const QFileInfo info(newFile);
+        const bool confirmed = registered && current["sha256"] == next["sha256"] && current["bytes"] == next["bytes"] &&
+            !current["invalid"].toBool() && info.isFile() && !info.isSymLink() &&
+            info.canonicalPath() == info.absolutePath() && info.size() == next["bytes"].toDouble() &&
+            (newFile == verifiedFile || digestFile(newFile) == next["sha256"].toString().toLatin1()) && validContent(newFile, next["format"].toString());
+        bool removed = false;
+        if (!registered || confirmed) {
+            const bool newRemoved = registered || removeUnused(newFile);
+            const bool oldRemoved = recordFile(id, current) == oldFile || removeUnused(oldFile);
+            const bool partRemoved = removeUnused(staging);
+            removed = newRemoved && oldRemoved && partRemoved && QFile::remove(transfers+"/"+name);
+        }
+        if (!removed) { retained.insert(newFile); retained.insert(oldFile); retained.insert(staging); }
+    }
+    static const QRegularExpression owned("^([1-9][0-9]*)(?:-([0-9a-f-]{36}))?\\.([a-z0-9]+)(?:\\.[A-Za-z0-9]+)?$");
     const QDir dir(scopeDir);
-    for (const auto &name : dir.entryList({"*.epub", "*.part", "*.part.*"}, QDir::Files)) {
+    for (const auto &name : dir.entryList(QDir::Files | QDir::NoSymLinks)) {
         const auto match = owned.match(name);
-        if (!match.hasMatch()) continue;
-        const QString id = match.captured(1);
-        const auto record = downloads.value(id).toObject();
-        if (recordFile(id, record) == dir.filePath(name)) continue;
-        // A legacy file is only ours to remove when its migrated record points elsewhere.
-        if (name.endsWith(".epub") && record.isEmpty()) continue;
-        const QString path = dir.filePath(name);
-        if (name.contains(".part") || readerFileState(path) == ReaderFileState::Closed) QFile::remove(path);
+        if (!match.hasMatch() || !validId(match.captured(1))) continue;
+        const QString uuid = match.captured(2), format = match.captured(3), path = dir.filePath(name);
+        if (retained.contains(path) || (!uuid.isEmpty() && QUuid::fromString(uuid).isNull())) continue;
+        if (format != "part") {
+            if (fileFormat({{"format", format}}).isEmpty() || !name.endsWith("."+format)) continue;
+            // Legacy names without a record have no proof of ownership.
+            if (uuid.isEmpty() && (format != "epub" || !downloads.contains(match.captured(1)))) continue;
+        }
+        removeUnused(path);
     }
 }
 
@@ -396,12 +460,20 @@ QJsonObject Client::selectBookFile(QJsonObject book) const {
     return book;
 }
 
-QVariantMap Client::bookSummary(const QJsonObject &book) const {
+QVariantMap Client::fileSummary(const QJsonObject &book) const {
     const auto file = book["selectedFile"].toObject();
-    const QString id = QString::number(file["id"].toInt());
-    const auto record = downloads.value(id).toObject();
-    const QString format = fileFormat(file);
+    const QString id = QString::number(file["id"].toInt()), format = fileFormat(file);
+    const auto record = downloads.value(id).toObject(), progress = record["progress"].toObject();
     const bool downloaded = !localFile(book).isEmpty();
+    return {{"fileId", file["id"].toInt()}, {"format", format.toUpper()},
+        {"downloaded", downloaded}, {"readable", readableFormat(format)}, {"canSync", downloaded && format == "epub"},
+        {"syncResult", syncResults[id].toString()}, {"pendingProgress", progress["pending"].isObject()},
+        {"remoteFileChanged", record["remoteFileChanged"].toBool()}, {"hasConflict", progress["conflictRemote"].isObject()},
+        {"supported", !pathFor(book).isEmpty() && file["sizeBytes"].toDouble() <= maxBook},
+        {"needsRepair", !record.isEmpty() && !downloaded}};
+}
+
+QVariantMap Client::bookSummary(const QJsonObject &book) const {
     QStringList localFormats, formats;
     for (const auto value : book["files"].toArray()) {
         auto variant = book;
@@ -410,20 +482,15 @@ QVariantMap Client::bookSummary(const QJsonObject &book) const {
         if (!formats.contains(label)) formats << label;
         if (!localFile(variant).isEmpty() && !localFormats.contains(label)) localFormats << label;
     }
-    const auto progress = record["progress"].toObject();
     const auto readingProgress = book["readingProgress"];
-    return {{"bookId", book["id"].toInt()}, {"title", book["title"].toString().isEmpty() ? "Без названия" : book["title"].toString()},
+    auto result = fileSummary(book);
+    result.insert(QVariantMap{{"bookId", book["id"].toInt()}, {"title", book["title"].toString().isEmpty() ? "Без названия" : book["title"].toString()},
         {"readStatus", book["readStatus"].toVariant()},
         {"readingProgress", readingProgress.isDouble() && readingProgress.toDouble() >= 0 && readingProgress.toDouble() <= 100 ? readingProgress.toVariant() : QVariant{}},
         {"author", authorNames(book["authors"].toArray())}, {"seriesName", book["seriesName"].toString()},
-        {"seriesIndex", book["seriesIndex"].toVariant()}, {"fileId", file["id"].toInt()}, {"format", format.toUpper()},
-        {"fileCount", book["files"].toArray().size()}, {"localFormats", localFormats.join(", ")}, {"formats", formats.join(", ")},
-        {"downloaded", downloaded}, {"readable", readableFormat(format)}, {"canSync", downloaded && format == "epub"},
-        {"syncResult", syncResults[id].toString()}, {"pendingProgress", progress["pending"].isObject()},
-        {"remoteFileChanged", record["remoteFileChanged"].toBool()},
-        {"hasConflict", progress["conflictRemote"].isObject()},
-        {"supported", !pathFor(book).isEmpty() && file["sizeBytes"].toDouble() <= maxBook},
-        {"needsRepair", !record.isEmpty() && !downloaded}};
+        {"seriesIndex", book["seriesIndex"].toVariant()}, {"fileCount", book["files"].toArray().size()},
+        {"localFormats", localFormats.join(", ")}, {"formats", formats.join(", ")}});
+    return result;
 }
 
 QVariantList Client::books() const {
@@ -500,7 +567,7 @@ QVariantMap Client::syncSummary() const {
         if (record["format"].toString("epub")=="epub") epubs.insert(id); else unsupported.insert(id);
     }
     unsupported.subtract(epubs);
-    return {{"total",books.size()},{"synced",synced},{"attention",books.size()-synced},{"unsupported",unsupported.size()}};
+    return {{"books",books},{"total",books.size()},{"synced",synced},{"attention",books.size()-synced},{"unsupported",unsupported.size()}};
 }
 
 void Client::syncFile(int fileId) {
@@ -567,7 +634,7 @@ QVariantMap Client::detail() const {
         auto book = detailBook;
         book["selectedFile"] = value;
         auto file = value.toObject().toVariantMap();
-        const auto info = bookSummary(book);
+        const auto info = fileSummary(book);
         for (const auto key : {"downloaded", "readable", "supported", "needsRepair", "remoteFileChanged", "syncResult"}) file[key] = info[key];
         file["format"] = fileFormat(value.toObject()).toUpper();
         const double bytes = value.toObject()["sizeBytes"].toDouble(-1);
@@ -836,7 +903,7 @@ bool Client::setCredentials(const QJsonObject &response) {
     static const QRegularExpression nativeRefresh("^[a-f0-9]{64}$");
     if (access.isEmpty() || access.size() > 8192 || access.contains('\r') || access.contains('\n') ||
         !nativeRefresh.match(refresh).hasMatch()) {
-        token.clear(); refreshToken.clear();
+        invalidateSession();
         finish("В ответе сервера нет действительной сессии", false, "login");
         return false;
     }
@@ -847,20 +914,30 @@ bool Client::setCredentials(const QJsonObject &response) {
 
 bool Client::saveSession() {
     const QString path = scopeDir+"/session.json";
-    const bool written = writeObject(path, {{"refreshToken", refreshToken}});
-    const auto privatePermissions = QFileDevice::ReadOwner | QFileDevice::WriteOwner;
-    const auto shared = QFileDevice::ReadGroup | QFileDevice::WriteGroup | QFileDevice::ExeGroup |
-                        QFileDevice::ReadOther | QFileDevice::WriteOther | QFileDevice::ExeOther;
-    sessionStored = written && QFile::setPermissions(path, privatePermissions) &&
-                    !(QFileInfo(path).permissions() & shared) && bool(QFileInfo(path).permissions() & QFileDevice::ReadOwner);
+    QSaveFile file(path);
+    const auto bytes = QJsonDocument(QJsonObject{{"refreshToken", refreshToken}}).toJson();
+    const QFileInfo info(path);
+    sessionStored = !info.isSymLink() && QFileInfo(scopeDir).canonicalFilePath() == scopeDir &&
+        file.open(QIODevice::WriteOnly) && file.setPermissions(sessionPermissions) &&
+        privateSessionPermissions(file.permissions()) && file.write(bytes) == bytes.size() && file.commit() &&
+        privateSessionPermissions(QFileInfo(path).permissions());
     if (!sessionStored) {
-        const bool removed = !QFile::exists(path) || QFile::remove(path);
+        file.cancelWriting();
+        const bool removed = (!QFile::exists(path) && !QFileInfo(path).isSymLink()) || QFile::remove(path);
         sessionNotice = removed ? "Не удалось защитить сохранённый вход. После закрытия приложения потребуется войти снова."
                                 : "Не удалось защитить или удалить данные входа. Проверьте память устройства.";
     } else sessionNotice.clear();
     logEvent(sessionStored ? "session saved" : "session save failed");
     emit changed();
     return sessionStored;
+}
+
+void Client::invalidateSession() {
+    token.clear(); refreshToken.clear(); sessionStored = false; sessionNotice.clear();
+    stopCovers();
+    const QString path = scopeDir+"/session.json";
+    if ((QFile::exists(path) || QFileInfo(path).isSymLink()) && !QFile::remove(path))
+        sessionNotice = "Не удалось удалить недействительную сессию с устройства.";
 }
 
 void Client::restoreSession() {
@@ -916,12 +993,7 @@ void Client::jsonRequest(const QString &path, const QJsonObject &payload, const 
             return;
         }
         if (reply->error() != QNetworkReply::NoError || code < 200 || code >= 300 || bytes->size() > maxJson) {
-            if (code == 401) { token.clear(); refreshToken.clear(); stopCovers(); }
-            if (code == 401 && path == "/api/v1/auth/refresh") {
-                sessionStored = false;
-                if (QFile::exists(scopeDir+"/session.json") && !QFile::remove(scopeDir+"/session.json"))
-                    sessionNotice = "Не удалось удалить истёкшую сессию с устройства.";
-            }
+            if (code == 401) invalidateSession();
             finish(path == "/api/v1/auth/logout" ? "Вы вышли на устройстве. Отзыв сессии на сервере не подтверждён." :
                    reply->error() == QNetworkReply::SslHandshakeFailedError ? "Не удалось проверить TLS-сертификат сервера. Проверьте доверенный CA и дату устройства." :
                    reply->error() == QNetworkReply::HostNotFoundError ? "Не найден сервер "+endpoint.host()+". Проверьте Wi-Fi и DNS." :
@@ -943,15 +1015,20 @@ void Client::jsonRequest(const QString &path, const QJsonObject &payload, const 
     });
 }
 
-void Client::login(const QString &username, const QString &password) {
+void Client::login(const QString &address, const QString &username, const QString &password) {
     if (working) return;
-    if (password.isEmpty() && username == user && !refreshToken.isEmpty()) { restoreSession(); return; }
+    QString normalized = address.trimmed();
+    while (normalized.endsWith('/')) normalized.chop(1);
+    const QUrl url(normalized, QUrl::StrictMode);
+    if (validServer(url) && url == endpoint && password.isEmpty() && username == user && !refreshToken.isEmpty()) {
+        restoreSession(); return;
+    }
     const QString secret = password;
-    if (!validServer(endpoint) || username.isEmpty() || secret.isEmpty()) {
+    if (!validServer(url) || username.trimmed().isEmpty() || secret.isEmpty()) {
         finish("Укажите HTTPS-адрес, имя пользователя и пароль.", false, "login");
         return;
     }
-    if (!configure(endpoint.toString(), username)) return;
+    if (!configure(normalized, username)) return;
     retryKind = 0;
     working = true;
     message = "Подключение…";
@@ -980,7 +1057,7 @@ void Client::refresh(int targetPage, const QString &query) {
     params.addQueryItem("page", QString::number(targetPage));
     params.addQueryItem("size", QString::number(pageSize));
     params.addQueryItem("collapseSeries", "false");
-    params.addQueryItem("q", query);
+    params.addQueryItem("q", QString::fromLatin1(QUrl::toPercentEncoding(query)));
     const QString route = activeCollection > 0 ? "/api/v1/collections/"+QString::number(activeCollection)+"/books?"+params.toString(QUrl::FullyEncoded) : "/api/v1/books/query";
     jsonRequest(route, {{"sort", QJsonArray{}}, {"pagination", QJsonObject{{"page", targetPage}, {"size", pageSize}}}, {"q", query}},
         [this, targetPage](const QJsonObject &response) {
@@ -1088,7 +1165,7 @@ void Client::downloadBook(const QJsonObject &book, bool renew) {
                 renewSession([this, book] { downloadBook(book, false); });
                 return;
             }
-            token.clear(); refreshToken.clear(); stopCovers();
+            invalidateSession();
             finish("Сессия истекла. Войдите снова для скачивания.", false, "download"); return;
         }
         if (reply->error() != QNetworkReply::NoError || reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200 ||
@@ -1118,31 +1195,40 @@ void Client::downloadBook(const QJsonObject &book, bool renew) {
             rememberFile(book);
             finish("Книга уже скачана", true, "download"); return;
         }
-        if (!accessibleDirectory(directory) || !sameStorage(scopeDir,directory) || !output->commit() ||
-            !validContent(staging, format) || !QFile::rename(staging, finalPath)) {
-            QFile::remove(staging);
-            finish("Не удалось сохранить книгу", false, "download"); return;
-        }
-        if (digestFile(finalPath) != newHash.toLatin1()) {
-            QFile::remove(finalPath);
-            finish("Сохранённая книга повреждена. Прежняя книга доступна.", false, "download"); return;
-        }
         QJsonObject record{{"bookId", book["id"]}, {"fileId", file["id"]}, {"filename", stem+"."+format}, {"format", format},
                                  {"sha256", newHash}, {"bytes", double(*size)}, {"book", smallBook(book)}};
         if (previous["sha256"].toString() == newHash && previous["format"].toString("epub") == format &&
             previous["progress"].isObject()) record["progress"] = previous["progress"];
         if (directory != scopeDir) record["directory"] = directory;
+        // Recovery needs file identity, not duplicated book metadata or progress.
+        auto identity = [](const QJsonObject &saved) {
+            QJsonObject result;
+            for (const auto key : {"fileId", "filename", "format", "sha256", "bytes", "directory"})
+                if (saved.contains(key)) result[key] = saved[key];
+            return result;
+        };
+        const QString transfers = scopeDir+"/transfers";
+        if (!QDir().mkpath(transfers) || !accessibleDirectory(transfers) ||
+            !writeObject(transfers+"/"+stem+".json", {{"fileId", file["id"]}, {"previous", identity(previous)}, {"next", identity(record)}})) {
+            output->cancelWriting();
+            finish("Не удалось сохранить журнал загрузки. Прежняя книга доступна.", false, "download"); return;
+        }
+        if (!accessibleDirectory(directory) || !sameStorage(scopeDir,directory) || !output->commit() ||
+            !validContent(staging, format) || !QFile::rename(staging, finalPath)) {
+            cleanupBooks();
+            finish("Не удалось сохранить книгу", false, "download"); return;
+        }
+        if (digestFile(finalPath) != newHash.toLatin1()) {
+            cleanupBooks();
+            finish("Сохранённая книга повреждена. Прежняя книга доступна.", false, "download"); return;
+        }
         if (!saveRecord(id, record)) {
-            QFile::remove(finalPath);
+            cleanupBooks();
             finish("Запись загрузки не сохранена. Прежняя книга доступна.", false, "download"); return;
         }
         syncResults.remove(id);
-        if (!previous.isEmpty() && oldFile != finalPath && QFile::exists(oldFile) &&
-            QFileInfo(oldFile).canonicalPath() == QFileInfo(oldFile).absolutePath() &&
-            readerFileState(oldFile) == ReaderFileState::Closed)
-            QFile::remove(oldFile);
         rememberFile(book);
-        cleanupBooks();
+        cleanupBooks(finalPath); // Its digest was verified immediately before saveRecord().
         if (readableFormat(format)) scanBook(finalPath);
         finish("Книга скачана и доступна без сети", true, "download");
     });
@@ -1455,14 +1541,6 @@ void Client::dismissConflict() {
     emit changed();
 }
 
-void Client::syncProgress(int index) {
-    if (working) return;
-    const auto visible=visibleItems();
-    if (index<0 || index>=visible.size()) return;
-    dismissConflict();
-    syncBook(QString::number(visible[index].toObject()["selectedFile"].toObject()["id"].toInt()));
-}
-
 void Client::syncAll() {
     if (working) return;
     if (!authenticated()) { finish("Для синхронизации войдите на сервер",false,"sync"); return; }
@@ -1540,7 +1618,7 @@ void Client::verifyRemoteFile(const QString &id, bool renew) {
         if (code==401 && renew && !refreshToken.isEmpty()) {
             renewSession([this,id] { verifyRemoteFile(id,false); }); return;
         }
-        if (code==401) { token.clear(); refreshToken.clear(); stopCovers(); }
+        if (code==401) invalidateSession();
         const auto length=reply->header(QNetworkRequest::ContentLengthHeader);
         const auto type=reply->header(QNetworkRequest::ContentTypeHeader).toString();
         const auto format=downloads.value(id).toObject()["format"].toString("epub");

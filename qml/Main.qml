@@ -21,7 +21,11 @@ ApplicationWindow {
     property bool syncView: false
     property string syncFilter: "all"
     property string syncBookKey: ""
-    readonly property var selectedSyncBook: client.syncBooks.find(book => book.key === syncBookKey) || ({})
+    readonly property var detailData: client.detail
+    readonly property var syncData: client.syncSummary
+    readonly property var detailFormat: (detailData.files || []).find(file => file.id === detailData.fileId) || ({})
+    readonly property var pendingFormat: (detailData.files || []).find(file => file.id === pendingFileId) || ({})
+    readonly property var selectedSyncBook: window.syncData.books.find(book => book.key === syncBookKey) || ({})
     property bool addingConnection: false
     property bool browsingFolders: false
     property string folderPath: "/mnt/ext1"
@@ -34,14 +38,8 @@ ApplicationWindow {
         client.showDetail(id)
         detailScroll.contentItem.contentY = 0
     }
-    function selectedFormat(id) {
-        const files = client.detail.files || []
-        const wanted = id === undefined ? client.detail.fileId : id
-        for (let i = 0; i < files.length; ++i) if (files[i].id === wanted) return files[i]
-        return {}
-    }
     function chooseFormat(download) {
-        pendingFileId = client.detail.fileId || 0
+        pendingFileId = window.detailData.fileId || 0
         formatDownload = download
         formatDialog.open()
     }
@@ -55,7 +53,7 @@ ApplicationWindow {
         return label
     }
     function editionText() {
-        const d = client.detail, lines = []
+        const d = window.detailData, lines = []
         function field(name, value) { if (value) lines.push(name + ": " + value) }
         field("Издательство", d.publisher)
         field("Издано", d.publishedDate || d.publishedYear)
@@ -273,14 +271,13 @@ ApplicationWindow {
                     Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444"
                 }
                 Action {
+                    objectName: "loginButton"
                     text: "Войти"; Layout.fillWidth: true
                     enabled: !client.busy && username.text.length > 0 && (password.text.length > 0 || client.hasSavedSession && username.text === client.username && server.text === client.server)
                     onClicked: {
-                        if (client.configure(server.text, username.text)) {
-                            client.login(username.text, password.text)
-                            password.text = ""
-                            Qt.inputMethod.hide()
-                        }
+                        client.login(server.text, username.text, password.text)
+                        password.text = ""
+                        Qt.inputMethod.hide()
                     }
                 }
                 }
@@ -422,7 +419,7 @@ ApplicationWindow {
             objectName: "syncStatusButton"
             visible: !window.settings && !window.syncView && !client.detailVisible && client.offlineOnly
             Layout.fillWidth: true
-            text: "Синхронизация: " + client.syncSummary.synced + " из " + client.syncSummary.total + " · открыть"
+            text: "Синхронизация: " + window.syncData.synced + " из " + window.syncData.total + " · открыть"
             enabled: !client.busy
             onClicked: { window.syncView = true; window.syncBookKey = "" }
         }
@@ -431,12 +428,12 @@ ApplicationWindow {
             Layout.fillWidth: true
             spacing: 10 * window.u
             Text { text: client.username + " · " + client.server; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; font.pixelSize: 14 * window.u }
-            Text { objectName: "syncSummaryText"; text: "Синхронизировано: " + client.syncSummary.synced + " из " + client.syncSummary.total; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 22 * window.u; font.bold: true }
+            Text { objectName: "syncSummaryText"; text: "Синхронизировано: " + window.syncData.synced + " из " + window.syncData.total; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 22 * window.u; font.bold: true }
             Text { text: "Позиции скачанных EPUB · по последней сверке"; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
             RowLayout {
                 Layout.fillWidth: true; spacing: 6 * window.u
                 Repeater {
-                    model: [{key:"all",label:"Все",count:client.syncSummary.total}, {key:"attention",label:"Требуют действия",count:client.syncSummary.attention}, {key:"synced",label:"Синхронизированы",count:client.syncSummary.synced}]
+                    model: [{key:"all",label:"Все",count:window.syncData.total}, {key:"attention",label:"Требуют действия",count:window.syncData.attention}, {key:"synced",label:"Синхронизированы",count:window.syncData.synced}]
                     Action {
                         required property var modelData
                         objectName: "syncFilter-" + modelData.key
@@ -456,7 +453,7 @@ ApplicationWindow {
             visible: window.syncView && !window.settings && !client.detailVisible && !window.syncBookKey
             Layout.fillWidth: true; Layout.fillHeight: true
             clip: true
-            model: client.syncBooks.filter(book => window.syncFilter === "all" || (window.syncFilter === "synced" ? book.state === "synced" : book.state !== "synced"))
+            model: window.syncData.books.filter(book => window.syncFilter === "all" || (window.syncFilter === "synced" ? book.state === "synced" : book.state !== "synced"))
             ScrollBar.vertical: ScrollBar { }
             delegate: ItemDelegate {
                 required property var modelData
@@ -482,7 +479,7 @@ ApplicationWindow {
             Text {
                 anchors.centerIn: parent; width: parent.width
                 visible: syncList.count === 0
-                text: client.syncSummary.total === 0 ? "Пока нечего синхронизировать.\nСкачайте EPUB из каталога." : "В этой группе больше нет книг."
+                text: window.syncData.total === 0 ? "Пока нечего синхронизировать.\nСкачайте EPUB из каталога." : "В этой группе больше нет книг."
                 wrapMode: Text.Wrap; horizontalAlignment: Text.AlignHCenter; font.pixelSize: 19 * window.u
             }
         }
@@ -514,8 +511,8 @@ ApplicationWindow {
                 }
             }
         }
-        Text { visible: window.syncView && !window.settings && !client.detailVisible && !window.syncBookKey && client.syncSummary.unsupported > 0; text: "Ещё книг без поддержки синхронизации позиции: " + client.syncSummary.unsupported; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
-        Action { objectName: "syncAllStatusButton"; visible: window.syncView && !window.settings && !client.detailVisible && !window.syncBookKey; text: client.busy ? "Сверяем книги…" : "Синхронизировать"; Layout.fillWidth: true; checked: true; enabled: !client.busy && client.authenticated && client.syncSummary.total > 0; onClicked: client.syncAll() }
+        Text { visible: window.syncView && !window.settings && !client.detailVisible && !window.syncBookKey && window.syncData.unsupported > 0; text: "Ещё книг без поддержки синхронизации позиции: " + window.syncData.unsupported; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
+        Action { objectName: "syncAllStatusButton"; visible: window.syncView && !window.settings && !client.detailVisible && !window.syncBookKey; text: client.busy ? "Сверяем книги…" : "Синхронизировать"; Layout.fillWidth: true; checked: true; enabled: !client.busy && client.authenticated && window.syncData.total > 0; onClicked: client.syncAll() }
         ListView {
             id: collectionList
             objectName: "collectionList"
@@ -704,43 +701,43 @@ ApplicationWindow {
                         color: "white"; border.color: "#777777"
                         Text { anchors.centerIn: parent; visible: detailCover.status !== Image.Ready; text: "Нет обложки"; font.pixelSize: 15 * window.u }
                         Image { id: detailCover; anchors.fill: parent; anchors.margins: 1
-                            source: { const revision = client.coverRevision; return client.coverUrl(client.detail.bookId || 0) }
+                            source: { const revision = client.coverRevision; return client.coverUrl(window.detailData.bookId || 0) }
                             fillMode: Image.PreserveAspectFit; cache: false
-                            Accessible.name: "Обложка: " + (client.detail.title || "")
+                            Accessible.name: "Обложка: " + (window.detailData.title || "")
                         }
                     }
                     ColumnLayout {
                         Layout.fillWidth: true; Layout.minimumWidth: 0
                         Layout.minimumHeight: 280 * window.u; Layout.alignment: Qt.AlignTop; spacing: 8 * window.u
-                        Text { objectName: "detailTitle"; text: client.detail.title || ""; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.bold: true; font.pixelSize: 23 * window.u }
-                        Text { text: client.detail.subtitle || ""; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
-                        Text { text: client.detail.author || ""; visible: text.length > 0; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 17 * window.u }
+                        Text { objectName: "detailTitle"; text: window.detailData.title || ""; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.bold: true; font.pixelSize: 23 * window.u }
+                        Text { text: window.detailData.subtitle || ""; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
+                        Text { text: window.detailData.author || ""; visible: text.length > 0; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 17 * window.u }
                         Text {
                             objectName: "detailEdition"
-                            text: [client.detail.publishedYear || client.detail.publishedDate, client.detail.publisher, client.detail.pageCount ? client.detail.pageCount + " стр." : ""].filter(v => !!v).join(" · ")
+                            text: [window.detailData.publishedYear || window.detailData.publishedDate, window.detailData.publisher, window.detailData.pageCount ? window.detailData.pageCount + " стр." : ""].filter(v => !!v).join(" · ")
                             visible: text.length > 0; textFormat: Text.PlainText; Layout.fillWidth: true
                             wrapMode: Text.Wrap; font.pixelSize: 14 * window.u
                         }
                         RowLayout {
                             objectName: "detailRating"
-                            visible: typeof client.detail.rating === "number" && client.detail.rating > 0 && client.detail.rating <= 5
+                            visible: typeof window.detailData.rating === "number" && window.detailData.rating > 0 && window.detailData.rating <= 5
                             spacing: 8 * window.u
                             Accessible.role: Accessible.StaticText
-                            Accessible.name: "Моя оценка: " + client.detail.rating + " из 5"
+                            Accessible.name: "Моя оценка: " + window.detailData.rating + " из 5"
                             Text {
-                                text: { const stars = Math.max(0, Math.min(5, Math.round(client.detail.rating || 0))); return "★".repeat(stars) + "☆".repeat(5 - stars) }
+                                text: { const stars = Math.max(0, Math.min(5, Math.round(window.detailData.rating || 0))); return "★".repeat(stars) + "☆".repeat(5 - stars) }
                                 font.pixelSize: 26 * window.u; Accessible.ignored: true
                             }
-                            Text { text: (client.detail.rating || 0) + "/5"; font.pixelSize: 14 * window.u; Accessible.ignored: true }
+                            Text { text: (window.detailData.rating || 0) + "/5"; font.pixelSize: 14 * window.u; Accessible.ignored: true }
                         }
                         Flow {
                             id: detailGenres
                             objectName: "detailGenres"
                             Layout.fillWidth: true
-                            visible: (client.detail.genres || []).length > 0
+                            visible: (window.detailData.genres || []).length > 0
                             spacing: 6 * window.u
                             Repeater {
-                                model: client.detail.genres || []
+                                model: window.detailData.genres || []
                                 Rectangle {
                                     required property string modelData
                                     width: Math.min(genreLabel.implicitWidth + 16 * window.u, detailGenres.width)
@@ -755,16 +752,16 @@ ApplicationWindow {
                                 }
                             }
                         }
-                        Text { text: (client.detail.seriesName || "") + (client.detail.seriesIndex ? " · № " + client.detail.seriesIndex : ""); textFormat: Text.PlainText; visible: !!client.detail.seriesName; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
+                        Text { text: (window.detailData.seriesName || "") + (window.detailData.seriesIndex ? " · № " + window.detailData.seriesIndex : ""); textFormat: Text.PlainText; visible: !!window.detailData.seriesName; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
                         Item { Layout.fillHeight: true; Layout.minimumHeight: 8 * window.u }
-                        Text { objectName: "detailReading"; text: window.readStatusLabel(client.detail); visible: text.length > 0; Layout.fillWidth: true; horizontalAlignment: Text.AlignRight; font.bold: true; font.pixelSize: 14 * window.u; wrapMode: Text.Wrap }
+                        Text { objectName: "detailReading"; text: window.readStatusLabel(window.detailData); visible: text.length > 0; Layout.fillWidth: true; horizontalAlignment: Text.AlignRight; font.bold: true; font.pixelSize: 14 * window.u; wrapMode: Text.Wrap }
                         ProgressBar {
                             id: detailProgress
                             objectName: "detailProgress"
                             Layout.fillWidth: true; implicitHeight: 7 * window.u
                             from: 0; to: 100
-                            visible: typeof client.detail.readingProgress === "number" && isFinite(client.detail.readingProgress) && client.detail.readingProgress >= 0 && client.detail.readingProgress <= 100
-                            value: visible ? client.detail.readingProgress : 0
+                            visible: typeof window.detailData.readingProgress === "number" && isFinite(window.detailData.readingProgress) && window.detailData.readingProgress >= 0 && window.detailData.readingProgress <= 100
+                            value: visible ? window.detailData.readingProgress : 0
                             Accessible.name: "Прогресс чтения в BookOrbit"
                             background: Rectangle { color: "#cccccc"; radius: 3 * window.u }
                             contentItem: Item {
@@ -775,8 +772,8 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             objectName: "formatButton"
                             font.pixelSize: 14 * window.u
-                            visible: (client.detail.files || []).length > 1
-                            text: "Формат: " + (window.selectedFormat().format || "нет файлов") + (window.selectedFormat().sizeLabel ? " · " + window.selectedFormat().sizeLabel : "") + "  ▾"
+                            visible: (window.detailData.files || []).length > 1
+                            text: "Формат: " + (window.detailFormat.format || "нет файлов") + (window.detailFormat.sizeLabel ? " · " + window.detailFormat.sizeLabel : "") + "  ▾"
                             enabled: !client.busy
                             onClicked: window.chooseFormat(false)
                         }
@@ -784,36 +781,36 @@ ApplicationWindow {
                             Layout.fillWidth: true
                             objectName: "downloadButton"
                             font.bold: true; font.pixelSize: 18 * window.u
-                            text: client.detail.downloaded ? (client.detail.readable ? "Читать (" + client.detail.format + ")" : "Скачано") : client.detail.needsRepair ? "Скачать заново" : "Скачать" + (client.detail.format ? " (" + client.detail.format + ")" : "")
-                            enabled: !client.busy && (client.detail.downloaded ? !!client.detail.readable : !!client.detail.supported && client.authenticated)
-                            onClicked: client.detail.downloaded ? client.openSelected() : client.downloadSelected()
+                            text: window.detailData.downloaded ? (window.detailData.readable ? "Читать (" + window.detailData.format + ")" : "Скачано") : window.detailData.needsRepair ? "Скачать заново" : "Скачать" + (window.detailData.format ? " (" + window.detailData.format + ")" : "")
+                            enabled: !client.busy && (window.detailData.downloaded ? !!window.detailData.readable : !!window.detailData.supported && client.authenticated)
+                            onClicked: window.detailData.downloaded ? client.openSelected() : client.downloadSelected()
                         }
                     }
                 }
                 Text {
                     id: description
                     objectName: "detailDescription"
-                    text: client.detail.description || (client.detail.detailed ? "Аннотации в BookOrbit нет" : "Сведения ещё не загружены")
+                    text: window.detailData.description || (window.detailData.detailed ? "Аннотации в BookOrbit нет" : "Сведения ещё не загружены")
                     textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 18 * window.u
                     maximumLineCount: window.fullDescription ? 100000 : 6; elide: Text.ElideRight
                 }
                 Action { objectName: "descriptionToggle"; text: window.fullDescription ? "Свернуть аннотацию" : "Читать полностью"; visible: window.fullDescription || description.truncated; onClicked: window.fullDescription = !window.fullDescription }
-                Text { text: client.detail.downloaded ? "Скачано на устройство" : ""; visible: text.length > 0; Layout.fillWidth: true; font.pixelSize: 14 * window.u }
-                Text { text: !client.detail.supported && client.detail.format ? "Размер файла превышает лимит загрузки 100 МБ." : !client.detail.readable && client.detail.format ? "Можно скачать; открытие этого формата из клиента пока не поддерживается." : client.detail.format && client.detail.format !== "EPUB" ? "Обмен позицией для этого формата пока не поддерживается." : ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
-                Text { objectName: "fileCheckResult"; text: client.detail.remoteFileChanged ? "Файл на сервере отличается. Обмен прогрессом приостановлен" : client.detail.syncResult || ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
-                Text { text: client.detail.hasConflict ? "На ридере и в BookOrbit разные позиции. Повторите сверку и выберите нужную." : client.detail.pendingProgress ? "Входящая позиция ещё не применена. Закройте книгу в читалке и повторите сверку." : ""; visible: !client.detail.remoteFileChanged && text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
-                Action { objectName: "redownloadButton"; text: "Скачать заново"; visible: !!client.detail.remoteFileChanged; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.downloadSelected() }
-                Action { text: "Читать локально"; visible: !!client.detail.pendingProgress; Layout.fillWidth: true; enabled: !client.busy; onClicked: client.openSelected(false) }
-                Action { text: "Синхронизировать позицию"; visible: !!client.detail.canSync; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.syncSelected() }
-                Text { text: client.detail.notice || ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
-                Action { text: client.detail.detailed ? "Обновить сведения" : "Загрузить сведения"; visible: client.offlineOnly || !!client.detail.notice; enabled: !client.busy && client.authenticated; onClicked: client.refreshDetail() }
+                Text { text: window.detailData.downloaded ? "Скачано на устройство" : ""; visible: text.length > 0; Layout.fillWidth: true; font.pixelSize: 14 * window.u }
+                Text { text: !window.detailData.supported && window.detailData.format ? "Размер файла превышает лимит загрузки 100 МБ." : !window.detailData.readable && window.detailData.format ? "Можно скачать; открытие этого формата из клиента пока не поддерживается." : window.detailData.format && window.detailData.format !== "EPUB" ? "Обмен позицией для этого формата пока не поддерживается." : ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
+                Text { objectName: "fileCheckResult"; text: window.detailData.remoteFileChanged ? "Файл на сервере отличается. Обмен прогрессом приостановлен" : window.detailData.syncResult || ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
+                Text { text: window.detailData.hasConflict ? "На ридере и в BookOrbit разные позиции. Повторите сверку и выберите нужную." : window.detailData.pendingProgress ? "Входящая позиция ещё не применена. Закройте книгу в читалке и повторите сверку." : ""; visible: !window.detailData.remoteFileChanged && text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
+                Action { objectName: "redownloadButton"; text: "Скачать заново"; visible: !!window.detailData.remoteFileChanged; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.downloadSelected() }
+                Action { text: "Читать локально"; visible: !!window.detailData.pendingProgress; Layout.fillWidth: true; enabled: !client.busy; onClicked: client.openSelected(false) }
+                Action { text: "Синхронизировать позицию"; visible: !!window.detailData.canSync; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.syncSelected() }
+                Text { text: window.detailData.notice || ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
+                Action { text: window.detailData.detailed ? "Обновить сведения" : "Загрузить сведения"; visible: client.offlineOnly || !!window.detailData.notice; enabled: !client.busy && client.authenticated; onClicked: client.refreshDetail() }
                 Action { text: "Об издании  " + (window.editionExpanded ? "▾" : "›"); Layout.fillWidth: true; onClicked: window.editionExpanded = !window.editionExpanded }
                 Text { text: window.editionText(); textFormat: Text.PlainText; visible: window.editionExpanded; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 17 * window.u }
-                Text { text: "Личная заметка"; visible: !!client.detail.personalNote; font.bold: true; font.pixelSize: 20 * window.u }
-                Text { text: client.detail.personalNote || ""; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 17 * window.u }
-                Text { text: "В моих коллекциях"; visible: (client.detail.collections || []).length > 0; font.bold: true; font.pixelSize: 20 * window.u }
+                Text { text: "Личная заметка"; visible: !!window.detailData.personalNote; font.bold: true; font.pixelSize: 20 * window.u }
+                Text { text: window.detailData.personalNote || ""; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 17 * window.u }
+                Text { text: "В моих коллекциях"; visible: (window.detailData.collections || []).length > 0; font.bold: true; font.pixelSize: 20 * window.u }
                 Repeater {
-                    model: client.detail.collections || []
+                    model: window.detailData.collections || []
                     Action {
                         required property var modelData
                         text: modelData.name + "  ›"; Layout.fillWidth: true; enabled: !client.busy
@@ -847,7 +844,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.preferredHeight: Math.min(contentHeight, window.height * 0.5)
                 clip: true; spacing: 6 * window.u
-                model: client.detail.files || []
+                model: window.detailData.files || []
                 ScrollBar.vertical: ScrollBar { }
                 delegate: Action {
                     required property var modelData
@@ -870,9 +867,9 @@ ApplicationWindow {
                 Action {
                     Layout.fillWidth: true; checked: true
                     objectName: "formatConfirm"
-                    text: !window.formatDownload ? "Выбрать" : window.selectedFormat(window.pendingFileId).downloaded ? "Открыть карточку" : "Скачать " + (window.selectedFormat(window.pendingFileId).format || "")
-                    enabled: !client.busy && window.pendingFileId > 0 && (!window.formatDownload || window.selectedFormat(window.pendingFileId).downloaded || window.selectedFormat(window.pendingFileId).supported)
-                    onClicked: { client.selectFile(window.pendingFileId); formatDialog.close(); if (window.formatDownload && !client.detail.downloaded) client.downloadSelected() }
+                    text: !window.formatDownload ? "Выбрать" : window.pendingFormat.downloaded ? "Открыть карточку" : "Скачать " + (window.pendingFormat.format || "")
+                    enabled: !client.busy && window.pendingFileId > 0 && (!window.formatDownload || window.pendingFormat.downloaded || window.pendingFormat.supported)
+                    onClicked: { client.selectFile(window.pendingFileId); formatDialog.close(); if (window.formatDownload && !window.detailData.downloaded) client.downloadSelected() }
                 }
             }
         }
@@ -959,7 +956,7 @@ ApplicationWindow {
     Connections {
         target: client
         function onCompleted(operation, success) {
-            if (operation === "sync" && client.syncSummary.total > 0 && !window.settings) {
+            if (operation === "sync" && window.syncData.total > 0 && !window.settings) {
                 window.syncView = true
                 window.syncBookKey = ""
             }

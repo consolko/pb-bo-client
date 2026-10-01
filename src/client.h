@@ -22,7 +22,6 @@ class Client : public QObject {
     Q_PROPERTY(QString conflictDescription READ conflictDescription NOTIFY changed)
     Q_PROPERTY(QVariantList conflictPositions READ conflictPositions NOTIFY changed)
     Q_PROPERTY(int conflictRevision READ conflictRevision NOTIFY changed)
-    Q_PROPERTY(QVariantList syncBooks READ syncBooks NOTIFY changed)
     Q_PROPERTY(QVariantMap syncSummary READ syncSummary NOTIFY changed)
     Q_PROPERTY(QString status READ status NOTIFY changed)
     Q_PROPERTY(bool busy READ busy NOTIFY changed)
@@ -71,7 +70,6 @@ public:
     Q_INVOKABLE void inspectConflict(int fileId);
     Q_INVOKABLE void showSyncFile(int fileId);
     Q_INVOKABLE void connectForSync();
-    Q_INVOKABLE void syncProgress(int index);
     Q_INVOKABLE void syncAll();
     Q_INVOKABLE void verifyLibrary();
     Q_INVOKABLE void cancelLibraryVerification();
@@ -105,7 +103,7 @@ public:
     Q_INVOKABLE void showDownloaded(bool value);
     Q_INVOKABLE void cancelDownload();
     Q_INVOKABLE void retry();
-    Q_INVOKABLE void login(const QString &username, const QString &password);
+    Q_INVOKABLE void login(const QString &server, const QString &username, const QString &password);
     Q_INVOKABLE void restoreSession();
     Q_INVOKABLE void refresh(int page = 0, const QString &query = {});
     Q_INVOKABLE void download(int index);
@@ -142,7 +140,7 @@ private:
     bool saveRecord(const QString &id, const QJsonObject &record);
     QString recordFile(const QString &id, const QJsonObject &record) const;
     void loadRecords();
-    void cleanupBooks();
+    void cleanupBooks(const QString &verifiedFile = {});
     void cleanupCovers();
     void removeCover(int bookId);
     void queueCovers();
@@ -154,10 +152,12 @@ private:
     void openBook(const QJsonObject &book, bool applyIncoming);
     QJsonObject selectBookFile(QJsonObject book) const;
     QVariantMap bookSummary(const QJsonObject &book) const;
+    QVariantMap fileSummary(const QJsonObject &book) const;
     void rememberFile(const QJsonObject &book);
     QString pathFor(const QJsonObject &book) const;
     bool validDownloadDirectory(const QString &path) const;
     bool saveSession();
+    void invalidateSession();
     void logEvent(const QString &event, int code = 0, int http = 0);
     QNetworkAccessManager network;
     QUrl endpoint;
@@ -181,7 +181,7 @@ private:
     QJsonObject retryBook;
     QString retryQuery;
     int retryPage = 0, retryKind = 0;
-    bool localView = false, cancelled = false;
+    bool localView = false, cancelled = false, canCleanupBooks = false;
     bool working = false, diagnostics = false, sessionStored = false;
     int currentPage = 0, count = 0;
 };
