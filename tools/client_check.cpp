@@ -3,7 +3,10 @@
 #include "device.h"
 #include "progress.h"
 #include "check_wait.h"
+#include <QCoreApplication>
+#ifdef BOOKORBIT_DESKTOP_CHECK
 #include <QGuiApplication>
+#endif
 #include <QEventLoop>
 #include <QTimer>
 #include <QFile>
@@ -63,7 +66,11 @@ int rssKiB() {
 }
 
 int main(int argc, char **argv) {
+#ifdef BOOKORBIT_DESKTOP_CHECK
     QGuiApplication app(argc, argv);
+#else
+    QCoreApplication app(argc, argv);
+#endif
     if (argc==4 && QString::fromLocal8Bit(argv[1])=="--resolve-cfi") {
         QString point; double percentage=0;
         require(epubPosition(QString::fromLocal8Bit(argv[2]),QString::fromLocal8Bit(argv[3]),&percentage,&point),
