@@ -91,7 +91,7 @@ docker run --rm \
 sudo apt-get install build-essential cmake qt6-base-dev qt6-declarative-dev \
   qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts \
   qml6-module-qtquick-templates qml6-module-qtquick-window \
-  qml6-module-qtqml-workerscript zlib1g-dev
+  qml6-module-qtqml-workerscript qt6-svg-plugins zlib1g-dev
 
 cmake -S . -B build/desktop -DCMAKE_BUILD_TYPE=Release -DBOOKORBIT_CHECKS=OFF
 cmake --build build/desktop -j2

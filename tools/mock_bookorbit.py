@@ -214,6 +214,10 @@ class Handler(BaseHTTPRequestHandler):
                         genres=["Научная фантастика"], tags=["Тест"], rating=4, personalNote="Личная заметка из BookOrbit",
                         collections=[{"id": 11, "name": "К прочтению"}],
                         seriesName="Проверка серии", seriesIndex="2.5")
+            # The basic catalog exposes EPUB 102, whereas the richer fixture
+            # has PDF 204. Keep detail metadata consistent for basic repair tests.
+            if book["id"] == 2 and mode != "features":
+                book["files"] = list(book["files"]) + list(BOOKS[1]["files"])
             if mode == "long_ui":
                 book.update(title="Очень длинное название книги "*20, authors=[{"name":"Автор с длинным именем "+str(i)} for i in range(8)],
                             genres=["Жанр "+str(i) for i in range(50)], publisher="Длинное издательство "*20)

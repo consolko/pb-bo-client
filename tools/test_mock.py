@@ -65,6 +65,9 @@ class FixtureTest(unittest.TestCase):
                 self.assertEqual(result["total"], 3)
                 self.assertEqual(len(result["items"]), 2)
                 self.assertIsInstance(result["items"][0]["authors"][0], str)
+                with request("books/2") as response:
+                    detail = json.load(response)
+                self.assertIn(102, [entry["id"] for entry in detail["files"]])
                 with request("books/files/101/download") as response:
                     data = response.read()
                 self.assertEqual(data, epub(1))

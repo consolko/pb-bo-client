@@ -11,6 +11,7 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QImageReader>
 #include <QEventLoop>
 #include <QTimer>
 #include <cstdio>
@@ -64,6 +65,7 @@ int posts(const QString &root) {
 int main(int argc,char **argv) {
     QGuiApplication app(argc,argv);
     require(argc==3,"data directory and fault file supplied");
+    require(QImageReader::supportedImageFormats().contains("svg"),"SVG icon decoder is installed");
     const QString root=QString::fromLocal8Bit(argv[1]),fault=QString::fromLocal8Bit(argv[2]);
     const auto fixture=[&](const QString &name) { return root+"/"+name+".epub"; };
     const QString point="epubcfi(/6/2!/4/2/1:3)";
