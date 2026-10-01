@@ -1,0 +1,53 @@
+name: Apply reviewed audit patch
+on:
+  push:
+    branches: [fix/audit-hardening]
+permissions:
+  contents: read
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'maintenance: apply reviewed audit patch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - name: Validate base and apply exact reviewed files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code 0fa64eef00494dcecd418d15839d9f5460f6c0f9 HEAD -- .gitignore CMakeLists.txt readme.md src tools/client_check.cpp tools/mock_bookorbit.py
+          git apply --check --unidiff-zero .maintenance/main.patch .maintenance/progress.patch .maintenance/docs.patch
+          git apply --index --unidiff-zero .maintenance/main.patch .maintenance/progress.patch .maintenance/docs.patch
+          python3 - <<'PY'
+          import subprocess
+          expected = {
+              '.gitignore': '534844bd9720e0a55cc75e4e15864ddd065183cc',
+              'CMakeLists.txt': '9913719013a29ffdfbb16da64b80f9e7702c3c4c',
+              'readme.md': 'b2a09eee03997ed2a69a271df409217331c5eb11',
+              'src/client.cpp': '132c5353a6d5867ce0d06f7dc6a1824c74cc22e7',
+              'src/client.h': '0307d3f1525551c77f5a4c52ed6775682b7e2500',
+              'src/device.cpp': '67f1bd311d1096849a843721e0a5ef3253b8f5c9',
+              'src/progress.cpp': '0af4a7b2d28a58e9b13ad68a15c46a5b9d9963ef',
+              'src/progress.h': '0e22188863952c7e89dacd30ebaed87b39feb395',
+              'src/sync_decision.h': '85e3ef67a944d25de6d1633752247a0cb75071d8',
+              'tools/audit_check.cpp': 'a22403291bd26b85f74023ecff0e6258352322c8',
+              'tools/audit_fixtures.py': 'ef567a32781e8d32465d0eea0257d2193d236c9a',
+              'tools/client_check.cpp': '5ca2175f8034c5e8bd3bc80c4a5585ddf307eaef',
+              'tools/mock_bookorbit.py': '642152b93add75f8c77e5b8b3e5c8306e563a964',
+              'tools/run_desktop_checks.py': '4bb59f902cbabf10a8d7442ada70033dc660568c',
+          }
+          for path, sha in expected.items():
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              if actual != sha:
+                  raise SystemExit(f'Hash mismatch for {path}: {actual} != {sha}')
+          PY
+          git diff --cached --check
+          git rm .maintenance/main.patch .maintenance/progress.patch .maintenance/docs.patch
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: harden sync, EPUB replacement and CFI handling with regression tests'
+          git push origin HEAD:refs/heads/fix/audit-hardening

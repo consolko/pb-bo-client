@@ -1,0 +1,245 @@
+diff --git a/.gitignore b/.gitignore
+index cdfa726..534844b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -16,0 +17,3 @@ build/
++!/tools/audit_check.cpp
++!/tools/audit_fixtures.py
++!/tools/run_desktop_checks.py
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 13e3708..9913719 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -47,0 +48,15 @@ endif()
++
++# Host-only tests use an isolated HTTP server; no live BookOrbit credentials.
++if(BOOKORBIT_CHECKS AND NOT POCKETBOOK_TOOLCHAIN_LOADED)
++  enable_testing()
++  find_package(Python3 REQUIRED COMPONENTS Interpreter)
++  add_executable(audit_check tools/audit_check.cpp src/client.cpp src/client.h src/progress.cpp src/progress.h qml/app.qrc)
++  target_link_libraries(audit_check PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::Network Qt6::Xml z)
++  target_include_directories(audit_check PRIVATE src tools)
++  target_compile_definitions(audit_check PRIVATE BOOKORBIT_TEST_HTTP)
++  target_compile_options(audit_check PRIVATE -Wall -Wextra -Wpedantic)
++  add_test(NAME mock_contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_mock.py)
++  add_test(NAME client_integration COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_desktop_checks.py $<TARGET_FILE:client_check> --native-layout)
++  add_test(NAME audit_regressions COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_desktop_checks.py $<TARGET_FILE:audit_check>)
++  set_tests_properties(client_integration audit_regressions PROPERTIES TIMEOUT 270)
++endif()
+diff --git a/src/client.cpp b/src/client.cpp
+index 8f8158c..132c535 100644
+--- a/src/client.cpp
++++ b/src/client.cpp
+@@ -3,0 +4 @@
++#include "sync_decision.h"
+@@ -118 +119,2 @@ bool validContent(const QString &path, const QString &format) {
+-    if (format == "epub" || format == "kepub" || format == "docx" || format == "cbz") return head.startsWith(QByteArray("PK\003\004", 4));
++    if (format == "epub" || format == "kepub") return validEpub(path);
++    if (format == "docx" || format == "cbz") return head.startsWith(QByteArray("PK\003\004", 4));
+@@ -351 +353 @@ void Client::removeCover(int bookId) {
+-        ++coverVersion;
++        coverRevisions[scopeDir+"/cover-"+key+".png"]=++coverVersion;
+@@ -502 +504,8 @@ void Client::beginFeedback(const QString &context,int bookId,int fileId) {
+-    feedbackContext=context; feedbackBookId=bookId; feedbackFileId=fileId;
++    // Entity identity is independent from the screen that initiated the action.
++    // Inline downloads/opens stay in the catalog; login's initial catalog request
++    // remains visible on the connection screen if that request fails.
++    feedbackContext=context;
++    if ((context=="book" && !detailVisible() && (uiContext=="catalog" || uiContext=="sync")) ||
++        (context=="catalog" && (uiContext=="connection" || uiContext=="settings")))
++        feedbackContext=uiContext;
++    feedbackBookId=bookId; feedbackFileId=fileId;
+@@ -1122 +1131,11 @@ void Client::jsonRequest(const QString &path, const QJsonObject &payload, const
+-            renewSession([this, path, payload, callback, get, arrayResponse] { jsonRequest(path, payload, callback, false, get, arrayResponse); });
++            if (!get && path.endsWith("/progress")) {
++                // A refreshed token is not permission to replay an old sync
++                // decision. Keep the outgoing journal; the next sync starts with
++                // fresh reader/profile/server snapshots, including explicit choices.
++                renewSession([this] {
++                    finish("Вход восстановлен. Повторите сверку: прежняя позиция не отправлена повторно.",
++                           false,"progress","uncertain");
++                });
++            } else {
++                renewSession([this, path, payload, callback, get, arrayResponse] { jsonRequest(path, payload, callback, false, get, arrayResponse); });
++            }
+@@ -1243,0 +1263,37 @@ void Client::downloadBook(const QJsonObject &book, bool renew) {
++    const int bookId=book["id"].toInt(), fileId=book["selectedFile"].toObject()["id"].toInt();
++    const auto previous=downloads.value(QString::number(fileId)).toObject();
++    if (previous.isEmpty()) { transferBook(book,renew); return; }
++    beginFeedback("book",bookId,fileId);
++    retryKind=2; retryBook=book;
++    if (bookId<=0 || fileId<=0 || previous["bookId"].toInt()!=bookId) {
++        finish("Этот файл уже связан с другой книгой. Обновите сведения.",false,"download"); return;
++    }
++    // Repairs and retries resolve file metadata again. A known replacement may
++    // have a different byte count under the same fileId; never use cached size.
++    working=true; message="Проверяем актуальную версию файла…"; emit changed();
++    jsonRequest("/api/v1/books/"+QString::number(bookId),{},
++        [this,book,bookId,fileId,renew](const QJsonObject &response) {
++            if (response["id"].toInt()!=bookId || !response["files"].isArray()) {
++                finish("Не удалось получить актуальные сведения о файле.",false,"download"); return;
++            }
++            QJsonObject selected;
++            for (const auto value:bookFiles(response))
++                if (value.toObject()["id"].toInt()==fileId) selected=value.toObject();
++            if (selected.isEmpty()) {
++                finish("Выбранного файла больше нет на сервере. Обновите карточку книги.",false,"download"); return;
++            }
++            if (fileFormat(selected)!=fileFormat(book["selectedFile"].toObject())) {
++                finish("Формат серверного файла изменился. Обновите карточку книги.",false,"download"); return;
++            }
++            auto refreshed=book;
++            refreshed["selectedFile"]=selected;
++            auto files=book["files"].toArray();
++            for (int i=0;i<files.size();++i)
++                if (files[i].toObject()["id"].toInt()==fileId) files[i]=selected;
++            refreshed["files"]=files;
++            working=false;
++            transferBook(refreshed,renew);
++        },renew,true);
++}
++
++void Client::transferBook(const QJsonObject &book, bool renew) {
+@@ -1627 +1683 @@ QString Client::coverUrl(int bookId) const {
+-    return bookId > 0 && QFileInfo::exists(path) ? QUrl::fromLocalFile(path).toString()+"?v="+QString::number(coverVersion) : QString{};
++    return bookId > 0 && QFileInfo::exists(path) ? QUrl::fromLocalFile(path).toString()+"?v="+QString::number(coverRevisions.value(path).toInt()) : QString{};
+@@ -1691 +1747 @@ void Client::fetchNextCover() {
+-                    ++coverVersion; emit coversChanged();
++                    coverRevisions[path]=++coverVersion; emit coversChanged();
+@@ -1838,2 +1894 @@ void Client::syncBook(const QString &id, int choice) {
+-    double percentage=0;
+-    if ((!position.isEmpty() && local.isEmpty()) || (!local.isEmpty() && !epubPosition(path,local,&percentage))) {
++    if ((!position.isEmpty() && local.isEmpty()) || (!local.isEmpty() && !epubPosition(path,local,nullptr))) {
+@@ -1848 +1903 @@ void Client::syncBook(const QString &id, int choice) {
+-        jsonRequest(route,{},[this,id,path,position,local,percentage,choice,route,profile](const QJsonObject &remote) {
++        jsonRequest(route,{},[this,id,path,position,local,choice,route,profile](const QJsonObject &remote) {
+@@ -1888 +1943,4 @@ void Client::syncBook(const QString &id, int choice) {
+-            if (local==cfi) { acknowledge(); return; }
++            const auto equivalent=[&path](const QString &a,const QString &b,bool range=false) {
++                return a==b || sameEpubPosition(path,a,b,range);
++            };
++            if (equivalent(local,cfi)) { acknowledge(); return; }
+@@ -1891,2 +1949,2 @@ void Client::syncBook(const QString &id, int choice) {
+-            const bool localChanged=known ? local!=state["localBase"].toString() : !local.isEmpty();
+-            const bool remoteChanged=known ? remoteCfi!=state["remoteBase"].toObject()["cfi"].toString() : !remoteEmpty;
++            const bool localChanged=known ? !equivalent(local,state["localBase"].toString()) : !local.isEmpty();
++            const bool remoteChanged=known ? !equivalent(remoteCfi,state["remoteBase"].toObject()["cfi"].toString(),true) : !remoteEmpty;
+@@ -1898,6 +1956,9 @@ void Client::syncBook(const QString &id, int choice) {
+-            else if (!known || localChanged || remoteChanged) {
+-                if (localChanged && !remoteChanged) action=1;
+-                else if (remoteChanged && !localChanged) action=2;
+-            } else {
+-                if (persist()) finish("Прогресс не изменился",true,"progress");
+-                return;
++            else {
++                switch (decideSync(known,localChanged,remoteChanged)) {
++                case SyncDecision::Upload: action=1; break;
++                case SyncDecision::ApplyRemote: action=2; break;
++                case SyncDecision::Unchanged:
++                    if (persist()) finish("Прогресс не изменился",true,"progress");
++                    return;
++                case SyncDecision::Conflict: break;
++                }
+@@ -1929,0 +1991,5 @@ void Client::syncBook(const QString &id, int choice) {
++            double percentage=0;
++            if (!epubPosition(path,local,&percentage)) {
++                finish("Координата распознана, но не удалось оценить процент книги для отправки. Позиции не изменены.",
++                       false,"progress","position"); return;
++            }
+diff --git a/src/client.h b/src/client.h
+index 50a33f8..0307d3f 100644
+--- a/src/client.h
++++ b/src/client.h
+@@ -181,0 +182 @@ private:
++    void transferBook(const QJsonObject &book, bool renew);
+@@ -201 +202 @@ private:
+-    QJsonObject detailBook, fileChoices, coverVersions;
++    QJsonObject detailBook, fileChoices, coverVersions, coverRevisions;
+diff --git a/src/device.cpp b/src/device.cpp
+index 6ec2959..67f1bd3 100644
+--- a/src/device.cpp
++++ b/src/device.cpp
+@@ -274 +274,3 @@ bool saveReaderPosition(const QString &path, const QString &expectedPosition,
+-    if (!epubPosition(path,cfi,&percentage,&point)) return false;
++    if (!epubPosition(path,cfi,nullptr,&point)) return false;
++    *error = "Координата распознана, но не удалось оценить процент книги для штатной библиотеки.";
++    if (!epubPosition(path,cfi,&percentage)) return false;
+diff --git a/src/progress.h b/src/progress.h
+index f3580cc..0e22188 100644
+--- a/src/progress.h
++++ b/src/progress.h
+@@ -8,0 +9,8 @@ QString nativeCfi(const QString &position);
++
++// Compare validated logical locations while retaining original CFI strings in
++// stored progress. compareRange also includes the end of a server range.
++bool sameEpubPosition(const QString &path, const QString &first, const QString &second, bool compareRange = false);
++
++// Bounded container/package/resource validation before committing a download.
++// Does not claim full EPUB conformance or CFI support for every resource.
++bool validEpub(const QString &path);
+diff --git a/src/sync_decision.h b/src/sync_decision.h
+new file mode 100644
+index 0000000..85e3ef6
+--- /dev/null
++++ b/src/sync_decision.h
+@@ -0,0 +1,12 @@
++#pragma once
++
++// Pure three-way decision. Explicit choices, profile guards and journaling stay
++// in the coordinator; this function cannot perform I/O or mutate progress.
++enum class SyncDecision { Unchanged, Upload, ApplyRemote, Conflict };
++
++constexpr SyncDecision decideSync(bool baselineKnown, bool localChanged, bool remoteChanged) {
++    if (localChanged && !remoteChanged) return SyncDecision::Upload;
++    if (remoteChanged && !localChanged) return SyncDecision::ApplyRemote;
++    if (baselineKnown && !localChanged && !remoteChanged) return SyncDecision::Unchanged;
++    return SyncDecision::Conflict;
++}
+diff --git a/tools/client_check.cpp b/tools/client_check.cpp
+index 20467d9..5ca2175 100644
+--- a/tools/client_check.cpp
++++ b/tools/client_check.cpp
+@@ -6 +6 @@
+-#include <QCoreApplication>
++#include <QGuiApplication>
+@@ -66 +66 @@ int main(int argc, char **argv) {
+-    QCoreApplication app(argc, argv);
++    QGuiApplication app(argc, argv);
+@@ -76 +76 @@ int main(int argc, char **argv) {
+-    const QUrl endpoint("http://host.containers.internal:8766");
++    const QUrl endpoint(qEnvironmentVariable("BOOKORBIT_TEST_ENDPOINT", "http://host.containers.internal:8766"));
+diff --git a/tools/mock_bookorbit.py b/tools/mock_bookorbit.py
+index 883eb6f..642152b 100644
+--- a/tools/mock_bookorbit.py
++++ b/tools/mock_bookorbit.py
+@@ -33,0 +34,11 @@ def epub(number):
++def changed_epub():
++    output = io.BytesIO()
++    with zipfile.ZipFile(io.BytesIO(epub(1))) as original, zipfile.ZipFile(output, "w") as archive:
++        for name in original.namelist():
++            raw = original.read(name)
++            if name == "chapter.xhtml":
++                raw = raw.replace(b"</body>", b"<p>A longer replacement edition.</p></body>")
++            archive.writestr(zipfile.ZipInfo(name, (2026, 9, 28, 0, 0, 0)), raw)
++    return output.getvalue()
++
++
+@@ -133,0 +145,5 @@ class Handler(BaseHTTPRequestHandler):
++        if mode == "audit_catalog_error" and path == "/api/v1/books/query":
++            return self.send(503, {})
++        if mode == "audit_post401" and path == "/api/v1/books/files/101/progress" and self.command == "POST":
++            fault.write_text("audit_refresh_race")
++            return self.send(401, {})
+@@ -141,0 +158,3 @@ class Handler(BaseHTTPRequestHandler):
++            if mode == "audit_refresh_race":
++                self.server.progress["101"] = {"cfi": "epubcfi(/6/2!/4/82/1)", "pageNumber": None, "percentage": 40}
++                fault.write_text("")
+@@ -200,0 +220,4 @@ class Handler(BaseHTTPRequestHandler):
++            if mode in ("audit_new_file", "audit_zip_file"):
++                from audit_fixtures import ordinary_zip
++                raw = changed_epub() if mode == "audit_new_file" else ordinary_zip()
++                book["files"] = [dict(entry, sizeBytes=len(raw)) if entry["id"] == 101 else entry for entry in book["files"]]
+@@ -272,0 +296,3 @@ class Handler(BaseHTTPRequestHandler):
++            if match[1] == "101" and mode in ("audit_new_file", "audit_zip_file"):
++                from audit_fixtures import ordinary_zip
++                raw = changed_epub() if mode == "audit_new_file" else ordinary_zip()
