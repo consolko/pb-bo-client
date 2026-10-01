@@ -1,0 +1,64 @@
+name: Apply verified fixture corrections
+on:
+  push:
+    branches: [fix/audit-hardening]
+    paths: [.github/workflows/apply-audit-followup.yml]
+permissions:
+  contents: read
+jobs:
+  apply:
+    if: "${{ github.event.head_commit.message == 'maintenance: apply verified fixture corrections' }}"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Apply exact reviewed corrections
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          changes = {
+              'readme.md': (
+                  'b2a09eee03997ed2a69a271df409217331c5eb11',
+                  '967cc1f049ee4a1f0cd2b34c5ae17993515d03f0',
+                  [('qml6-module-qtqml-workerscript zlib1g-dev', 'qml6-module-qtqml-workerscript qt6-svg-plugins zlib1g-dev')]),
+              'tools/audit_check.cpp': (
+                  'a22403291bd26b85f74023ecff0e6258352322c8',
+                  '488388fbf43052a17259924714d710d55f316cc2',
+                  [('#include <QJsonDocument>', '#include <QJsonDocument>\n#include <QImageReader>'),
+                   ('    require(argc==3,"data directory and fault file supplied");', '    require(argc==3,"data directory and fault file supplied");\n    require(QImageReader::supportedImageFormats().contains("svg"),"SVG icon decoder is installed");')]),
+              'tools/mock_bookorbit.py': (
+                  '642152b93add75f8c77e5b8b3e5c8306e563a964',
+                  '09927e308955aa399f7d3f2b9f08d68ea946c5de',
+                  [('            if mode == "long_ui":', '            # The basic catalog exposes EPUB 102, whereas the richer fixture\n            # has PDF 204. Keep detail metadata consistent for basic repair tests.\n            if book["id"] == 2 and mode != "features":\n                book["files"] = list(book["files"]) + list(BOOKS[1]["files"])\n            if mode == "long_ui":')]),
+              'tools/test_mock.py': (
+                  '6db3acb2d99351c8f5552aa5f028744015b5cd2e',
+                  'd6c637caa6f0c6ebf1187e9dade1da1497090adf',
+                  [('                with request("books/files/101/download") as response:', '                with request("books/2") as response:\n                    detail = json.load(response)\n                self.assertIn(102, [entry["id"] for entry in detail["files"]])\n                with request("books/files/101/download") as response:')]),
+          }
+          for name, (before, after, edits) in changes.items():
+              current = subprocess.check_output(['git', 'hash-object', name], text=True).strip()
+              if current != before:
+                  raise SystemExit(f'Unexpected input version: {name}')
+              path = Path(name)
+              text = path.read_text()
+              for old, new in edits:
+                  if text.count(old) != 1:
+                      raise SystemExit(f'Ambiguous edit: {name}')
+                  text = text.replace(old, new)
+              path.write_text(text)
+              result = subprocess.check_output(['git', 'hash-object', name], text=True).strip()
+              if result != after:
+                  raise SystemExit(f'Unexpected output version: {name}')
+          PY
+          git add readme.md tools/audit_check.cpp tools/mock_bookorbit.py tools/test_mock.py
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'test: align fixture metadata and verify SVG icon decoding'
+          git push origin HEAD:refs/heads/fix/audit-hardening
