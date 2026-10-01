@@ -32,9 +32,11 @@ jobs:
           mkdir -p artifacts
           git -c safe.directory="$GITHUB_WORKSPACE" archive --format=tar HEAD -o artifacts/source.tar
       - name: Configure and build
+        shell: bash
         run: |
-          cmake -S . -B build/desktop -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBOOKORBIT_CHECKS=ON
-          cmake --build build/desktop -j2
+          set -o pipefail
+          cmake -S . -B build/desktop -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBOOKORBIT_CHECKS=ON 2>&1 | tee artifacts/configure.log
+          cmake --build build/desktop -j2 2>&1 | tee artifacts/build.log
       - name: Run tests
         run: ctest --test-dir build/desktop --output-on-failure --no-tests=error
       - name: Preserve exact sources and test logs
@@ -43,6 +45,6 @@ jobs:
         with:
           name: desktop-checks-${{ github.sha }}
           path: |
-            artifacts/source.tar
+            artifacts/
             build/desktop/Testing/Temporary/LastTest.log
           retention-days: 7
