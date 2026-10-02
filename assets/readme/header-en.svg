@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">PocketBook client</title>
+  <desc id="desc">The pb-bo-client application for accessing a BookOrbit library.</desc>
+  <rect width="1200" height="420" fill="#f5f6f2"/>
+  <rect x="1" y="1" width="1198" height="418" fill="none" stroke="#d8ded7"/>
+  <g fill="#59645d" font-family="monospace" font-size="15" letter-spacing="2">
+    <text x="48" y="51">PB-BO-CLIENT</text>
+    <text x="1152" y="51" text-anchor="end">POCKETBOOK APPLICATION</text>
+  </g>
+  <g fill="#202621" font-family="Georgia, 'Times New Roman', serif" font-size="72">
+    <text x="45" y="150">PocketBook</text>
+    <text x="45" y="232">client</text>
+  </g>
+  <text x="48" y="288" fill="#59645d" font-family="Arial, sans-serif" font-size="24">Library access and sync with BookOrbit</text>
+  <g fill="none" stroke="#59645d">
+    <rect x="943" y="112" width="177" height="204" rx="13"/>
+    <rect x="958" y="127" width="147" height="148" rx="2"/>
+    <path d="M986 157h91m-91 17h91m-91 17h64m-64 34h91m-91 17h70" stroke-width="2"/>
+    <rect x="998" y="290" width="67" height="8" rx="4"/>
+  </g>
+  <path d="M48 346H1152" stroke="#d8ded7"/>
+  <g fill="#59645d" font-family="monospace" font-size="15">
+    <text x="48" y="383">bookorbit.app</text>
+    <text x="1152" y="383" text-anchor="end">C++20 / Qt Quick</text>
+  </g>
+</svg>
