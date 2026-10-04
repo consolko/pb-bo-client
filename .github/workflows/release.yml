@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'New release tag, e.g. v0.1.0 (leave empty for a build only)'
+        description: 'New release tag, e.g. v1.1.0 (leave empty for a build only)'
         required: false
         type: string
 
@@ -30,17 +30,24 @@ jobs:
       BO_SDK_COMMIT: 754e436c7c24b4e2695154e2efffbf7447b4130e
       BO_IMAGE: ghcr.io/fstanis/pocketbook-sdk-qt6-builder@sha256:4015337a8c57c56b54239861e41487922b49779b0e0a277637ae53e311103344
     steps:
-      - name: Validate release version
-        env:
-          BO_VERSION: ${{ inputs.version }}
-        run: |
-          if [[ -n "$BO_VERSION" && ! "$BO_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
-            echo 'Use a version such as v0.1.0 or v0.1.0-rc.1' >&2
-            exit 1
-          fi
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Validate release version
+        env:
+          BO_TAG: ${{ inputs.version || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
+        run: |
+          if [[ -n "$BO_TAG" ]]; then
+            if [[ ! "$BO_TAG" =~ ^v(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$ ]]; then
+              echo 'OTA releases require a stable tag, such as v1.1.0' >&2
+              exit 1
+            fi
+            echo "BO_VERSION=${BO_TAG#v}" >> "$GITHUB_ENV"
+          else
+            BO_VERSION=$(sed -n 's/^set(BOOKORBIT_VERSION "\([^"]*\)".*/\1/p' CMakeLists.txt)
+            test -n "$BO_VERSION"
+            echo "BO_VERSION=$BO_VERSION" >> "$GITHUB_ENV"
+          fi
       - name: Check out pinned SDK
         uses: actions/checkout@v4
         with:
@@ -53,6 +60,7 @@ jobs:
         run: |
           docker run --rm \
             --user "$(id -u):$(id -g)" \
+            -e BO_VERSION \
             -v "$GITHUB_WORKSPACE:/src" \
             -v "$GITHUB_WORKSPACE/.pocketbook-sdk:/sdk:ro" \
             -w /src "$BO_IMAGE" bash -euc '
@@ -60,6 +68,7 @@ jobs:
                 -DPOCKETBOOK_QT_SDK=/sdk \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DBOOKORBIT_CHECKS=OFF \
+                -DBOOKORBIT_VERSION="$BO_VERSION" \
                 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
               cmake --build build/pocketbook --target bookorbit -j2
             '
@@ -78,7 +87,7 @@ jobs:
           fi
           jq -e 'length > 0 and all(.[];
             (.command | contains("-DNDEBUG")) and
-            (.command | contains("-DPOCKETBOOK_DEVICE")) and
+            ((.command | contains("CMakeFiles/bookorbit.dir/") | not) or (.command | contains("-DPOCKETBOOK_DEVICE"))) and
             (.command | contains("BOOKORBIT_TEST_HTTP") | not))' \
             build/pocketbook/compile_commands.json
           git archive --format=tar HEAD -o artifacts/source.tar
@@ -119,6 +128,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           BO_TAG: ${{ inputs.version || github.ref_name }}
+          BO_SIGNING_KEY: ${{ secrets.BOOKORBIT_UPDATE_SIGNING_KEY }}
         run: |
           if git show-ref --verify --quiet "refs/tags/$BO_TAG"; then
             test "$(git rev-list -n 1 "refs/tags/$BO_TAG")" = "$GITHUB_SHA" || {
@@ -126,24 +136,31 @@ jobs:
               exit 1
             }
           fi
-          cd artifacts
-          sha256sum -c SHA256SUMS
+          (cd artifacts && sha256sum -c SHA256SUMS)
+          test -n "$BO_SIGNING_KEY" || { echo 'Configure the release signing key before creating OTA releases' >&2; exit 1; }
+          umask 077
+          BO_KEY_FILE="$RUNNER_TEMP/bookorbit-signing.pem"
+          trap 'rm -f "$BO_KEY_FILE"' EXIT
+          printf '%s\n' "$BO_SIGNING_KEY" > "$BO_KEY_FILE"
+          python3 tools/package_release.py \
+            --client artifacts/bookorbit.app \
+            --key "$BO_KEY_FILE" --commit "$GITHUB_SHA" --expect-version "$BO_TAG" \
+            --source-sha256 "$(sha256sum artifacts/source.tar | cut -d' ' -f1)" \
+            --output "$RUNNER_TEMP/ota-package"
           cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
           PocketBook PB634 / U634.6.10.3425 build.
 
-          Download bookorbit-pb634.zip and verify it against SHA256SUMS, then extract it.
-          The archive contains bookorbit.app, release.json with the toolchain,
-          elf.txt and checksums for the extracted files. Source code is not included.
+          Download bookorbit-pb634.zip and verify SHA256SUMS. The same signed ZIP
+          supports USB installation and subsequent in-app updates. Close BookOrbit,
+          copy bookorbit.app into applications/, keep existing application data,
+          safely eject USB and open BookOrbit. In-app installation replaces this
+          one file and closes BookOrbit; reopen it from the applications menu.
+          No previous version or automatic rollback is retained.
 
-          Desktop tests and ARM ELF checks passed. This build has not been run in
-          pbemu or accepted on a physical PB634. Review and test before publishing.
+          Desktop tests and ARM ELF checks passed. This CI build has not been run
+          in pbemu or accepted on a physical PB634. Review and test before publishing.
           EOF
-          # GitHub release assets reject the .app extension; ZIP also preserves executable mode.
-          chmod +x bookorbit.app
-          sha256sum bookorbit.app release.json elf.txt > SHA256SUMS
-          zip "$RUNNER_TEMP/bookorbit-pb634.zip" bookorbit.app SHA256SUMS release.json elf.txt
-          cd "$RUNNER_TEMP"
-          sha256sum bookorbit-pb634.zip > SHA256SUMS
+          cd "$RUNNER_TEMP/ota-package"
           gh release create "$BO_TAG" bookorbit-pb634.zip SHA256SUMS \
             --target "$GITHUB_SHA" --draft --title "BookOrbit $BO_TAG" \
             --notes-file "$RUNNER_TEMP/release-notes.md"

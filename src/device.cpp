@@ -156,6 +156,29 @@ bool connectNetwork() {
 #endif
 }
 
+bool networkConnected() {
+#ifdef POCKETBOOK_DEVICE
+    const auto *info=NetInfo(); return info && info->connected;
+#else
+    return true;
+#endif
+}
+QString updateDeviceError(QJsonObject *details) {
+#ifdef POCKETBOOK_DEVICE
+    const QString firmware=QString::fromLatin1(GetSoftwareVersion());
+    const bool usb=IsUSBconnected(), charging=IsCharging();
+    const int power=GetBatteryPower();
+    if(details) *details={{"firmware",firmware},{"usb",usb},{"battery",power},{"charging",charging},{"connected",networkConnected()}};
+    if(firmware!="U634.6.10.3425") return QCoreApplication::translate("BookOrbit","Updates are unavailable for this firmware.");
+    // Until mass-storage mode is independently identified, conservatively block any USB connection.
+    if(usb) return QCoreApplication::translate("BookOrbit","Disconnect USB before installing the update.");
+    if(!charging && (power<30 || power>100)) return QCoreApplication::translate("BookOrbit","Charge the battery to at least 30% before updating.");
+#else
+    if(details) *details={{"firmware","desktop"},{"connected",networkConnected()}};
+#endif
+    return {};
+}
+
 QString readerProfile() {
 #ifdef POCKETBOOK_DEVICE
     const char *profile = GetCurrentProfile();

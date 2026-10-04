@@ -236,3 +236,20 @@ python3 tools/check_translations.py
 Commit both `.ts` and `.qm` files; normal application builds do not require Linguist. To add another language, create `translations/bookorbit_<code>.ts`, translate every message in the `BookOrbit` context, compile it to `.qm`, and add it to `qml/app.qrc`. Register its code and native name in `interfaceLanguages()` in `src/i18n.h`; Settings and system-language selection use that registry automatically. Extend the language and catalog coverage checks. Unsupported system languages use English.
 
 </details>
+
+## Application updates
+
+Starting with **1.1.0**, BookOrbit checks [GitHub Releases](https://github.com/consolko/pb-bo-client/releases) for updates. A connected startup checks at most once per 24 hours; automatic checks can be disabled. Settings also provides a manual check. Download and installation require user actions.
+
+The app downloads `bookorbit-pb634.zip` and checks its checksum, Ed25519 signature, version and PB634 / U634.6.10.3425 compatibility. Installation replaces only `applications/bookorbit.app` and closes BookOrbit; reopen it from the applications menu. Books and settings are preserved. No previous version or automatic rollback is retained.
+
+Install 1.1.0 initially over USB: close BookOrbit, copy `bookorbit.app` from the ZIP into `applications/`, preserve `applications/bookorbit/`, then safely eject the reader. Later releases can be installed in the app. Enable the diagnostic log in Settings before reproducing an update error.
+
+<details>
+<summary>Preparing a release</summary>
+
+`resources/update-public-key.hex` contains the public key embedded in the app. Keep its Ed25519 private key outside the repository and add the full PEM as the GitHub Actions repository secret `BOOKORBIT_UPDATE_SIGNING_KEY`. Keep a protected backup: rotating this key requires a separate transition for installed clients.
+
+Update `BOOKORBIT_VERSION` in `CMakeLists.txt`, push the reviewed changes and run **PocketBook release** with `vX.Y.Z`, or push that tag. The workflow runs tests, builds the ARM app, signs the ZIP and creates a draft release with `bookorbit-pb634.zip` and an external `SHA256SUMS`. It checks key, version and commit consistency; a missing key fails the release. Validate the build, then publish the draft as a regular release. The app discovers only published releases with a higher version than its own.
+
+</details>

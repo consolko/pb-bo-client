@@ -1,5 +1,6 @@
 #include "i18n.h"
 #include "client.h"
+#include <cstdio>
 #include "device.h"
 #include "progress.h"
 #include "sync_decision.h"
@@ -161,6 +162,7 @@ bool sameStorage(const QString &first, const QString &second) {
 
 Client::Client(QUrl server, QString root, QObject *parent, bool restoreAccount)
     : QObject(parent), endpoint(server), rootDir(root) {
+    diagnosticClock.start();
     network.setTransferTimeout(15000);
     const bool dataDirectoryCreated = QDir().mkpath(rootDir);
     const auto preferences = readObject(rootDir+"/preferences.json");
@@ -188,6 +190,14 @@ Client::Client(QUrl server, QString root, QObject *parent, bool restoreAccount)
     if (!dataDirectoryCreated)
         finish(QCoreApplication::translate("BookOrbit", "Could not create the app data folder: ") + rootDir +
                QCoreApplication::translate("BookOrbit", ". Check free space and access to device storage."), false, "storage");
+}
+
+bool Client::prepareUpdate() {
+    if(working || downloading() || checkingLibrary || syncingAll) return false;
+    updateLocked=true; working=true; stopCovers(); emit changed(); return true;
+}
+void Client::cancelUpdate() {
+    if(updateLocked) { updateLocked=false; working=false; emit changed(); }
 }
 
 bool Client::setLanguage(const QString &language) {
@@ -1521,8 +1531,9 @@ bool Client::setDownloadDirectory(const QString &path) {
 
 bool Client::setDiagnosticLogging(bool enabled) {
     beginFeedback("settings");
+    if(!enabled) logEvent("diagnostics disabled");
     diagnostics = enabled;
-    logEvent(enabled ? "diagnostics enabled" : "diagnostics disabled");
+    if(enabled) { logEvent("diagnostics enabled"); emit diagnosticsEnabled(); }
     auto preferences = readObject(rootDir+"/preferences.json");
     preferences["diagnosticLogging"] = enabled;
     QString error;
@@ -1535,18 +1546,32 @@ bool Client::setDiagnosticLogging(bool enabled) {
 }
 
 void Client::logEvent(const QString &event, int code, int http) {
-    if (!diagnostics) return;
-    const QString path = diagnosticLogPath();
-    if (QFileInfo(path).size() > 128 * 1024) {
-        QFile::remove(path+".1");
-        QFile::rename(path, path+".1");
+    logDiagnostic(event,{{"error",code},{"http",http}});
+}
+void Client::logDiagnostic(const QString &event, QJsonObject fields) {
+    if(!diagnostics) return;
+    const QString path=diagnosticLogPath();
+    auto failed=[&](const QString &reason) {
+        const auto text=QCoreApplication::translate("BookOrbit","Could not write diagnostic log: ")+reason;
+        if(logError!=text) { logError=text; emit changed(); }
+        std::fprintf(stderr,"bookorbit diagnostic log: %s\n",qPrintable(reason));
+    };
+    if(QFileInfo(path).isSymLink() || QFileInfo(path+".1").isSymLink()) { failed("Unsafe log path"); return; }
+    if(QFileInfo(path).size()>128*1024) {
+        if((QFile::exists(path+".1") && !QFile::remove(path+".1")) || !QFile::rename(path,path+".1")) {
+            failed("Cannot rotate log"); return;
+        }
     }
-    QFile log(path);
-    if (!log.open(QIODevice::WriteOnly | QIODevice::Append)) return;
-    const auto line = (QDateTime::currentDateTimeUtc().toString(Qt::ISODate)+" "+event+
-                       " error="+QString::number(code)+" http="+QString::number(http)+"\n").toUtf8();
-    log.write(line);
-    log.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    QFile file(path);
+    if(!file.open(QIODevice::WriteOnly|QIODevice::Append)) { failed(file.errorString()); return; }
+    // Only explicit diagnostic fields: never response bodies, credentials or signed URLs.
+    fields["event"]=event; fields["at"]=QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+    fields["pid"]=QCoreApplication::applicationPid(); fields["version"]=QCoreApplication::applicationVersion();
+    fields["seq"]=++diagnosticSequence; fields["elapsedMs"]=diagnosticClock.elapsed();
+    const auto line=QJsonDocument(fields).toJson(QJsonDocument::Compact)+"\n";
+    if(file.write(line)!=line.size() || !file.flush()) { failed(file.errorString()); return; }
+    file.setPermissions(QFileDevice::ReadOwner|QFileDevice::WriteOwner);
+    if(!logError.isEmpty()) { logError.clear(); emit changed(); }
 }
 
 QVariantList Client::directories(const QString &path) const {

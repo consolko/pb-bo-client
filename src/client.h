@@ -1,5 +1,6 @@
 #pragma once
 #include <QObject>
+#include <QElapsedTimer>
 #include "i18n.h"
 #include "device.h"
 #include <QJsonArray>
@@ -49,12 +50,15 @@ class Client : public QObject {
     Q_PROPERTY(bool verifyingLibrary READ verifyingLibrary NOTIFY changed)
     Q_PROPERTY(bool canRetry READ canRetry NOTIFY changed)
     Q_PROPERTY(QString downloadDirectory READ downloadDirectory NOTIFY changed)
+    Q_PROPERTY(QString diagnosticError READ diagnosticError NOTIFY changed)
     Q_PROPERTY(bool diagnosticLogging READ diagnosticLogging NOTIFY changed)
     Q_PROPERTY(QString diagnosticLogPath READ diagnosticLogPath CONSTANT)
     Q_PROPERTY(bool hasSavedSession READ hasSavedSession NOTIFY changed)
     Q_PROPERTY(QString sessionWarning READ sessionWarning NOTIFY changed)
 public:
     Client(QUrl server, QString root, QObject *parent = nullptr, bool restoreAccount = true);
+    bool prepareUpdate();
+    void cancelUpdate();
     QStringList languageCodes() const { return interfaceLanguages().keys(); }
     QStringList languageNames() const { return interfaceLanguages().values(); }
     QString language() const { return languagePreference; }
@@ -121,6 +125,8 @@ public:
     QString downloadDirectory() const;
     bool diagnosticLogging() const { return diagnostics; }
     QString diagnosticLogPath() const;
+    QString diagnosticError() const { return logError; }
+    void logDiagnostic(const QString &event, QJsonObject fields = {});
     bool hasSavedSession() const { return sessionStored; }
     QString sessionWarning() const { return translatedText(sessionNotice); }
     Q_INVOKABLE QVariantList directories(const QString &path) const;
@@ -139,11 +145,16 @@ public:
     Q_INVOKABLE void open(int index, bool applyIncoming = true);
     QString localFile(int index) const;
 signals:
+    void diagnosticsEnabled();
     void languageChanged();
     void changed();
     void coversChanged();
     void completed(const QString &operation, bool success);
 private:
+    bool updateLocked=false;
+    QString logError;
+    QElapsedTimer diagnosticClock;
+    qint64 diagnosticSequence=0;
     QVariantMap syncFileStatus(const QString &id, const QString &profile) const;
     void prepareConflict(const QString &id, const QString &local, const QJsonObject &remote, const QString &profile);
     QVariantList positionChoices;

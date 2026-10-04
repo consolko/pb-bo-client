@@ -10,6 +10,16 @@ ApplicationWindow {
     title: "BookOrbit"
     color: "white"
     property real u: width / 600
+    readonly property var updater: typeof updateManager === "undefined" ? null : updateManager
+    Connections {
+        target: window.updater
+        function onChanged() {
+            if (window.settings && window.updater.state === "ready")
+                Qt.callLater(function() {
+                    settingsScroll.contentItem.contentY = Math.max(0, settingsScroll.contentHeight - settingsScroll.height)
+                })
+        }
+    }
     property bool fullDescription: false
     property bool editionExpanded: false
     property bool coverGrid: false
@@ -294,6 +304,13 @@ ApplicationWindow {
             }
             Action { objectName: "exitButton"; visible: !window.settings && !window.syncView && !client.detailVisible; text: qsTranslate("BookOrbit", "Close application"); icon.source: "qrc:/icons/exit.svg"; enabled: !client.busy; onClicked: Qt.quit() }
         }
+        Action {
+            objectName: "updateNotification"
+            visible: !window.settings && !!window.updater && window.updater.state === "available"
+            text: qsTranslate("BookOrbit", "Available version: %1").arg(window.updater ? window.updater.availableVersion : "")
+            Layout.fillWidth: true; enabled: !client.busy
+            onClicked: { window.settings = true; Qt.callLater(function() { settingsScroll.contentItem.contentY = Math.max(0, settingsScroll.contentHeight - settingsScroll.height) }) }
+        }
         Text {
             Layout.fillWidth: true
             visible: window.settings
@@ -431,6 +448,89 @@ ApplicationWindow {
                     onClicked: client.setDiagnosticLogging(checked)
                 }
                 Text { objectName: "diagnosticPath"; text: client.diagnosticLogPath; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; font.pixelSize: 14 * window.u; color: "#444444" }
+                Text {
+                    text: client.diagnosticError
+                    visible: text.length > 0; textFormat: Text.PlainText
+                    Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u
+                }
+                ColumnLayout {
+                    visible: window.updater !== null
+                    Layout.fillWidth: true
+                    spacing: 8 * window.u
+                    Item { Layout.preferredHeight: 12 * window.u }
+                    Text { text: qsTranslate("BookOrbit", "Application updates"); font.pixelSize: 18 * window.u; font.bold: true }
+                    Text {
+                        text: qsTranslate("BookOrbit", "Installed version: %1").arg(window.updater ? window.updater.version : "")
+                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u
+                    }
+                    Text {
+                        visible: !!window.updater && window.updater.lastChecked.length > 0
+                        text: qsTranslate("BookOrbit", "Last checked: %1").arg(window.updater ? window.updater.lastChecked : "")
+                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u
+                    }
+                    CheckBox {
+                        text: qsTranslate("BookOrbit", "Check at startup when connected")
+                        checked: !!window.updater && window.updater.automatic
+                        enabled: !client.busy
+                        font.pixelSize: 16 * window.u; implicitHeight: 48 * window.u
+                        onClicked: window.updater.automatic = checked
+                    }
+                    Text {
+                        text: window.updater ? window.updater.message : ""
+                        visible: text.length > 0; textFormat: Text.PlainText
+                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u
+                        Accessible.role: Accessible.StaticText; Accessible.name: text
+                    }
+                    Action {
+                        objectName: "checkUpdateButton"
+                        text: window.updater && window.updater.state === "checking" ? qsTranslate("BookOrbit", "Checking updates…") : qsTranslate("BookOrbit", "Check for updates")
+                        Layout.fillWidth: true
+                        enabled: !client.busy && !!window.updater && ["idle", "error", "available"].indexOf(window.updater.state) >= 0
+                        onClicked: window.updater.check()
+                    }
+                    Text {
+                        text: qsTranslate("BookOrbit", "Available version: %1").arg(window.updater ? window.updater.availableVersion : "")
+                        visible: !!window.updater && window.updater.availableVersion.length > 0
+                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u; font.bold: true
+                    }
+                    Text {
+                        text: window.updater ? window.updater.notes : ""
+                        visible: text.length > 0; textFormat: Text.PlainText
+                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 15 * window.u
+                    }
+                    ProgressBar {
+                        Layout.fillWidth: true
+                        visible: !!window.updater && window.updater.state === "downloading"
+                        value: window.updater ? window.updater.progress : 0
+                        Accessible.name: qsTranslate("BookOrbit", "Update download progress")
+                    }
+                    Text {
+                        visible: !!window.updater && window.updater.availableVersion.length > 0
+                        text: window.updater && window.updater.state === "downloading"
+                            ? qsTranslate("BookOrbit", "%1% · %2 / %3 KB").arg(Math.round(window.updater.progress * 100)).arg(Math.round(window.updater.progress * window.updater.archiveBytes / 1024)).arg(Math.ceil(window.updater.archiveBytes / 1024))
+                            : qsTranslate("BookOrbit", "Download size: %1 KB").arg(window.updater ? Math.ceil(window.updater.archiveBytes / 1024) : 0)
+                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u
+                    }
+                    Action {
+                        objectName: "downloadUpdateButton"
+                        text: qsTranslate("BookOrbit", "Download update"); Layout.fillWidth: true
+                        visible: !!window.updater && window.updater.state === "available"
+                        enabled: !client.busy
+                        onClicked: window.updater.download()
+                    }
+                    Action {
+                        text: qsTranslate("BookOrbit", "Cancel update download"); Layout.fillWidth: true
+                        visible: !!window.updater && ["checking", "downloading"].indexOf(window.updater.state) >= 0
+                        onClicked: window.updater.cancel()
+                    }
+                    Action {
+                        objectName: "installUpdateButton"
+                        text: qsTranslate("BookOrbit", "Install and close"); Layout.fillWidth: true
+                        visible: !!window.updater && window.updater.canInstall
+                        enabled: !client.busy
+                        onClicked: window.updater.install()
+                    }
+                }
                 }
             }
         }

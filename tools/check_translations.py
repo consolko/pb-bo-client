@@ -19,6 +19,9 @@ for path in [root / 'qml/Main.qml', *root.glob('src/*.cpp')]:
     for match in re.finditer(r'(?:qsTranslate|QCoreApplication::translate)\("BookOrbit",\s*("(?:[^"\\]|\\.)*")', path.read_text()):
         source = json.loads(match[1])
         assert source in messages, f'Missing Russian translation in {path.name}: {source}'
+for path in root.glob('src/*.cpp'):
+    for match in re.finditer(r'trUpdate\(("(?:[^"\\]|\\.)*")', path.read_text()):
+        assert json.loads(match[1]) in messages, f'Missing update translation: {match[1]}'
 print(f'PASS: {len(messages)} translations, source coverage, placeholders and line breaks')
 
 lrelease = shutil.which('lrelease') or shutil.which('lrelease6')

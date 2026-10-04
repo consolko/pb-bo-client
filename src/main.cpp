@@ -1,5 +1,7 @@
 #include "client.h"
 #include "device.h"
+#include "ota.h"
+#include "update.h"
 #include <QCoreApplication>
 #include <QFont>
 #include <QGuiApplication>
@@ -11,6 +13,7 @@
 #include <cstdio>
 #include <memory>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 
@@ -20,6 +23,7 @@ int main(int argc, char **argv) {
 #endif
     QStringList args;
     for (int i=1; i<argc; ++i) args << QString::fromLocal8Bit(argv[i]);
+    if(args.contains("--build-info")) { std::puts(Ota::buildInfo()); return 0; }
     const bool smoke = args.contains("--smoke-test");
     const bool offline = args.contains("--offline-test");
     auto option = [&args](const QString &name, const QString &fallback) {
@@ -51,13 +55,14 @@ int main(int argc, char **argv) {
         QGuiApplication::setFont(QFont(deviceFont()));
     }
     QCoreApplication::setApplicationName("bookorbit");
+    QCoreApplication::setApplicationVersion(Ota::version());
 #ifdef POCKETBOOK_DEVICE
     const QString defaultData = "/mnt/ext1/applications/bookorbit";
 #else
     const QString defaultData = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
 #endif
     // Isolated storage is only available to explicit command-line checks.
-    const QString data = smoke || offline ? option("--data-dir", defaultData) : defaultData;
+    QString data = smoke || offline ? option("--data-dir", defaultData) : defaultData;
     // Install before constructing Client so startup/storage errors use the selected language.
     const QString systemLanguage = deviceLanguage();
     InterfaceTranslation translator;
@@ -67,6 +72,8 @@ int main(int argc, char **argv) {
         applyLanguage(QJsonDocument::fromJson(preferences.readAll()).object()["language"].toString());
     else applyLanguage({});
     Client client(QUrl(server), data, nullptr, !args.contains("--server"));
+    client.logDiagnostic("app.start",{{"executable",QString::fromLocal8Bit(argv[0])},{"data",data}});
+    QObject::connect(app.get(),&QCoreApplication::aboutToQuit,&client,[&] { client.logDiagnostic("app.exit"); });
     if (offline) {
         const QString path = client.localFile(0);
         std::printf("cachedBooks=%lld localFile=%s\n", static_cast<long long>(client.books().size()), qPrintable(path));
@@ -113,6 +120,8 @@ int main(int argc, char **argv) {
         return app->exec();
     }
     QQmlApplicationEngine engine;
+    UpdateManager updater(&client,data,QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath());
+    engine.rootContext()->setContextProperty("updateManager",&updater);
     QObject::connect(&client, &Client::languageChanged, &engine, [&] {
         applyLanguage(client.language());
         engine.retranslate();
@@ -125,7 +134,13 @@ int main(int argc, char **argv) {
     engine.rootContext()->setContextProperty("screenHeight", screen.height());
     engine.load(QUrl("qrc:/Main.qml"));
     std::fprintf(stderr, "bookorbit: QML roots %lld\n", static_cast<long long>(engine.rootObjects().size()));
-    if (engine.rootObjects().isEmpty()) return 1;
-    QTimer::singleShot(0, &client, &Client::restoreSession);
+    if (engine.rootObjects().isEmpty()) { client.logDiagnostic("app.qml.failed"); return 1; }
+    QObject::connect(&updater,&UpdateManager::startupCommitted,&client,&Client::restoreSession);
+    auto *window=qobject_cast<QQuickWindow*>(engine.rootObjects().first());
+    if(!window) return 1;
+    auto ready=std::make_shared<bool>(false);
+    QObject::connect(window,&QQuickWindow::frameSwapped,&updater,[&updater,ready] {
+        if(!*ready) { *ready=true; QTimer::singleShot(0,&updater,&UpdateManager::windowReady); }
+    });
     return app->exec();
 }

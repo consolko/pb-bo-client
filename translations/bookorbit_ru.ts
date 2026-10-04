@@ -1426,5 +1426,157 @@ On device</source>
       <source>Downloads</source>
       <translation>Скачанные</translation>
     </message>
-  </context>
+      <message>
+        <source>Application updates</source>
+        <translation>Обновление приложения</translation>
+    </message>
+    <message>
+        <source>Installed version: %1</source>
+        <translation>Установленная версия: %1</translation>
+    </message>
+    <message>
+        <source>Check at startup when connected</source>
+        <translation>Проверять при запуске, если сеть подключена</translation>
+    </message>
+    <message>
+        <source>Checking updates…</source>
+        <translation>Проверка обновлений…</translation>
+    </message>
+    <message>
+        <source>Check for updates</source>
+        <translation>Проверить обновления</translation>
+    </message>
+    <message>
+        <source>Available version: %1</source>
+        <translation>Доступна версия: %1</translation>
+    </message>
+    <message>
+        <source>Update download progress</source>
+        <translation>Ход загрузки обновления</translation>
+    </message>
+    <message>
+        <source>Download update</source>
+        <translation>Скачать обновление</translation>
+    </message>
+    <message>
+        <source>Cancel update download</source>
+        <translation>Отменить загрузку обновления</translation>
+    </message>
+    <message>
+        <source>Updates are unavailable for this firmware.</source>
+        <translation>Обновления недоступны для этой прошивки.</translation>
+    </message>
+    <message>
+        <source>Disconnect USB before installing the update.</source>
+        <translation>Отключите USB перед установкой обновления.</translation>
+    </message>
+    <message>
+        <source>Charge the battery to at least 30% before updating.</source>
+        <translation>Перед обновлением зарядите устройство хотя бы до 30%.</translation>
+    </message>
+    <message>
+        <source>The update request timed out.</source>
+        <translation>Истекло время ожидания обновления.</translation>
+    </message>
+    <message>
+        <source>Could not save update settings.</source>
+        <translation>Не удалось сохранить настройки обновлений.</translation>
+    </message>
+    <message>
+        <source>The update could not be installed. The current version is still running.</source>
+        <translation>Не удалось установить обновление. Текущая версия продолжает работать.</translation>
+    </message>
+    <message>
+        <source>The update server returned an unsafe download address.</source>
+        <translation>Сервер обновлений вернул недопустимый адрес загрузки.</translation>
+    </message>
+    <message>
+        <source>The update response is too large.</source>
+        <translation>Ответ сервера обновлений слишком большой.</translation>
+    </message>
+    <message>
+        <source>The published release is unavailable.</source>
+        <translation>Опубликованный релиз недоступен.</translation>
+    </message>
+    <message>
+        <source>Could not check updates. Try again later.</source>
+        <translation>Не удалось проверить обновления. Повторите позже.</translation>
+    </message>
+    <message>
+        <source>The update connection failed.</source>
+        <translation>Соединение с сервером обновлений прервано.</translation>
+    </message>
+    <message>
+        <source>The update server asked to wait. Try again later.</source>
+        <translation>Сервер обновлений попросил подождать. Повторите позже.</translation>
+    </message>
+    <message>
+        <source>Connect to the network to check updates.</source>
+        <translation>Подключитесь к сети для проверки обновлений.</translation>
+    </message>
+    <message>
+        <source>The release information is invalid.</source>
+        <translation>Сведения о релизе повреждены или имеют неподдерживаемый формат.</translation>
+    </message>
+    <message>
+        <source>You have the latest version.</source>
+        <translation>У вас последняя версия.</translation>
+    </message>
+    <message>
+        <source>This release has no compatible update package.</source>
+        <translation>В этом релизе нет совместимого пакета обновления.</translation>
+    </message>
+    <message>
+        <source>An application update is available.</source>
+        <translation>Доступно обновление приложения.</translation>
+    </message>
+    <message>
+        <source>Update download cancelled.</source>
+        <translation>Загрузка обновления отменена.</translation>
+    </message>
+    <message>
+        <source>Not enough writable space for the update.</source>
+        <translation>Недостаточно доступного места для обновления.</translation>
+    </message>
+    <message>
+        <source>Connect to the network to download the update.</source>
+        <translation>Подключитесь к сети для загрузки обновления.</translation>
+    </message>
+    <message>
+        <source>Invalid archive checksum.</source>
+        <translation>Неверная контрольная сумма архива.</translation>
+    </message>
+    <message>
+        <source>Could not save the update download.</source>
+        <translation>Не удалось сохранить загружаемое обновление.</translation>
+    </message>
+    <message>
+        <source>The update archive is incomplete or damaged.</source>
+        <translation>Архив обновления загружен не полностью или повреждён.</translation>
+    </message>
+    <message>
+        <source>The update is verified. Press Install and close to apply it.</source>
+        <translation>Обновление проверено. Нажмите «Установить и закрыть».</translation>
+    </message>
+    <message>
+        <source>Finish the current operation before updating.</source>
+        <translation>Завершите текущую операцию перед обновлением.</translation>
+    </message>
+<message><source>Last checked: %1</source><translation>Последняя проверка: %1</translation></message>
+<message><source>%1% · %2 / %3 KB</source><translation>%1% · %2 / %3 КБ</translation></message>
+<message><source>Download size: %1 KB</source><translation>Размер загрузки: %1 КБ</translation></message>
+<message><source>The update package could not be verified.</source><translation>Не удалось проверить пакет обновления.</translation></message>
+    <message>
+        <source>Install and close</source>
+        <translation>Установить и закрыть</translation>
+    </message>
+    <message>
+        <source>Update installed. Open BookOrbit again from the applications menu.</source>
+        <translation>Обновление установлено. Откройте BookOrbit снова из меню приложений.</translation>
+    </message>
+    <message>
+        <source>Could not write diagnostic log: </source>
+        <translation>Не удалось записать диагностический журнал: </translation>
+    </message>
+</context>
 </TS>

@@ -1,5 +1,6 @@
 #pragma once
 #include <QString>
+#include <QJsonObject>
 #include <QSize>
 #include <QMap>
 #include <QStringList>
@@ -18,6 +19,8 @@ enum class ReaderFileState { Closed, Open, Unknown };
 ReaderFileState readerFileState(const QString &path);
 
 bool connectNetwork();
+bool networkConnected();
+QString updateDeviceError(QJsonObject *details=nullptr);
 bool readerPosition(const QString &path, QString *position);
 QString readerProfile();
 bool saveReaderPosition(const QString &path, const QString &expectedPosition,

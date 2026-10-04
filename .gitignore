@@ -19,3 +19,5 @@ build/
 !/tools/run_desktop_checks.py
 !/tools/language_check.cpp
 !/tools/check_translations.py
+!/tools/package_release.py
+!/tools/ota_check.cpp
