@@ -39,6 +39,13 @@ UpdateManager::UpdateManager(Client *c,QString data,QString path,QObject *parent
 
 }
 QString UpdateManager::version() const { return Ota::version(); }
+bool UpdateManager::canInstall() const {
+#ifdef POCKETBOOK_DEVICE
+    return phase=="ready";
+#else
+    return false;
+#endif
+}
 QString UpdateManager::lastChecked() const {
     const auto value=settings["lastChecked"].toInteger();
     return value>0 ? QLocale().toString(QDateTime::fromSecsSinceEpoch(value),QLocale::ShortFormat) : QString{};
@@ -211,15 +218,19 @@ void UpdateManager::downloadZip(QUrl url,int redirects) {
             }
             QFile::remove(root+"/update/archive.zip"); totalDeadline.stop(); phase="ready";
             trace("verify.ready",{{"sha256",prepared["sha256"]},{"bytes",prepared["bytes"]}});
-            notice=trUpdate("The update is verified. Press Install and close to apply it."); emit changed();
+            notice=canInstall() ? trUpdate("The update is verified. Press Install and close to apply it.") : updateDeviceError(); emit changed();
         });
     });
 }
 void UpdateManager::install() {
     trace("install.requested",{{"canInstall",canInstall()},{"busy",client->busy()},{"destination",executable},{"permissions",int(QFileInfo(executable).permissions())},{"storage",storageDetails(QFileInfo(executable).absolutePath())}});
-    if(!canInstall()) { trace("install.ignored"); return; }
     QJsonObject device; const auto deviceError=updateDeviceError(&device); trace("install.device",device);
     if(!deviceError.isEmpty()) { trace("install.blocked",{{"reason",deviceError}}); notice=deviceError; emit changed(); return; }
+    if(!canInstall()) { trace("install.ignored"); return; }
+    if(!Ota::isRunningExecutable(executable)) {
+        trace("install.blocked",{{"reason","unverified executable path"}});
+        notice=trUpdate("Cannot safely identify the running application. Update installation is blocked."); emit changed(); return;
+    }
     if(active || !client->prepareUpdate()) { trace("install.blocked",{{"reason","client busy"}}); notice=trUpdate("Finish the current operation before updating."); emit changed(); return; }
     trace("install.started");
     QString error;

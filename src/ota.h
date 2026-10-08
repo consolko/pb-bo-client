@@ -14,6 +14,7 @@ QByteArray publicKey();
 QByteArray read(const QString &path, qint64 limit);
 QString hashFile(const QString &path);
 bool safeDirectory(const QString &path);
+bool isRunningExecutable(const QString &path);
 bool save(const QString &path, const QByteArray &data, QString *error);
 bool saveJson(const QString &path, const QJsonObject &data, QString *error);
 bool verifyManifest(const QByteArray &data, const QByteArray &signature,

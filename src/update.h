@@ -32,7 +32,7 @@ public:
     QString lastChecked() const;
     bool automatic() const { return settings["automatic"].toBool(true); }
     void setAutomatic(bool value);
-    bool canInstall() const { return phase=="ready"; }
+    bool canInstall() const;
     void windowReady();
     void automaticCheck();
     Q_INVOKABLE void check();
@@ -43,6 +43,7 @@ signals:
     void changed();
     void startupCommitted();
 private:
+    friend struct UpdateManagerCheck;
     void checkRelease(bool manual);
     void fail(const QString &error);
     bool allowed(const QUrl &url) const;

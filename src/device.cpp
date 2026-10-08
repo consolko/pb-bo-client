@@ -175,6 +175,7 @@ QString updateDeviceError(QJsonObject *details) {
     if(!charging && (power<30 || power>100)) return QCoreApplication::translate("BookOrbit","Charge the battery to at least 30% before updating.");
 #else
     if(details) *details={{"firmware","desktop"},{"connected",networkConnected()}};
+    return QCoreApplication::translate("BookOrbit","Updates can only be installed on PocketBook PB634.");
 #endif
     return {};
 }

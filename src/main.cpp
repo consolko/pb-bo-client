@@ -13,7 +13,6 @@
 #include <cstdio>
 #include <memory>
 #include <QFile>
-#include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 
@@ -120,7 +119,7 @@ int main(int argc, char **argv) {
         return app->exec();
     }
     QQmlApplicationEngine engine;
-    UpdateManager updater(&client,data,QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath());
+    UpdateManager updater(&client,data,QCoreApplication::applicationFilePath());
     engine.rootContext()->setContextProperty("updateManager",&updater);
     QObject::connect(&client, &Client::languageChanged, &engine, [&] {
         applyLanguage(client.language());

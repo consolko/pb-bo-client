@@ -21,3 +21,4 @@ build/
 !/tools/check_translations.py
 !/tools/package_release.py
 !/tools/ota_check.cpp
+!/tools/check_update_path.py

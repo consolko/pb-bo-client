@@ -1,6 +1,7 @@
 #include "ota.h"
 #include "zip.h"
 #include <QCryptographicHash>
+#include <QCoreApplication>
 #include <QJsonDocument>
 #include <QFileInfo>
 #include <QDir>
@@ -11,6 +12,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <cerrno>
+#include <cstring>
 
 #ifndef BOOKORBIT_VERSION
 #define BOOKORBIT_VERSION "1.1.0"
@@ -49,16 +52,35 @@ bool safeDirectory(const QString &path) {
     const QFileInfo info(path);
     return info.isDir() && !info.isSymLink() && info.canonicalFilePath()==info.absoluteFilePath();
 }
+bool isRunningExecutable(const QString &path) {
+#ifdef Q_OS_LINUX
+    const QFileInfo info(path);
+    return !path.isEmpty() && info.isFile() && !info.isSymLink() &&
+        info.canonicalFilePath()==path && QCoreApplication::applicationFilePath()==path &&
+        QFileInfo("/proc/self/exe").canonicalFilePath()==path;
+#else
+    Q_UNUSED(path)
+    return false;
+#endif
+}
+static bool commit(QSaveFile &file, QString *error) {
+    if(!file.flush()) return fail(error,"flush: "+file.errorString());
+    // QSaveFile::commit() ignores syncToDisk() failures; check before the rename.
+    if(::fsync(file.handle())!=0) return fail(error,"sync_file: "+QString::fromLocal8Bit(std::strerror(errno)));
+    const int dir=::open(QFile::encodeName(QFileInfo(file.fileName()).absolutePath()),O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if(dir<0) return fail(error,"open_directory: "+QString::fromLocal8Bit(std::strerror(errno)));
+    if(!file.commit()) { ::close(dir); return fail(error,"commit: "+file.errorString()); }
+    const bool ok=::fsync(dir)==0;
+    const QString detail=ok ? QString{} : QString::fromLocal8Bit(std::strerror(errno));
+    ::close(dir);
+    return ok || fail(error,"sync_directory: "+detail);
+}
 bool save(const QString &path, const QByteArray &data, QString *error) {
     const QFileInfo info(path);
     if (!safeDirectory(info.absolutePath()) || info.isSymLink()) return fail(error,"Unsafe update path");
     QSaveFile f(path); f.setDirectWriteFallback(false);
-    if (!f.open(QIODevice::WriteOnly) || f.write(data)!=data.size() || !f.commit()) return fail(error,f.errorString());
-    // QSaveFile syncs the file. Also persist its directory entry before advancing state.
-    const int dir=::open(QFile::encodeName(info.absolutePath()),O_RDONLY|O_DIRECTORY);
-    if (dir<0) return fail(error,"Cannot open update directory");
-    const bool ok=::fsync(dir)==0; ::close(dir);
-    return ok || fail(error,"Cannot sync update directory");
+    if (!f.open(QIODevice::WriteOnly) || f.write(data)!=data.size()) return fail(error,f.errorString());
+    return commit(f,error);
 }
 bool saveJson(const QString &path, const QJsonObject &data, QString *error) {
     return save(path,QJsonDocument(data).toJson(QJsonDocument::Compact),error);
@@ -143,8 +165,9 @@ bool install(const QString &staged,const QString &destination,const QJsonObject 
         if(::fstat(output.handle(),&mode)!=0 || !(mode.st_mode&S_IXUSR))
             return fail(error,"install.permissions: temporary file is not executable");
     }
-    if(!output.commit()) return fail(error,"install.commit: "+output.errorString());
-    QFile::remove(staged);
+    QString detail;
+    if(!commit(output,&detail)) return fail(error,"install."+detail);
+    if(!QFile::remove(staged)) return fail(error,"install.cleanup: cannot remove staged executable");
     return true;
 }
 }

@@ -104,9 +104,12 @@ struct Zip {
             do {
                 qint64 count=input.size(); const char *data=input.constData();
                 if(method==8) {
+                    const auto available=z.avail_in;
                     z.next_out=reinterpret_cast<Bytef*>(buffer); z.avail_out=sizeof(buffer);
                     rc=inflate(&z,Z_NO_FLUSH); count=sizeof(buffer)-z.avail_out; data=buffer;
+                    if(rc==Z_BUF_ERROR && !z.avail_in && !count && remaining>0) break;
                     if(rc!=Z_OK && rc!=Z_STREAM_END) { ok=false; break; }
+                    if(rc!=Z_STREAM_END && !count && z.avail_in==available) { ok=false; break; }
                 }
                 if(written+count>expected || out.write(data,count)!=count) { ok=false; break; }
                 written+=count; crc=crc32(crc,reinterpret_cast<const Bytef*>(data),count);

@@ -1578,5 +1578,13 @@ On device</source>
         <source>Could not write diagnostic log: </source>
         <translation>Не удалось записать диагностический журнал: </translation>
     </message>
+    <message>
+        <source>Updates can only be installed on PocketBook PB634.</source>
+        <translation>Установка обновлений доступна только на PocketBook PB634.</translation>
+    </message>
+    <message>
+        <source>Cannot safely identify the running application. Update installation is blocked.</source>
+        <translation>Не удалось достоверно определить путь запущенного приложения. Установка обновления заблокирована.</translation>
+    </message>
 </context>
 </TS>
