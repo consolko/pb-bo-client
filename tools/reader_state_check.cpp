@@ -1,5 +1,6 @@
 // VM-only check of the same InkView task query used before replacing an EPUB.
 #include "device.h"
+#include "progress.h"
 #include <cstdio>
 #include <QCoreApplication>
 
@@ -15,6 +16,12 @@ int main(int argc, char **argv) {
         QString position;
         if (!readerPosition(QString::fromLocal8Bit(argv[1]),&position)) return 4;
         std::printf("%s\n",qPrintable(position)); return 0;
+    }
+    if (argc==3 && QString::fromLocal8Bit(argv[2])=="--cfi") {
+        const QString path=QString::fromLocal8Bit(argv[1]); QString position;
+        if (!readerPosition(path,&position)) return 4;
+        const QString cfi=bookCfi(path,position);
+        std::puts(qPrintable(cfi)); return cfi.isEmpty() ? 5 : 0;
     }
     if (argc==4 && QString::fromLocal8Bit(argv[2])=="--save-cfi") {
         QString previous,error;

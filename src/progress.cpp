@@ -11,6 +11,7 @@
 #include <QtEndian>
 #include <zlib.h>
 #include <algorithm>
+#include <functional>
 
 namespace {
 QString tag(const QDomElement &e) { return e.tagName().section(':',-1); }
@@ -148,6 +149,15 @@ bool loadPackage(Zip &zip, Package &package) {
     return true;
 }
 
+QList<int> cfiOrder(const QString &path) {
+    QList<int> result;
+    for (auto step:path.mid(1).split('/')) {
+        step.remove(QRegularExpression("\\[[^\\]]*\\]"));
+        for (const auto &number:step.split(':')) result.append(number.toInt());
+    }
+    return result;
+}
+
 // Called only after both endpoints and all assertions have been validated.
 QString locationKey(QString point) {
     point.remove(QRegularExpression("\\[[^\\]]*\\]"));
@@ -205,15 +215,7 @@ bool epubPosition(const QString &path, const QString &cfi, double *percentage, Q
                 QDomNode last; qint64 endBefore=0; int endOffset=0;
                 if (!resolve(content.documentElement(),end,last,endBefore,endOffset) || endBefore<before) return false;
                 // Text offsets alone cannot order empty elements: compare validated CFI steps too.
-                const auto order=[](const QString &path) {
-                    QList<int> result;
-                    for (auto step : path.mid(1).split('/')) {
-                        step.remove(QRegularExpression("\\[[^\\]]*\\]"));
-                        for (const auto &number : step.split(':')) result.append(number.toInt());
-                    }
-                    return result;
-                };
-                const auto firstOrder=order(start), lastOrder=order(end);
+                const auto firstOrder=cfiOrder(start), lastOrder=cfiOrder(end);
                 if (std::lexicographical_compare(lastOrder.begin(),lastOrder.end(),firstOrder.begin(),firstOrder.end())) return false;
             }
             position=total+before;
@@ -267,4 +269,236 @@ bool validEpub(const QString &path) {
     for (const auto &resource:package.resources)
         if (!resource.isEmpty() && !zip.contains(resource)) return false;
     return true;
+}
+namespace {
+struct FbParagraph { QDomElement node; int section, page; qint64 offset; };
+struct FbBook { QList<QDomDocument> sections; QList<FbParagraph> paragraphs; qint64 total=0; };
+
+// ponytail: PB634 prose only. Images, tables, poetry and long native sections
+// need separate native-model calibration before their positions can be written.
+bool fbConvert(const QDomElement &source, QDomElement parent, FbBook &book,
+               int section, int page, qint64 &offset, bool top=false, bool inlineText=false) {
+    const QString name=tag(source);
+    if (source.tagName()!=name || (source.hasAttribute("xmlns") &&
+        source.attribute("xmlns")!="http://www.gribuser.ru/xml/fictionbook/2.0")) return false;
+    QString output;
+    bool paragraph=false, childrenInline=inlineText;
+    if (inlineText) {
+        static const QMap<QString,QString> inlineTags{{"strong","strong"},{"emphasis","em"},{"style","span"},
+            {"a","a"},{"strikethrough","s"},{"sub","sub"},{"sup","sup"},{"code","code"}};
+        output=inlineTags.value(name);
+    } else if (name=="p" || name=="subtitle" || name=="text-author") {
+        output=name=="subtitle" ? "h2" : tag(parent)=="header" || (top && name=="p") ? "h1" : "p";
+        paragraph=true; childrenInline=true;
+    } else if (name=="empty-line") { output="br"; paragraph=true; }
+    else if (name=="section") output="section";
+    else if (name=="title") output=top ? "section" : "header";
+    else if (name=="epigraph" || name=="cite") output=top ? "section" : "blockquote";
+    if (output.isEmpty()) return false;
+    auto doc=parent.ownerDocument(); auto node=doc.createElement(output);
+    if (source.hasAttribute("id")) node.setAttribute("id",source.attribute("id"));
+    parent.appendChild(node);
+    if (paragraph) book.paragraphs.append({node,section,page,offset});
+    for (auto child=source.firstChild();!child.isNull();child=child.nextSibling()) {
+        if (child.isElement()) {
+            if (name=="title" && tag(child.toElement())!="p" && tag(child.toElement())!="empty-line") return false;
+            if (name=="empty-line" || !fbConvert(child.toElement(),node,book,section,page,offset,
+                    top && name=="title",childrenInline)) return false;
+        } else if (child.isText() || child.isCDATASection() || child.isComment()) {
+            if (name=="empty-line" && !child.isComment() && !child.nodeValue().isEmpty()) return false;
+            if (!paragraph && !inlineText && !child.isComment() && !child.nodeValue().trimmed().isEmpty()) return false;
+            node.appendChild(doc.importNode(child,true));
+        } else if (!child.isProcessingInstruction()) return false;
+    }
+    if (paragraph) {
+        offset+=textSize(node)+1;
+        book.total+=textSize(node)+1;
+        // Below the firmware's 63000 UTF-16 split threshold, including delimiters.
+        if (offset>60000) return false;
+    }
+    return true;
+}
+
+QDomElement fbDocument(FbBook &book) {
+    QDomDocument doc; auto html=doc.createElement("html"); doc.appendChild(html);
+    html.appendChild(doc.createTextNode("\n    "));
+    html.appendChild(doc.createElement("head"));
+    html.appendChild(doc.createTextNode("\n    "));
+    auto body=doc.createElement("body"); html.appendChild(body);
+    html.appendChild(doc.createTextNode("\n"));
+    book.sections.append(doc); return body;
+}
+
+bool loadFb(const QString &path, FbBook &book) {
+    QFile file(path); QDomDocument source;
+    if (!file.open(QIODevice::ReadOnly) || file.size()>16*1024*1024 || !xml(file.readAll(),source)) return false;
+    const auto root=source.documentElement();
+    if (tag(root)!="FictionBook" || root.tagName()!= "FictionBook" ||
+        root.attribute("xmlns")!="http://www.gribuser.ru/xml/fictionbook/2.0" ||
+        !root.elementsByTagName("image").isEmpty()) return false;
+    int bodyIndex=0,page=-1; qint64 offset=0;
+    for (auto body=root.firstChildElement();!body.isNull();body=body.nextSiblingElement()) {
+        if (tag(body)!="body") continue;
+        QDomElement notes;
+        if (bodyIndex) { auto wrapper=fbDocument(book); notes=wrapper.ownerDocument().createElement("body"); wrapper.appendChild(notes); }
+        bool started=false,sectionsStarted=false;
+        for (auto child=body.firstChild();!child.isNull();child=child.nextSibling()) {
+            if (!child.isElement()) {
+                if ((child.isText() || child.isCDATASection()) && !child.nodeValue().trimmed().isEmpty()) return false;
+                if (bodyIndex && (child.isText() || child.isCDATASection() || child.isComment())) notes.appendChild(notes.ownerDocument().importNode(child,true));
+                continue;
+            }
+            const auto element=child.toElement(); const QString name=tag(element);
+            if (element.tagName()!=name || (name!="section" && name!="title" && name!="epigraph") ||
+                (sectionsStarted && name!="section")) return false;
+            if (!started || name=="section") { ++page; offset=0; started=true; }
+            sectionsStarted |= name=="section";
+            auto parent=bodyIndex ? notes : fbDocument(book);
+            const int before=book.paragraphs.size();
+            if (!fbConvert(element,parent,book,book.sections.size()-1,page,offset,true) || before==book.paragraphs.size()) return false;
+        }
+        if (!started) return false;
+        ++bodyIndex;
+    }
+    return bodyIndex>0 && book.total>0;
+}
+
+bool within(QDomNode node,const QDomNode &ancestor) {
+    while (!node.isNull()) { if (node==ancestor) return true; node=node.parentNode(); } return false;
+}
+qint64 fbBefore(QDomNode node) {
+    qint64 result=0;
+    while (!node.parentNode().isNull()) {
+        for (auto prev=node.previousSibling();!prev.isNull();prev=prev.previousSibling()) result+=textSize(prev);
+        node=node.parentNode();
+    }
+    return result;
+}
+QString fbPath(QDomNode node) {
+    QString path;
+    while (!node.parentNode().isDocument()) {
+        int elements=0;
+        for (auto prev=node.previousSibling();!prev.isNull();prev=prev.previousSibling()) if (prev.isElement()) ++elements;
+        path="/"+QString::number(node.isElement() ? (elements+1)*2 : elements*2+1)+path;
+        node=node.parentNode();
+    }
+    return path;
+}
+QString fbTextPoint(const FbParagraph &p,qint64 offset) {
+    // One CFI text step covers adjacent text/CDATA nodes separated by comments.
+    std::function<QString(QDomNode)> walk=[&](QDomNode parent)->QString {
+        for (auto node=parent.firstChild();!node.isNull();) {
+            if (node.isElement()) { auto result=walk(node); if (!result.isEmpty()) return result; node=node.nextSibling(); }
+            else {
+                QDomNode first; qint64 length=0;
+                while (!node.isNull() && !node.isElement()) {
+                    if (node.isText() || node.isCDATASection()) { if (first.isNull()) first=node; length+=node.nodeValue().size(); }
+                    node=node.nextSibling();
+                }
+                if (!first.isNull() && offset<=length) return fbPath(first)+":"+QString::number(offset);
+                offset-=length;
+            }
+        }
+        return {};
+    };
+    QString point=walk(p.node);
+    if (point.isEmpty() && textSize(p.node)==0 && offset==0) point=fbPath(p.node);
+    return point.isEmpty() ? QString{} : "epubcfi(/6/"+QString::number((p.section+1)*2)+"!"+point+")";
+}
+QString fbNative(const FbParagraph &p,qint64 offset) {
+    return "pbr:/word?page="+QString::number(p.page)+"&offs="+QString::number(p.offset+offset);
+}
+struct FbLocation { int paragraph=-1; qint64 offset=0; };
+bool fbResolve(const FbBook &book,int section,const QString &path,FbLocation &location) {
+    if (section<0 || section>=book.sections.size()) return false;
+    QDomNode target; qint64 before=0; int unused=0;
+    if (!resolve(book.sections[section].documentElement(),path,target,before,unused)) return false;
+    for (int i=0;i<book.paragraphs.size();++i) {
+        const auto &p=book.paragraphs[i]; if (p.section!=section) continue;
+        if (within(target,p.node)) {
+            const auto offset=before-fbBefore(p.node);
+            if (offset<0 || offset>textSize(p.node)) return false;
+            location={i,offset}; return true;
+        }
+        if (target.isElement() && within(p.node,target)) { location={i,0}; return true; }
+    }
+    return false;
+}
+
+bool fbPosition(const QString &path,const QString &cfi,double *percentage,QString *point,QVariantMap *context,QString *native) {
+    if (context) context->clear();
+    static const QRegularExpression base("^/6/([1-9][0-9]*)$");
+    if (cfi.size()>4096 || !cfi.startsWith("epubcfi(") || !cfi.endsWith(')')) return false;
+    auto ranges=cfi.mid(8,cfi.size()-9).split(',');
+    if (ranges.size()!=1 && ranges.size()!=3) return false;
+    auto parts=ranges[0].split('!'); if (parts.size()!=2) return false;
+    auto match=base.match(parts[0]); bool ok=false; int index=match.captured(1).toInt(&ok);
+    if (!match.hasMatch() || !ok || index%2) return false;
+    QString start=parts[1],end;
+    if (ranges.size()==3) {
+        if (start.isEmpty() || (!ranges[1].startsWith('/') && !ranges[1].startsWith(':')) ||
+            (!ranges[2].startsWith('/') && !ranges[2].startsWith(':'))) return false;
+        start+=ranges[1]; end=parts[1]+ranges[2];
+    }
+    FbBook book; FbLocation first,last;
+    if (!loadFb(path,book) || !fbResolve(book,index/2-1,start,first)) return false;
+    if (!end.isEmpty() && (!fbResolve(book,index/2-1,end,last) || last.paragraph<first.paragraph ||
+        (last.paragraph==first.paragraph && last.offset<first.offset))) return false;
+    if (!end.isEmpty()) {
+        const auto a=cfiOrder(start),b=cfiOrder(end);
+        if (std::lexicographical_compare(b.begin(),b.end(),a.begin(),a.end())) return false;
+    }
+    const auto &p=book.paragraphs[first.paragraph];
+    if (native) *native=fbNative(p,first.offset);
+    if (point) *point=fbTextPoint(p,first.offset);
+    if (percentage) {
+        qint64 before=first.offset;
+        for (int i=0;i<first.paragraph;++i) before+=textSize(book.paragraphs[i].node)+1;
+        *percentage=100.0*double(before)/double(book.total);
+    }
+    if (context) {
+        QString heading; precedingHeading(book.sections[p.section].documentElement(),p.node,heading);
+        *context={{"chapter",heading},{"excerpt",p.node.text().mid(first.offset,160).simplified()}};
+    }
+    return true;
+}
+}
+
+bool syncFormat(const QString &format) { return format=="epub" || format=="fb2"; }
+
+bool bookPosition(const QString &path,const QString &cfi,double *percentage,QString *point,QVariantMap *context,QString *native) {
+    if (path.endsWith(".fb2",Qt::CaseInsensitive)) return fbPosition(path,cfi,percentage,point,context,native);
+    if (!path.endsWith(".epub",Qt::CaseInsensitive)) return false;
+    QString result;
+    if (!epubPosition(path,cfi,percentage,&result,context)) return false;
+    if (point) *point=result;
+    if (native) *native="pbr:/webkit?##"+result;
+    return true;
+}
+
+QString bookCfi(const QString &path,const QString &position) {
+    if (!path.endsWith(".fb2",Qt::CaseInsensitive)) return nativeCfi(position);
+    static const QRegularExpression pattern("^pbr:/word\\?page=([0-9]+)(?:&offs=([0-9]+))?$");
+    auto match=pattern.match(position); bool ok=false;
+    const int page=match.captured(1).toInt(&ok); if (!match.hasMatch() || !ok) return {};
+    const qint64 offset=match.captured(2).isEmpty()?0:match.captured(2).toLongLong(&ok);
+    if (!ok) return {};
+    FbBook book; if (!loadFb(path,book)) return {};
+    for (const auto &p:book.paragraphs)
+        if (p.page==page && offset>=p.offset && offset<=p.offset+textSize(p.node)) return fbTextPoint(p,offset-p.offset);
+    return {};
+}
+
+bool sameBookPosition(const QString &path,const QString &first,const QString &second,bool compareRange) {
+    if (!path.endsWith(".fb2",Qt::CaseInsensitive)) return sameEpubPosition(path,first,second,compareRange);
+    if (first.isEmpty() || second.isEmpty()) return first.isEmpty() && second.isEmpty();
+    QString a,b;
+    if (!bookPosition(path,first,nullptr,nullptr,nullptr,&a) || !bookPosition(path,second,nullptr,nullptr,nullptr,&b) || a!=b) return false;
+    if (!compareRange) return true;
+    const auto endpoint=[](const QString &cfi) {
+        const auto range=cfi.mid(8,cfi.size()-9).split(',');
+        return range.size()==3 ? "epubcfi("+range[0]+range[2]+")" : cfi;
+    };
+    return bookPosition(path,endpoint(first),nullptr,nullptr,nullptr,&a) &&
+        bookPosition(path,endpoint(second),nullptr,nullptr,nullptr,&b) && a==b;
 }

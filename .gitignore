@@ -5,6 +5,7 @@ build/
 .DS_Store
 /tools/*
 !/tools/client_check.cpp
+!/tools/fb2_check.cpp
 !/tools/catalog_ui_check.cpp
 !/tools/native_sync_check.cpp
 !/tools/reader_state_check.cpp

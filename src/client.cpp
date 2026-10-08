@@ -505,7 +505,7 @@ QVariantMap Client::fileSummary(const QJsonObject &book) const {
     const bool downloaded = !localFile(book).isEmpty();
     const bool sameProfile=progress.contains("profile") && progress["profile"].toString()==readerProfile();
     return {{"fileId", file["id"].toInt()}, {"format", format.toUpper()},
-        {"downloaded", downloaded}, {"readable", readableFormat(format)}, {"canSync", downloaded && format == "epub"},
+        {"downloaded", downloaded}, {"readable", readableFormat(format)}, {"canSync", downloaded && syncFormat(format)},
         {"syncResult", translatedText(syncResults[id].toString())}, {"pendingProgress", sameProfile && progress["pending"].isObject()},
         {"remoteFileChanged", record["remoteFileChanged"].toBool()}, {"hasConflict", sameProfile && progress["conflictRemote"].isObject()},
         {"supported", !pathFor(book).isEmpty() && file["sizeBytes"].toDouble() <= maxBook},
@@ -654,7 +654,7 @@ QVariantMap Client::syncFileStatus(const QString &id, const QString &profile) co
     if (record["remoteFileChanged"].toBool()) {
         state="file"; reason=QCoreApplication::translate("BookOrbit", "The server file differs. Download the new version before syncing positions.");
     } else if (!available) {
-        state="file"; reason=QCoreApplication::translate("BookOrbit", "The local EPUB is missing or damaged. Download it again.");
+        state="file"; reason=QCoreApplication::translate("BookOrbit", "The local book file is missing or damaged. Download it again.");
     } else if (progressProfile && progress["conflictRemote"].isObject()) state="conflict";
     else if (progressProfile && progress["outgoing"].isObject()) state="uncertain";
     else if (progressProfile && progress["pending"].isObject() && (state=="synced" || state=="unknown")) state="pending";
@@ -662,13 +662,14 @@ QVariantMap Client::syncFileStatus(const QString &id, const QString &profile) co
         {"synced",QCoreApplication::translate("BookOrbit", "Synced")},{"conflict",QCoreApplication::translate("BookOrbit", "Choose a position")},{"reader",QCoreApplication::translate("BookOrbit", "Close the reader")},
         {"reader_unknown",QCoreApplication::translate("BookOrbit", "Could not check the reader")},{"network",QCoreApplication::translate("BookOrbit", "Waiting for network")},
         {"pending",QCoreApplication::translate("BookOrbit", "Position not applied yet")},{"uncertain",QCoreApplication::translate("BookOrbit", "Result needs verification")},
-        {"unknown",QCoreApplication::translate("BookOrbit", "Not checked yet")},{"auth",QCoreApplication::translate("BookOrbit", "Sign in to BookOrbit")},{"file",QCoreApplication::translate("BookOrbit", "Check the EPUB file")},
+        {"unknown",QCoreApplication::translate("BookOrbit", "Not checked yet")},{"auth",QCoreApplication::translate("BookOrbit", "Sign in to BookOrbit")},{"file",QCoreApplication::translate("BookOrbit", "Check the book file")},
         {"position",QCoreApplication::translate("BookOrbit", "Could not match the position")},{"error",QCoreApplication::translate("BookOrbit", "Could not sync")}};
     if (!labels.contains(state)) state="unknown";
     if (state=="network") reason=QCoreApplication::translate("BookOrbit", "Connect to a network and retry sync");
     if (state=="unknown") reason=QCoreApplication::translate("BookOrbit", "Run sync to check the position status.");
     const auto at=QDateTime::fromString(saved["at"].toString(),Qt::ISODate).toLocalTime();
     return {{"fileId",id.toInt()},{"filename",book["selectedFile"].toObject()["filename"].toString(record["filename"].toString())},
+        {"format",record["format"].toString("epub").toUpper()},
         {"state",state},{"label",labels[state]},{"reason",reason},{"available",available},
         {"checkedAt",sameProfile && at.isValid() ? at.toString("dd.MM.yyyy HH:mm") : QString{}}};
 }
@@ -679,7 +680,7 @@ QVariantList Client::syncBooks() const {
     const QStringList priority{"conflict","file","position","reader","reader_unknown","error","auth","pending","uncertain","network","unknown","synced"};
     for (auto it=downloads.begin(); it!=downloads.end(); ++it) {
         const auto record=it.value().toObject();
-        if (record["format"].toString("epub")!="epub") continue;
+        if (!syncFormat(record["format"].toString("epub"))) continue;
         const auto book=record["book"].toObject();
         const QString key=positiveId(book["id"]) ? "book:"+QString::number(book["id"].toInt()) : "file:"+it.key();
         const auto file=syncFileStatus(it.key(),profile);
@@ -712,12 +713,12 @@ QVariantMap Client::syncSummary() const {
         const auto group=book.toMap()["group"];
         if (group=="synced") ++synced; else if (group=="waiting") ++waiting; else ++attention;
     }
-    QSet<int> unsupported,epubs;
+    QSet<int> unsupported,supported;
     for (const auto value : downloads) {
         const auto record=value.toObject(); const int id=record["book"].toObject()["id"].toInt();
-        if (record["format"].toString("epub")=="epub") epubs.insert(id); else unsupported.insert(id);
+        if (syncFormat(record["format"].toString("epub"))) supported.insert(id); else unsupported.insert(id);
     }
-    unsupported.subtract(epubs);
+    unsupported.subtract(supported);
     return {{"books",books},{"total",books.size()},{"synced",synced},{"waiting",waiting},{"attention",attention},{"unsupported",unsupported.size()}};
 }
 
@@ -756,10 +757,10 @@ void Client::prepareConflict(const QString &id,const QString &local,const QJsonO
     for (bool useLocal : {true,false}) {
         QVariantMap context; double percentage=0;
         const auto cfi=useLocal ? local : remote["cfi"].toString();
-        const bool valid=sameFile && epubPosition(path,cfi,&percentage,nullptr,&context);
+        const bool valid=sameFile && bookPosition(path,cfi,&percentage,nullptr,&context);
         context["source"]=useLocal ? QCoreApplication::translate("BookOrbit", "On this PocketBook") : QCoreApplication::translate("BookOrbit", "In BookOrbit");
         context["local"]=useLocal;
-        context["percentage"]=valid ? QCoreApplication::translate("BookOrbit", "About %1% of the book").arg(QLocale().toString(percentage,'f',1)) : cfi.isEmpty() ? QCoreApplication::translate("BookOrbit", "No position saved yet") : QCoreApplication::translate("BookOrbit", "The position does not match this EPUB");
+        context["percentage"]=valid ? QCoreApplication::translate("BookOrbit", "About %1% of the book").arg(QLocale().toString(percentage,'f',1)) : cfi.isEmpty() ? QCoreApplication::translate("BookOrbit", "No position saved yet") : QCoreApplication::translate("BookOrbit", "The position does not match this book");
         context["canUse"]=valid && !(useLocal && other) && !record["remoteFileChanged"].toBool();
         context["notice"]=useLocal && other ? QCoreApplication::translate("BookOrbit", "Upload stopped to preserve other server position data.") : QString{};
         positionChoices.append(context);
@@ -1812,7 +1813,7 @@ void Client::syncAll() {
     if (!authenticated()) { finish(QCoreApplication::translate("BookOrbit", "Sign in to sync"),false,"sync"); return; }
     syncQueue.clear();
     for (auto it=downloads.begin(); it!=downloads.end(); ++it)
-        if (it.value().toObject()["format"].toString("epub") == "epub") syncQueue.append(it.key());
+        if (syncFormat(it.value().toObject()["format"].toString("epub"))) syncQueue.append(it.key());
     if (syncQueue.isEmpty()) { finish(QCoreApplication::translate("BookOrbit", "No downloaded books to sync"),true,"sync"); return; }
     dismissConflict();
     syncStopRequested=false; syncCompleted=0;
@@ -1921,14 +1922,14 @@ void Client::syncBook(const QString &id, int choice) {
     if (record["remoteFileChanged"].toBool()) {
         finish(QCoreApplication::translate("BookOrbit", "The server file differs. Progress sync is paused"),false,"progress","file"); return;
     }
-    if (record["format"].toString("epub") != "epub") {
-        finish(QCoreApplication::translate("BookOrbit", "Position sync is only available for EPUB. You can read this file locally."),false,"progress"); return;
+    if (!syncFormat(record["format"].toString("epub"))) {
+        finish(QCoreApplication::translate("BookOrbit", "Position sync is available for EPUB and supported FB2 books. You can read this file locally."),false,"progress"); return;
     }
     const QString path=localFile(record["book"].toObject());
     QString position;
     const QString profile=readerProfile();
     if (path.isEmpty() || digestFile(path)!=record["sha256"].toString().toLatin1()) {
-        finish(QCoreApplication::translate("BookOrbit", "Download a valid EPUB before syncing"),false,"progress","file"); return;
+        finish(QCoreApplication::translate("BookOrbit", "Download a valid book file before syncing"),false,"progress","file"); return;
     }
     const auto reader=readerFileState(path);
     if (reader==ReaderFileState::Open) {
@@ -1937,8 +1938,11 @@ void Client::syncBook(const QString &id, int choice) {
     if (reader==ReaderFileState::Unknown || !readerPosition(path,&position)) {
         finish(QCoreApplication::translate("BookOrbit", "Could not check the reader state. Positions were kept unchanged; try again."),false,"progress","reader_unknown"); return;
     }
-    const QString local=nativeCfi(position);
-    if ((!position.isEmpty() && local.isEmpty()) || (!local.isEmpty() && !epubPosition(path,local,nullptr))) {
+    if (record["format"].toString()=="fb2" && bookCfi(path,"pbr:/word?page=0").isEmpty()) {
+        finish(QCoreApplication::translate("BookOrbit", "This FB2 structure is not supported for sync yet. Images, tables, poetry and long sections require additional validation. You can still read the original file."),false,"progress","position"); return;
+    }
+    const QString local=bookCfi(path,position);
+    if ((!position.isEmpty() && local.isEmpty()) || (!local.isEmpty() && !bookPosition(path,local,nullptr))) {
         finish(QCoreApplication::translate("BookOrbit", "The local position format is unsupported. Progress was kept unchanged."),false,"progress","position"); return;
     }
     working=true; retryKind=0; stopCovers();
@@ -1953,7 +1957,7 @@ void Client::syncBook(const QString &id, int choice) {
                 finish(QCoreApplication::translate("BookOrbit", "The reader state has changed. Retry sync."),false,"progress"); return;
             }
             if (digestFile(path)!=downloads.value(id).toObject()["sha256"].toString().toLatin1()) {
-                finish(QCoreApplication::translate("BookOrbit", "The local EPUB changed during sync. Progress was kept unchanged."),false,"progress","file"); return;
+                finish(QCoreApplication::translate("BookOrbit", "The local book file changed during sync. Progress was kept unchanged."),false,"progress","file"); return;
             }
             const QString remoteCfi=remote["cfi"].toString();
             QString cfi=remoteCfi;
@@ -1962,8 +1966,8 @@ void Client::syncBook(const QString &id, int choice) {
                 !percent.isDouble() || percent.toDouble()<0 || percent.toDouble()>100) {
                 finish(QCoreApplication::translate("BookOrbit", "Invalid progress response: expected a CFI and a percentage from 0 to 100. Progress was kept unchanged."),false,"progress"); return;
             }
-            if (!cfi.isEmpty() && !epubPosition(path,remoteCfi,nullptr,&cfi)) {
-                finish(QCoreApplication::translate("BookOrbit", "Could not match the server CFI to this EPUB. Progress was kept unchanged."),false,"progress","position"); return;
+            if (!cfi.isEmpty() && !bookPosition(path,remoteCfi,nullptr,&cfi)) {
+                finish(QCoreApplication::translate("BookOrbit", "Could not match the server CFI to this book. Progress was kept unchanged."),false,"progress","position"); return;
             }
             bool other=false;
             for (const auto key : {"positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
@@ -1988,7 +1992,7 @@ void Client::syncBook(const QString &id, int choice) {
                 if (persist()) { dismissConflict(); finish(QCoreApplication::translate("BookOrbit", "Progress synced"),true,"progress"); }
             };
             const auto equivalent=[&path](const QString &a,const QString &b,bool range=false) {
-                return a==b || sameEpubPosition(path,a,b,range);
+                return a==b || sameBookPosition(path,a,b,range);
             };
             if (equivalent(local,cfi)) { acknowledge(); return; }
             const bool known=state.contains("profile") && state["profile"].toString()==profile &&
@@ -2036,7 +2040,7 @@ void Client::syncBook(const QString &id, int choice) {
                                QCoreApplication::translate("BookOrbit", "No exact position on the reader yet."),false,"progress"); return;
             }
             double percentage=0;
-            if (!epubPosition(path,local,&percentage)) {
+            if (!bookPosition(path,local,&percentage)) {
                 finish(QCoreApplication::translate("BookOrbit", "The position was recognized, but the book percentage could not be estimated for upload. Positions were kept unchanged."),
                        false,"progress","position"); return;
             }

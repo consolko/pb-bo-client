@@ -281,7 +281,23 @@ static bool readReaderPosition(const QString &path, QString *position, qint64 *b
 #endif
 }
 
+#ifdef POCKETBOOK_DEVICE
+static bool fb2Firmware() {
+    if (QByteArray(GetSoftwareVersion())!="U634.6.10.3425") return false;
+    static const bool verified=[] {
+        QFile library("/ebrmain/lib/libpbrdwrapper.so");
+        QCryptographicHash hash(QCryptographicHash::Sha256);
+        return library.open(QIODevice::ReadOnly) && hash.addData(&library) && hash.result().toHex()==
+            "ab547f547a9e80338434c3c072dd7b560254a3d7f5a74a9adc58c89f0900b965";
+    }();
+    return verified;
+}
+#endif
+
 bool readerPosition(const QString &path, QString *position) {
+#ifdef POCKETBOOK_DEVICE
+    if (path.endsWith(".fb2",Qt::CaseInsensitive) && !fb2Firmware()) return false;
+#endif
     return readReaderPosition(path, position, nullptr);
 }
 
@@ -302,12 +318,13 @@ bool saveReaderPosition(const QString &path, const QString &expectedPosition,
     const auto setPosition = reinterpret_cast<int (*)(void *, long long, const std::string &, int, long)>(native.resolve(
         "_ZN10pocketbook2db9DbManager11SetPositionExRKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEil"));
     if (!instance || !initProfile || !setPosition) return false;
+    if (path.endsWith(".fb2",Qt::CaseInsensitive) && !fb2Firmware()) return false;
     double percentage=0;
-    QString point;
-    *error = QCoreApplication::translate("BookOrbit", "The position does not match this EPUB.");
-    if (!epubPosition(path,cfi,nullptr,&point)) return false;
+    QString incoming;
+    *error = QCoreApplication::translate("BookOrbit", "The position does not match this book.");
+    if (!bookPosition(path,cfi,nullptr,nullptr,nullptr,&incoming)) return false;
     *error = QCoreApplication::translate("BookOrbit", "The position was recognized, but the book percentage could not be estimated for the built-in library.");
-    if (!epubPosition(path,cfi,&percentage)) return false;
+    if (!bookPosition(path,cfi,&percentage)) return false;
     *error = QCoreApplication::translate("BookOrbit", "Close all books in the built-in reader and retry sync.");
     if (readerFileState(path) != ReaderFileState::Closed) return false;
     // Different paths can share one native book_id. Block all open books, including aliases.
@@ -326,7 +343,6 @@ bool saveReaderPosition(const QString &path, const QString &expectedPosition,
     QString current; qint64 bookId=0;
     *error = QCoreApplication::translate("BookOrbit", "The reader position or profile has changed. Retry sync.");
     if (readerProfile()!=profile || !readReaderPosition(path,&current,&bookId) || bookId<=0 || current!=expectedPosition) return false;
-    const QString incoming="pbr:/webkit?##"+point;
     *error = QCoreApplication::translate("BookOrbit", "Could not confirm that the position was saved. Retry sync.");
     try {
         void *db=instance();

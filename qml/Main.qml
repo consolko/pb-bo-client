@@ -277,7 +277,7 @@ ApplicationWindow {
                 visible: !window.settings && !window.syncView && !client.detailVisible
                 text: qsTranslate("BookOrbit", "Sync")
                 icon.source: "qrc:/icons/sync.svg"
-                Accessible.name: qsTranslate("BookOrbit", "Open sync for downloaded EPUBs")
+                Accessible.name: qsTranslate("BookOrbit", "Open sync for downloaded books")
                 enabled: !client.busy && client.authenticated
                 onClicked: { window.syncView = true; window.syncBookKey = "" }
             }
@@ -628,7 +628,7 @@ ApplicationWindow {
             spacing: 10 * window.u
             Text { text: client.username + " · " + client.server; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; font.pixelSize: 14 * window.u }
             Text { objectName: "syncSummaryText"; text: qsTranslate("BookOrbit", "Synced: ") + window.syncData.synced + qsTranslate("BookOrbit", " of ") + window.syncData.total; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 22 * window.u; font.bold: true }
-            Text { text: qsTranslate("BookOrbit", "Downloaded EPUB positions · last sync results"); Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
+            Text { text: qsTranslate("BookOrbit", "Downloaded book positions · last sync results"); Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
             Text { text: qsTranslate("BookOrbit", "Waiting: ") + window.syncData.waiting + qsTranslate("BookOrbit", " · needs attention: ") + window.syncData.attention; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 15 * window.u }
             RowLayout {
                 Layout.fillWidth: true
@@ -666,7 +666,7 @@ ApplicationWindow {
                         Layout.fillWidth: true; spacing: 4 * window.u
                         Text { text: modelData.title; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight; font.pixelSize: 21 * window.u; font.bold: true }
                         Text { text: modelData.author; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; maximumLineCount: 1; elide: Text.ElideRight; font.pixelSize: 14 * window.u; color: "#444444" }
-                        Text { text: modelData.label + " · " + (modelData.files.length > 1 ? qsTranslate("BookOrbit", "EPUB files: ") + modelData.files.length : "EPUB"); Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
+                        Text { text: modelData.label + " · " + (modelData.files.length > 1 ? qsTranslate("BookOrbit", "Files: ") + modelData.files.length : modelData.files[0].format); Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
                     }
                     Text { text: "›"; font.pixelSize: 22 * window.u; Accessible.ignored: true }
                 }
@@ -674,7 +674,7 @@ ApplicationWindow {
             Text {
                 anchors.centerIn: parent; width: parent.width
                 visible: syncList.count === 0
-                text: window.syncData.total === 0 ? qsTranslate("BookOrbit", "Nothing to sync yet.\nDownload an EPUB from the catalog.") : qsTranslate("BookOrbit", "No more books in this group.")
+                text: window.syncData.total === 0 ? qsTranslate("BookOrbit", "Nothing to sync yet.\nDownload an EPUB or FB2 from the catalog.") : qsTranslate("BookOrbit", "No more books in this group.")
                 wrapMode: Text.Wrap; horizontalAlignment: Text.AlignHCenter; font.pixelSize: 19 * window.u
             }
         }
@@ -692,7 +692,7 @@ ApplicationWindow {
                     ColumnLayout {
                         required property var modelData
                         Layout.fillWidth: true; spacing: 12 * window.u
-                        Text { text: modelData.filename || "EPUB"; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; font.pixelSize: 15 * window.u; color: "#444444" }
+                        Text { text: modelData.filename || modelData.format; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; font.pixelSize: 15 * window.u; color: "#444444" }
                         Text { objectName: "syncState-" + modelData.fileId; text: modelData.label; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 21 * window.u; font.bold: true }
                         Text { text: modelData.reason; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 18 * window.u }
                         Text { text: modelData.checkedAt ? qsTranslate("BookOrbit", "Last attempt: ") + modelData.checkedAt : ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
@@ -954,7 +954,7 @@ ApplicationWindow {
                         }
                     }
                 }
-                Text { text: !window.detailData.supported && window.detailData.format ? qsTranslate("BookOrbit", "The file exceeds the 100 MiB download limit.") : !window.detailData.readable && window.detailData.format ? qsTranslate("BookOrbit", "Available to download; opening this format from the app is not supported yet.") : window.detailData.format && window.detailData.format !== "EPUB" ? qsTranslate("BookOrbit", "Position sync is not supported for this format yet.") : ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
+                Text { text: !window.detailData.supported && window.detailData.format ? qsTranslate("BookOrbit", "The file exceeds the 100 MiB download limit.") : !window.detailData.readable && window.detailData.format ? qsTranslate("BookOrbit", "Available to download; opening this format from the app is not supported yet.") : window.detailData.format && window.detailData.format !== "EPUB" && window.detailData.format !== "FB2" ? qsTranslate("BookOrbit", "Position sync is not supported for this format yet.") : window.detailData.format === "FB2" ? qsTranslate("BookOrbit", "Experimental FB2 sync: text-only books with short sections. Unsupported structures keep their progress unchanged.") : ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
                 Text { objectName: "fileCheckResult"; text: window.detailData.remoteFileChanged ? qsTranslate("BookOrbit", "The server file differs. Progress sync is paused") : window.detailData.syncResult || ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
                 Text { text: window.detailData.hasConflict ? qsTranslate("BookOrbit", "The reader and BookOrbit have different positions. Check again and choose the one to use.") : window.detailData.pendingProgress ? qsTranslate("BookOrbit", "The incoming position has not been applied yet. Close all books in the built-in reader and check again.") : ""; visible: !window.detailData.remoteFileChanged && text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
                 Action { objectName: "redownloadButton"; text: qsTranslate("BookOrbit", "Download again"); visible: !!window.detailData.remoteFileChanged; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.downloadSelected() }
@@ -1017,7 +1017,7 @@ ApplicationWindow {
                     objectName: "file-" + modelData.id
                     width: ListView.view.width
                     implicitHeight: Math.max(64 * window.u, contentItem.implicitHeight + 20 * window.u)
-                    text: modelData.format + (modelData.sizeLabel ? " · " + modelData.sizeLabel : "") + (modelData.filename ? "\n" + modelData.filename : "") + "\n" + (modelData.format === "EPUB" ? qsTranslate("BookOrbit", "Reading and position sync") : modelData.readable ? qsTranslate("BookOrbit", "Reading without position sync") : qsTranslate("BookOrbit", "Download only")) + (!modelData.supported ? qsTranslate("BookOrbit", "\nExceeds the 100 MiB download limit") : "")
+                    text: modelData.format + (modelData.sizeLabel ? " · " + modelData.sizeLabel : "") + (modelData.filename ? "\n" + modelData.filename : "") + "\n" + ((modelData.format === "EPUB" || modelData.format === "FB2") ? qsTranslate("BookOrbit", "Reading and position sync") : modelData.readable ? qsTranslate("BookOrbit", "Reading without position sync") : qsTranslate("BookOrbit", "Download only")) + (!modelData.supported ? qsTranslate("BookOrbit", "\nExceeds the 100 MiB download limit") : "")
                     Accessible.role: Accessible.RadioButton
                     Accessible.name: text
                     Accessible.checked: checked
@@ -1070,7 +1070,7 @@ ApplicationWindow {
                 spacing: 14 * window.u
                 Text { text: client.conflictDescription; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 22 * window.u; font.bold: true }
                 Text { text: qsTranslate("BookOrbit", "The reader and BookOrbit have different saved positions. Where would you like to continue?"); Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 18 * window.u }
-                Text { text: qsTranslate("BookOrbit", "Chapter and excerpt are from the EPUB on this device."); Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
+                Text { text: qsTranslate("BookOrbit", "Chapter and excerpt are from the book on this device."); Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
                 Repeater {
                     model: client.conflictPositions
                     RadioButton {

@@ -29,10 +29,11 @@ QMap<QString,ReaderRecent> fakeRecents;
 ReaderRecents readerRecents(const QStringList &) { return {fakeProfile,historyReadable,fakeRecents}; }
 QString appliedCfi;
 bool applyAllowed=true;
-bool saveReaderPosition(const QString &, const QString &expected, const QString &cfi, const QString &profile, QString *error) {
+bool saveReaderPosition(const QString &path, const QString &expected, const QString &cfi, const QString &profile, QString *error) {
     *error="Тестовый отказ сохранения";
     if (!applyAllowed || expected!=fakePosition || profile!=fakeProfile) return false;
-    appliedCfi=cfi; fakePosition="pbr:/webkit?##"+cfi; return true;
+    QString native; if (!bookPosition(path,cfi,nullptr,nullptr,nullptr,&native)) return false;
+    appliedCfi=cfi; fakePosition=native; return true;
 }
 bool opened = false, indexed = true;
 QString scanned;
@@ -874,14 +875,36 @@ int main(int argc, char **argv) {
     require(wait(features, [&] { features.downloadSelected(); }), "download second format without replacing PDF");
     const QString fb2Path = features.localFile(0);
     require(fb2Path.endsWith(".fb2") && contents(fb2Path).contains("FictionBook") && QFile::exists(pdfPath), "FB2 and PDF coexist");
+    require(features.detail()["canSync"].toBool(), "downloaded FB2 exposes sync action");
+    const auto previousPosition=fakePosition;
+    fakePosition="pbr:/word?page=0&offs=20";
+    const int epubPosts=requests(root,"POST /api/v1/books/files/101/progress");
+    const auto originalFb2=contents(fb2Path);
+    require(wait(features,[&] { features.syncFile(202); }), "FB2 uploads its native position as CFI");
+    require(requests(root,"POST /api/v1/books/files/202/progress")==1 &&
+            requests(root,"POST /api/v1/books/files/101/progress")==epubPosts, "FB2 progress uses its own file identity");
+    require(wait(features,[&] { features.syncFile(202); }) &&
+            requests(root,"POST /api/v1/books/files/202/progress")==1, "unchanged FB2 does not echo upload");
+    fakePosition="pbr:/word?page=0&offs=21";
+    write(fault,"fb2_remote");
+    require(!wait(features,[&] { features.syncFile(202); }) && features.progressConflict(), "FB2 changes on both sides require explicit choice");
+    fakeReader=ReaderFileState::Open;
+    require(!wait(features,[&] { features.resolveProgress(false); }) && fakePosition.endsWith("offs=21"), "open FB2 is never overwritten");
+    fakeReader=ReaderFileState::Closed;
+    require(wait(features,[&] { features.resolveProgress(false); }) && fakePosition=="pbr:/word?page=0&offs=0", "server FB2 position maps back to native coordinates");
+    require(wait(features,[&] { features.syncFile(202); }) &&
+            requests(root,"POST /api/v1/books/files/202/progress")==1, "applied FB2 position is acknowledged without echo");
+    require(contents(fb2Path)==originalFb2, "FB2 sync preserves the original file bytes");
+    fakePosition=previousPosition;
+    write(fault,"features");
     features.selectFile(101);
     require(wait(features, [&] { features.downloadSelected(); }), "EPUB remains available beside other formats");
     const QString epubPath = features.localFile(0);
     features.selectFile(203);
     require(wait(features, [&] { features.downloadSelected(); }) && features.localFile(0) != epubPath && QFile::exists(epubPath),
             "two EPUB files of one book keep distinct file identities");
-    require(features.syncSummary()["total"].toInt()==1 && features.syncBooks()[0].toMap()["files"].toList().size()==2 &&
-            features.syncSummary()["unsupported"].toInt()==0, "two EPUBs plus PDF and FB2 count as one book and keep separate file actions");
+    require(features.syncSummary()["total"].toInt()==1 && features.syncBooks()[0].toMap()["files"].toList().size()==3 &&
+            features.syncSummary()["unsupported"].toInt()==0, "two EPUBs and FB2 have three sync actions under one book; PDF stays readable");
     const QString categoriesRoot=root+"/category-check", categoriesScope=categoriesRoot+"/"+QFileInfo(scope).fileName();
     require(QDir().mkpath(categoriesScope+"/records"),"create isolated sync category fixture");
     write(categoriesRoot+"/accounts.json",contents(featureRoot+"/accounts.json"));
@@ -915,7 +938,7 @@ int main(int argc, char **argv) {
     require(!features.historyAvailable() && features.recentBook().isEmpty(), "unavailable native history has no client-only fallback");
     historyReadable=true; fakeRecents.clear(); features.refreshRecents(); QCoreApplication::processEvents();
     features.selectFile(201);
-    require(!wait(features, [&] { features.syncSelected(); }) && features.status().contains("только для EPUB"), "PDF never enters EPUB synchronization");
+    require(!wait(features, [&] { features.syncSelected(); }) && features.status().contains("EPUB и поддерживаемых FB2"), "PDF never enters position synchronization");
     opened = false;
     require(wait(features, [&] { features.openSelected(); }) && opened, "selected PDF uses the native opener boundary");
     require(features.localFile(0) == pdfPath, "successful open remembers the chosen variant");
