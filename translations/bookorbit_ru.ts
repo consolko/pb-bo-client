@@ -1586,5 +1586,27 @@ On device</source>
         <source>Cannot safely identify the running application. Update installation is blocked.</source>
         <translation>Не удалось достоверно определить путь запущенного приложения. Установка обновления заблокирована.</translation>
     </message>
+
+    <message><source>The local book file is missing or damaged. Download it again.</source><translation>Локальный файл книги отсутствует или повреждён. Скачайте его заново.</translation></message>
+    <message><source>Check the book file</source><translation>Проверьте файл книги</translation></message>
+    <message><source>The position does not match this book</source><translation>Позиция не соответствует этой книге</translation></message>
+    <message><source>The position does not match this book.</source><translation>Позиция не соответствует этой книге.</translation></message>
+    <message><source>Position sync is available for EPUB and supported FB2 books. You can read this file locally.</source><translation>Синхронизация позиции доступна для EPUB и поддерживаемых FB2. Этот файл можно читать на устройстве.</translation></message>
+    <message><source>Download a valid book file before syncing</source><translation>Перед синхронизацией скачайте исправный файл книги</translation></message>
+    <message><source>The local book file changed during sync. Progress was kept unchanged.</source><translation>Локальный файл книги изменился во время синхронизации. Прогресс сохранён без изменений.</translation></message>
+    <message><source>Could not match the server CFI to this book. Progress was kept unchanged.</source><translation>Не удалось сопоставить серверную позицию с этой книгой. Прогресс сохранён без изменений.</translation></message>
+    <message><source>Open sync for downloaded books</source><translation>Открыть синхронизацию скачанных книг</translation></message>
+    <message><source>Downloaded book positions · last sync results</source><translation>Позиции в скачанных книгах · результаты синхронизации</translation></message>
+    <message><source>Files: </source><translation>Файлы: </translation></message>
+    <message><source>Nothing to sync yet.
+Download an EPUB or FB2 from the catalog.</source><translation>Пока нечего синхронизировать.
+Скачайте EPUB или FB2 из каталога.</translation></message>
+    <message><source>Chapter and excerpt are from the book on this device.</source><translation>Глава и отрывок взяты из книги на этом устройстве.</translation></message>
+    <message><source>This FB2 structure is not supported for sync yet. Images, tables, poetry and long sections require additional validation. You can still read the original file.</source><translation>Синхронизация FB2 с такой структурой пока не поддерживается. Изображения, таблицы, стихи и длинные разделы требуют дополнительной проверки. Исходную книгу можно читать как обычно.</translation></message>
+    <message><source>Experimental FB2 sync: text-only books with short sections. Unsupported structures keep their progress unchanged.</source><translation>Пробная синхронизация FB2: текстовые книги с небольшими разделами. Прогресс книг с неподдерживаемой структурой остаётся без изменений.</translation></message>
+    <message><source>The file, profile or account changed. Retry the operation.</source><translation>Файл, профиль или учётная запись изменились. Повторите операцию.</translation></message>
+    <message><source>Checking the book file…</source><translation>Проверяем файл книги…</translation></message>
+    <message><source>Verifying the update package…</source><translation>Проверяем пакет обновления…</translation></message>
+    <message><source>Installing the update…</source><translation>Устанавливаем обновление…</translation></message>
 </context>
 </TS>

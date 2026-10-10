@@ -15,6 +15,9 @@
 #include <QRegularExpression>
 #include <QTimer>
 #include <memory>
+#include <QUuid>
+#include <tuple>
+#include <utility>
 #include <cstdio>
 
 // Query strings may contain GitHub signed asset credentials. Never record them.
@@ -30,6 +33,16 @@ UpdateManager::UpdateManager(Client *c,QString data,QString path,QObject *parent
     network.setTransferTimeout(30000);
     const bool directoryReady=QDir().mkpath(root+"/update");
     settings=QJsonDocument::fromJson(Ota::read(root+"/update/preferences.json",65536)).object();
+    const auto abandoned=QDir(root+"/update").entryInfoList({"attempt-*"},QDir::Dirs|QDir::NoDotAndDotDot);
+    client->files.submit(this,[abandoned](const FileCancellation &cancel) {
+        for(const auto &entry:abandoned) {
+            if(fileCancelled(cancel)) break;
+            if(entry.isSymLink() || QUuid::fromString(entry.fileName().mid(8)).isNull()) continue;
+            QFile::remove(entry.absoluteFilePath()+"/archive.zip"); QFile::remove(entry.absoluteFilePath()+"/bookorbit.next");
+            QDir().rmdir(entry.absoluteFilePath());
+        }
+        return true;
+    },[](bool,bool) {});
     if(settings["source"].toString()!=apiBase.toString()) settings={{"automatic",settings["automatic"].toBool(true)},{"source",apiBase.toString()}};
     traceContext();
     if(!directoryReady) trace("directory.failed",{{"path",root+"/update"}});
@@ -37,6 +50,18 @@ UpdateManager::UpdateManager(Client *c,QString data,QString path,QObject *parent
     totalDeadline.setSingleShot(true);
     connect(&totalDeadline,&QTimer::timeout,this,[this] { fail(trUpdate("The update request timed out.")); });
 
+}
+UpdateManager::~UpdateManager() {
+    if(fileTask) fileTask->store(true);
+    discardAttempt();
+}
+void UpdateManager::discardAttempt() {
+    if(attemptDir.isEmpty()) return;
+    const auto directory=std::exchange(attemptDir,{});
+    client->files.submit(this,[directory](const FileCancellation &) {
+        QFile::remove(directory+"/archive.zip"); QFile::remove(directory+"/bookorbit.next");
+        return QDir().rmdir(directory);
+    },[](bool,bool) {});
 }
 QString UpdateManager::version() const { return Ota::version(); }
 bool UpdateManager::canInstall() const {
@@ -58,7 +83,7 @@ void UpdateManager::traceContext() {
     QJsonObject device; const auto blocker=updateDeviceError(&device);
     trace("context",{{"installed",version()},{"executable",executable},{"source",logUrl(apiBase)},
           {"device",device},{"installBlocker",blocker},
-          {"storage",storageDetails(root)},{"stagedBytes",QFileInfo(root+"/update/bookorbit.next").size()}});
+          {"storage",storageDetails(root)},{"stagedBytes",attemptDir.isEmpty() ? 0 : QFileInfo(attemptDir+"/bookorbit.next").size()}});
 }
 bool UpdateManager::persist() {
     QString error; const bool ok=Ota::saveJson(root+"/update/preferences.json",settings,&error);
@@ -86,7 +111,8 @@ void UpdateManager::automaticCheck() {
 void UpdateManager::check() { checkRelease(true); }
 void UpdateManager::fail(const QString &error) {
     trace("failed",{{"reason",error}});
-    ++generation; totalDeadline.stop(); if(active) active->abort(); active.clear();
+    ++generation; if(fileTask) fileTask->store(true); fileTask.reset(); totalDeadline.stop(); if(active) active->abort(); active.clear();
+    discardAttempt();
     phase="error"; notice=error; emit changed();
 }
 bool UpdateManager::allowed(const QUrl &url) const {
@@ -126,7 +152,7 @@ void UpdateManager::fetch(QUrl url,qint64 limit,std::function<void(QByteArray,in
     });
 }
 void UpdateManager::checkRelease(bool manual) {
-    if(active || phase=="installing" || phase=="ready" || !startupDone) { trace("check.ignored"); return; }
+    if(active || phase=="checking" || phase=="downloading" || phase=="verifying" || phase=="installing" || phase=="ready" || !startupDone) { trace("check.ignored"); return; }
     if(QDateTime::currentSecsSinceEpoch()<settings["retryAfter"].toInteger()) { if(manual) fail(trUpdate("The update server asked to wait. Try again later.")); return; }
     if(manual && !connectNetwork()) { fail(trUpdate("Connect to the network to check updates.")); return; }
     trace("check.requested",{{"manual",manual}});
@@ -154,9 +180,10 @@ void UpdateManager::checkRelease(bool manual) {
     });
 }
 void UpdateManager::cancel() {
-    if(phase!="checking" && phase!="downloading") return;
+    if(phase!="checking" && phase!="downloading" && phase!="verifying") return;
     trace("cancelled",{{"progress",fraction}});
-    ++generation; totalDeadline.stop(); if(active) active->abort(); active.clear();
+    ++generation; if(fileTask) fileTask->store(true); fileTask.reset(); totalDeadline.stop(); if(active) active->abort(); active.clear();
+    discardAttempt();
     phase=candidateVersion.isEmpty()?"idle":"available"; notice=trUpdate("Update download cancelled."); emit changed();
 }
 void UpdateManager::download() {
@@ -165,6 +192,8 @@ void UpdateManager::download() {
     const QStorageInfo storage(root);
     if(!storage.isValid()||storage.isReadOnly()||storage.bytesAvailable()<archiveSize+2*Ota::maxClient+8*1024*1024) { fail(trUpdate("Not enough writable space for the update.")); return; }
     if(!connectNetwork()) { fail(trUpdate("Connect to the network to download the update.")); return; }
+    attemptDir=root+"/update/attempt-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
+    if(!QDir().mkpath(attemptDir)) { fail(trUpdate("Could not save the update download.")); return; }
     ++generation; phase="downloading"; fraction=0; notice.clear(); emit changed(); totalDeadline.start(600000);
     fetch(checksumsUrl,4096,[this](QByteArray data,int) {
         zipDigest.clear();
@@ -181,7 +210,7 @@ void UpdateManager::download() {
 }
 void UpdateManager::downloadZip(QUrl url,int redirects) {
     if(!allowed(url)||redirects<0) { trace("url.rejected",{{"url",logUrl(url)},{"redirectsLeft",redirects}}); fail(trUpdate("The update server returned an unsafe download address.")); return; }
-    auto out=std::make_shared<QSaveFile>(root+"/update/archive.zip"); out->setDirectWriteFallback(false);
+    auto out=std::make_shared<QSaveFile>(attemptDir+"/archive.zip"); out->setDirectWriteFallback(false);
     if(!out->open(QIODevice::WriteOnly)) { trace("archive.open.failed",{{"detail",out->errorString()}}); fail(out->errorString()); return; }
     auto hash=std::make_shared<QCryptographicHash>(QCryptographicHash::Sha256);
     auto size=std::make_shared<qint64>(0);
@@ -209,19 +238,32 @@ void UpdateManager::downloadZip(QUrl url,int redirects) {
         trace("archive.received",{{"bytes",*size},{"expectedBytes",archiveSize},{"sha256",actual},{"expectedSha256",zipDigest}});
         if(reply->error()!=QNetworkReply::NoError || status!=200 || *size!=archiveSize || actual!=zipDigest) { fail(trUpdate("The update archive is incomplete or damaged.")); return; }
         if(!out->commit()) { trace("archive.commit.failed",{{"detail",out->errorString()}}); fail(trUpdate("Could not save the update download.")); return; }
-        phase="verifying"; trace("verify.started"); emit changed();
-        QTimer::singleShot(0,this,[this] {
-            QString error;
-            if(!Ota::stageArchive(root+"/update/archive.zip",root+"/update/bookorbit.next",candidateVersion,&prepared,&error)) {
-                trace("verify.failed",{{"detail",error}});
-                fail(trUpdate("The update package could not be verified.")); return;
-            }
-            QFile::remove(root+"/update/archive.zip"); totalDeadline.stop(); phase="ready";
-            trace("verify.ready",{{"sha256",prepared["sha256"]},{"bytes",prepared["bytes"]}});
-            notice=canInstall() ? trUpdate("The update is verified. Press Install and close to apply it.") : updateDeviceError(); emit changed();
-        });
+        verifyArchive();
     });
 }
+void UpdateManager::verifyArchive() {
+    const auto run=generation;
+    phase="verifying"; notice=trUpdate("Verifying the update package…"); trace("verify.started"); emit changed();
+    const auto directory=attemptDir,version=candidateVersion;
+    fileTask=client->files.submit(this,[directory,version](const FileCancellation &cancel) {
+        QJsonObject prepared; QString error;
+        const bool ok=Ota::stageArchive(directory+"/archive.zip",directory+"/bookorbit.next",version,&prepared,&error);
+        QFile::remove(directory+"/archive.zip");
+        if(!ok || fileCancelled(cancel)) { QFile::remove(directory+"/bookorbit.next"); QDir().rmdir(directory); }
+        return std::make_tuple(ok,prepared,error);
+    },[this,run](const auto &result,bool cancelled) {
+        if(run!=generation || cancelled) return;
+        fileTask.reset(); const auto &[ok,manifest,error]=result;
+        if(!ok) {
+            trace("verify.failed",{{"detail",error}});
+            fail(trUpdate("The update package could not be verified.")); return;
+        }
+        prepared=manifest; totalDeadline.stop(); phase="ready";
+        trace("verify.ready",{{"sha256",prepared["sha256"]},{"bytes",prepared["bytes"]}});
+        notice=canInstall() ? trUpdate("The update is verified. Press Install and close to apply it.") : updateDeviceError(); emit changed();
+    });
+}
+
 void UpdateManager::install() {
     trace("install.requested",{{"canInstall",canInstall()},{"busy",client->busy()},{"destination",executable},{"permissions",int(QFileInfo(executable).permissions())},{"storage",storageDetails(QFileInfo(executable).absolutePath())}});
     QJsonObject device; const auto deviceError=updateDeviceError(&device); trace("install.device",device);
@@ -232,13 +274,23 @@ void UpdateManager::install() {
         notice=trUpdate("Cannot safely identify the running application. Update installation is blocked."); emit changed(); return;
     }
     if(active || !client->prepareUpdate()) { trace("install.blocked",{{"reason","client busy"}}); notice=trUpdate("Finish the current operation before updating."); emit changed(); return; }
-    trace("install.started");
-    QString error;
-    if(!Ota::install(root+"/update/bookorbit.next",executable,prepared,&error)) {
-        trace("install.failed",{{"detail",error}}); client->cancelUpdate();
-        fail(trUpdate("The update could not be installed. The current version is still running.")); return;
-    }
-    trace("install.complete",{{"sha256",Ota::hashFile(executable)},{"expectedSha256",prepared["sha256"]}});
-    phase="installing"; notice=trUpdate("Update installed. Open BookOrbit again from the applications menu."); emit changed();
-    QTimer::singleShot(2000,qApp,&QCoreApplication::quit);
+    phase="installing"; notice=trUpdate("Installing the update…"); trace("install.started"); emit changed();
+    const auto directory=attemptDir,destination=executable; const auto manifest=prepared;
+    fileTask=client->files.submit(this,[directory,destination,manifest](const FileCancellation &) {
+        // Finish the atomic replacement even when the application is closing.
+        FileCancellationScope uninterruptible({});
+        QString error; const bool ok=Ota::install(directory+"/bookorbit.next",destination,manifest,&error);
+        const auto digest=ok ? Ota::hashFile(destination) : QString{};
+        if(ok) QDir().rmdir(directory);
+        return std::make_tuple(ok,digest,error);
+    },[this](const auto &result,bool) {
+        fileTask.reset(); const auto &[ok,digest,error]=result;
+        if(!ok) {
+            trace("install.failed",{{"detail",error}}); client->cancelUpdate();
+            fail(trUpdate("The update could not be installed. The current version is still running.")); return;
+        }
+        trace("install.complete",{{"sha256",digest},{"expectedSha256",prepared["sha256"]}});
+        phase="installing"; notice=trUpdate("Update installed. Open BookOrbit again from the applications menu."); emit changed();
+        QTimer::singleShot(2000,qApp,&QCoreApplication::quit);
+    });
 }

@@ -14,3 +14,11 @@ bool sameEpubPosition(const QString &path, const QString &first, const QString &
 // Bounded container/package/resource validation before committing a download.
 // Does not claim full EPUB conformance or CFI support for every resource.
 bool validEpub(const QString &path);
+
+// Shared sync boundary. FB2 uses a calibrated PB634 prose model; unsupported
+// structure/coordinates fail before a server or native position is changed.
+bool syncFormat(const QString &format);
+QString bookCfi(const QString &path, const QString &position);
+bool bookPosition(const QString &path, const QString &cfi, double *percentage,
+                  QString *point = nullptr, QVariantMap *context = nullptr, QString *native = nullptr);
+bool sameBookPosition(const QString &path, const QString &first, const QString &second, bool compareRange = false);

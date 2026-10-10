@@ -1,6 +1,7 @@
 #include "i18n.h"
 #include "device.h"
 #include "progress.h"
+#include <cmath>
 #include <QDesktopServices>
 #include <QUrl>
 #include <QFileInfo>
@@ -189,60 +190,15 @@ QString readerProfile() {
 #endif
 }
 
+std::function<ReaderRecents(const FileCancellation &)> readerRecentsTask(const QStringList &paths,const QString &profile) {
+    return [paths,profile](const FileCancellation &cancel) {
+        return readReaderRecents("/mnt/ext1/system/explorer-3/explorer-3.db",paths,profile,cancel);
+    };
+}
 ReaderRecents readerRecents(const QStringList &paths) {
-    ReaderRecents result; result.profile=readerProfile();
-#ifdef POCKETBOOK_DEVICE
-    const QString connection="bookorbit-native-recents";
-    {
-        auto db=QSqlDatabase::addDatabase("QSQLITE",connection);
-        db.setDatabaseName("/mnt/ext1/system/explorer-3/explorer-3.db");
-        db.setConnectOptions("QSQLITE_OPEN_READONLY;QSQLITE_BUSY_TIMEOUT=100");
-        if (db.open() && db.transaction()) {
-            bool ok=true;
-            const QMap<QString,QStringList> columns{
-                {"files",{"book_id","folder_id","filename"}}, {"folders",{"id","name"}},
-                {"profiles",{"id","name"}}, {"books_settings",{"bookid","profileid","opentime"}}};
-            for (auto it=columns.begin();it!=columns.end();++it) {
-                QSqlQuery schema(db); QStringList found;
-                ok=ok && schema.exec("PRAGMA table_info("+it.key()+")");
-                while (schema.next()) found << schema.value(1).toString();
-                for (const auto &column:it.value()) ok=ok && found.contains(column);
-            }
-            QSqlQuery profile(db);
-            profile.prepare("SELECT id FROM profiles WHERE name=? OR (?='' AND name='default' AND (SELECT COUNT(*) FROM profiles)=1)");
-            profile.addBindValue(result.profile); profile.addBindValue(result.profile);
-            qint64 profileId=0;
-            if (ok) {
-                ok=profile.exec() && profile.next();
-                if (ok) { profileId=profile.value(0).toLongLong(); ok=!profile.next(); }
-            }
-            if (ok) {
-                QSqlQuery q(db);
-                ok=q.prepare("SELECT f.book_id,s.opentime FROM files f JOIN folders d ON d.id=f.folder_id "
-                    "LEFT JOIN books_settings s ON s.bookid=f.book_id AND s.profileid=? "
-                    "WHERE d.name=? AND f.filename=? AND f.book_id>0");
-                for (const auto &path:paths) {
-                    if (!ok) break;
-                    const QFileInfo info(path);
-                    q.bindValue(0,profileId); q.bindValue(1,info.absolutePath()); q.bindValue(2,info.fileName());
-                    ok=q.exec();
-                    if (ok && q.next()) {
-                        const ReaderRecent entry{q.value(0).toLongLong(),qMax(qint64(0),q.value(1).toLongLong())};
-                        ok=!q.next();
-                        if (ok) result.files.insert(path,entry);
-                    }
-                    q.finish();
-                }
-            }
-            result.available=ok && readerProfile()==result.profile;
-            db.rollback(); // End the read snapshot; never checkpoint or mutate the native database.
-        }
-    }
-    QSqlDatabase::removeDatabase(connection);
-#else
-    Q_UNUSED(paths)
-#endif
-    if (!result.available) result.files.clear();
+    const auto profile=readerProfile();
+    auto result=readerRecentsTask(paths,profile)({});
+    if (readerProfile()!=profile) { result.available=false; result.files.clear(); }
     return result;
 }
 
@@ -281,20 +237,22 @@ static bool readReaderPosition(const QString &path, QString *position, qint64 *b
 #endif
 }
 
+
 bool readerPosition(const QString &path, QString *position) {
+#ifdef POCKETBOOK_DEVICE
+    if (path.endsWith(".fb2",Qt::CaseInsensitive) && QByteArray(GetSoftwareVersion())!="U634.6.10.3425") return false;
+#endif
     return readReaderPosition(path, position, nullptr);
 }
 
 bool saveReaderPosition(const QString &path, const QString &expectedPosition,
-                        const QString &cfi, const QString &profile, QString *error) {
+                        const PreparedReaderPosition &prepared, const QString &profile, QString *error) {
     *error = QCoreApplication::translate("BookOrbit", "Native position saving is unavailable for this firmware.");
 #ifdef POCKETBOOK_DEVICE
     // Private native Cloud ABI, verified only in this exact U634 library. No SQL writes here.
     if (QByteArray(GetSoftwareVersion()) != "U634.6.10.3425") return false;
-    QFile library("/ebrmain/lib/libframework2.so");
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    if (!library.open(QIODevice::ReadOnly) || !hash.addData(&library) || hash.result().toHex() !=
-        "69de9e57ddb9d96f6d38e54150a120efd061dbe524f8d430f90ff5b39a10c5f9") return false;
+    if (!prepared.framework.valid || fileStamp(QFileInfo("/ebrmain/lib/libframework2.so").canonicalFilePath())!=prepared.framework ||
+        !prepared.file.valid || fileStamp(path)!=prepared.file) return false;
     static QLibrary native("/ebrmain/lib/libframework2.so");
     native.setLoadHints(QLibrary::PreventUnloadHint);
     const auto instance = reinterpret_cast<void *(*)()>(native.resolve("_ZN10pocketbook2db9DbManager8InstanceEv"));
@@ -302,12 +260,14 @@ bool saveReaderPosition(const QString &path, const QString &expectedPosition,
     const auto setPosition = reinterpret_cast<int (*)(void *, long long, const std::string &, int, long)>(native.resolve(
         "_ZN10pocketbook2db9DbManager11SetPositionExRKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEil"));
     if (!instance || !initProfile || !setPosition) return false;
-    double percentage=0;
-    QString point;
-    *error = QCoreApplication::translate("BookOrbit", "The position does not match this EPUB.");
-    if (!epubPosition(path,cfi,nullptr,&point)) return false;
+    if (path.endsWith(".fb2",Qt::CaseInsensitive) && (!prepared.fb2.valid ||
+        fileStamp(QFileInfo("/ebrmain/lib/libpbrdwrapper.so").canonicalFilePath())!=prepared.fb2)) return false;
+    const double percentage=prepared.percentage;
+    const QString incoming=prepared.native;
+    *error = QCoreApplication::translate("BookOrbit", "The position does not match this book.");
+    if (!prepared.coordinate || incoming.isEmpty()) return false;
     *error = QCoreApplication::translate("BookOrbit", "The position was recognized, but the book percentage could not be estimated for the built-in library.");
-    if (!epubPosition(path,cfi,&percentage)) return false;
+    if (!prepared.estimate || !std::isfinite(percentage) || percentage<0 || percentage>100) return false;
     *error = QCoreApplication::translate("BookOrbit", "Close all books in the built-in reader and retry sync.");
     if (readerFileState(path) != ReaderFileState::Closed) return false;
     // Different paths can share one native book_id. Block all open books, including aliases.
@@ -326,21 +286,22 @@ bool saveReaderPosition(const QString &path, const QString &expectedPosition,
     QString current; qint64 bookId=0;
     *error = QCoreApplication::translate("BookOrbit", "The reader position or profile has changed. Retry sync.");
     if (readerProfile()!=profile || !readReaderPosition(path,&current,&bookId) || bookId<=0 || current!=expectedPosition) return false;
-    const QString incoming="pbr:/webkit?##"+point;
     *error = QCoreApplication::translate("BookOrbit", "Could not confirm that the position was saved. Retry sync.");
     try {
         void *db=instance();
         if (!db) return false;
         initProfile(db);
         if (readerProfile()!=profile || !allBooksClosed() ||
-            !readerPosition(path,&current) || current!=expectedPosition) return false;
+            !readerPosition(path,&current) || current!=expectedPosition || fileStamp(path)!=prepared.file ||
+            fileStamp(QFileInfo("/ebrmain/lib/libframework2.so").canonicalFilePath())!=prepared.framework ||
+            (prepared.fb2.valid && fileStamp(QFileInfo("/ebrmain/lib/libpbrdwrapper.so").canonicalFilePath())!=prepared.fb2)) return false;
         // The native Cloud setter owns timestamps and temporary percentage/100 counters.
         // Those counters never determine the CFI or the winner of a conflict.
         if (setPosition(db,bookId,incoming.toStdString(),qRound(percentage),long(QDateTime::currentSecsSinceEpoch()))!=0) return false;
     } catch (const std::exception &) { return false; }
     return readerProfile()==profile && allBooksClosed() && readerPosition(path,&current) && current==incoming;
 #else
-    Q_UNUSED(path) Q_UNUSED(expectedPosition) Q_UNUSED(cfi) Q_UNUSED(profile)
+    Q_UNUSED(path) Q_UNUSED(expectedPosition) Q_UNUSED(prepared) Q_UNUSED(profile)
     return false;
 #endif
 }

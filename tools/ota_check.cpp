@@ -2,6 +2,8 @@
 #include "zip.h"
 #include "client.h"
 #include "update.h"
+#include "check_wait.h"
+#include "worker_gate.h"
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -18,6 +20,10 @@ struct UpdateManagerCheck {
     static void ready(UpdateManager &updater, const QJsonObject &manifest) {
         updater.prepared=manifest; updater.phase="ready";
     }
+    static void verify(UpdateManager &updater,const QString &directory) {
+        ++updater.generation; updater.attemptDir=directory; updater.candidateVersion=Ota::version(); updater.verifyArchive();
+    }
+    static void timeout(UpdateManager &updater) { QMetaObject::invokeMethod(&updater.totalDeadline,"timeout",Qt::DirectConnection); }
 };
 
 #ifdef BOOKORBIT_FSYNC_CHECK
@@ -162,7 +168,48 @@ int main(int argc,char **argv) {
     Client client(QUrl("https://example.test"),root,nullptr,false);
     check(client.prepareUpdate() && client.busy(),"installation locks client operations");
     client.cancelUpdate(); check(!client.busy(),"cancel releases installation lock");
+    const auto abandoned=root+"/update/attempt-01234567-89ab-4cde-8abc-0123456789ab",unknown=root+"/update/attempt-foreign";
+    check(QDir().mkpath(abandoned) && QDir().mkpath(unknown) && Ota::save(abandoned+"/archive.zip","owned stale file",&error) &&
+          Ota::save(unknown+"/archive.zip","unrelated file",&error),"create owned and unknown update directories");
     UpdateManager updater(&client,root,target);
+    bool cleanupDone=false;
+    ClientWorkerCheck::executor(client).submit(&app,[](const FileCancellation &) { return true; },[&](bool,bool) { cleanupDone=true; });
+    check(waitUntil([&] { return cleanupDone; }) && !QFile::exists(abandoned+"/archive.zip") && Ota::read(unknown+"/archive.zip",100)=="unrelated file",
+          "startup cleanup removes owned UUID attempts and preserves unknown directories");
+    const auto package=argc==2 ? QString::fromLocal8Bit(argv[1]) : root+"/valid.zip";
+    const auto attempt=[&](const QString &name) {
+        const auto directory=root+"/update/attempt-"+name;
+        check(QDir().mkpath(directory) && QFile::copy(package,directory+"/archive.zip"),"create isolated verification attempt");
+        return directory;
+    };
+    {
+        auto &executor=ClientWorkerCheck::executor(client);
+        WorkerGate gate(executor,&app);
+        check(waitUntil([&] { return gate.entered->load(); }),"hold OTA worker");
+        const auto old=attempt("cancelled"); UpdateManagerCheck::verify(updater,old);
+        int ticks=0; QTimer timer; QObject::connect(&timer,&QTimer::timeout,[&] { ++ticks; }); timer.start(5);
+        check(updater.state()=="verifying" && waitUntil([&] { return ticks>=5; }),"OTA verification publishes state while GUI remains responsive");
+        updater.cancel(); check(updater.state()=="available","verification can be cancelled before worker starts");
+        WorkerGate next(executor,&app);
+        const auto fresh=attempt("fresh"); UpdateManagerCheck::verify(updater,fresh);
+        gate.open(); check(waitUntil([&] { return next.entered->load(); }),"old cancelled result drains");
+        QCoreApplication::processEvents();
+        check(updater.state()=="verifying" && !QFile::exists(old+"/bookorbit.next") && QFile::exists(fresh+"/archive.zip"),
+              "cancelled verification cannot mark a new candidate ready or remove its files");
+        next.open(); check(waitUntil([&] { return updater.state()!="verifying"; }),"fresh OTA verification completes");
+        check(updater.state()==(argc==2 ? "ready" : "error"),"only the current verified signed package becomes ready");
+    }
+    {
+        auto &executor=ClientWorkerCheck::executor(client);
+        WorkerGate gate(executor,&app);
+        check(waitUntil([&] { return gate.entered->load(); }),"hold timed-out verification");
+        const auto expired=attempt("timeout"); UpdateManagerCheck::verify(updater,expired);
+        UpdateManagerCheck::timeout(updater); check(updater.state()=="error","overall timeout cancels package verification");
+        bool drained=false;
+        executor.submit(&app,[](const FileCancellation &) { return true; },[&](bool,bool) { drained=true; });
+        gate.open(); check(waitUntil([&] { return drained; }) && updater.state()=="error" && !QFile::exists(expired+"/bookorbit.next"),
+                           "late verification after timeout never publishes ready and removes its own files");
+    }
     check(!updateDeviceError().isEmpty(),"real desktop backend disallows PocketBook installation");
     check(QDir().mkpath(root+"/update") && Ota::save(root+"/update/bookorbit.next",executable,&error),"verified PocketBook executable staged for desktop guard");
     UpdateManagerCheck::ready(updater,record);

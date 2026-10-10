@@ -43,7 +43,7 @@ int main(int argc,char **argv) {
     require(!screen.isEmpty(),"native adapter initialized");
     Client c(QUrl("http://host.containers.internal:8766"),QString::fromLocal8Bit(argv[1]));
     if (argc==4 && QString::fromLocal8Bit(argv[3])=="--history-check") {
-        c.showDownloaded(true); c.refreshRecents(); QCoreApplication::processEvents();
+        c.showDownloaded(true); c.refreshRecents(); require(waitForRecents(c),"native history refresh completes");
         require(c.historyAvailable() && c.recentBook()["fileId"].toInt()==101,"stock-library open appears in the account recent snapshot after restart");
         QQmlApplicationEngine engine; engine.addImportPath("/ebrmain/qml");
         engine.rootContext()->setContextProperty("client",&c);
@@ -91,7 +91,7 @@ int main(int argc,char **argv) {
     QString before;
     require(readerPosition(path,&before) && !nativeCfi(before).isEmpty(),"read saved stock-reader CFI");
     QString error;
-    require(saveReaderPosition(path,before,"epubcfi(/6/2!/4/122/1)",readerProfile(),&error),"prepare distinct native paragraph 060");
+    require(saveReaderPosition(path,before,prepareReaderPosition(path,"epubcfi(/6/2!/4/122/1)"),readerProfile(),&error),"prepare distinct native paragraph 060");
     require(readerPosition(path,&before) && nativeCfi(before)=="epubcfi(/6/2!/4/122/1)","confirm distinct initial CFI");
     require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }),"real saved reader position uploaded to fixture");
     QFile fault(QString::fromLocal8Bit(argv[2]));
@@ -104,7 +104,7 @@ int main(int argc,char **argv) {
     const auto afterRecents=readerRecents({path});
     require(afterRecents.available && afterRecents.files[path].openTime>=initialRecents.files[path].openTime && afterRecents.files[path].openTime>0,
         "incoming native position can advance recents without a reading session");
-    c.showDownloaded(true); c.refreshRecents(); QCoreApplication::processEvents();
+    c.showDownloaded(true); c.refreshRecents(); require(waitForRecents(c),"native history refresh completes");
     require(c.recentBook()["fileId"].toInt()==101,"native recent snapshot identifies the exact account file");
     require(fault.open(QIODevice::WriteOnly) && fault.write("progress_range")==14,"move fixture server to a CFI range");
     fault.close();

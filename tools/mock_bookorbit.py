@@ -255,7 +255,7 @@ class Handler(BaseHTTPRequestHandler):
                     if book["id"] == 1:
                         book.pop("coverVersion", None)
             return self.send(200, {"items": items[page*size:(page+1)*size], "total": len(items), "page": page, "size": size})
-        match = re.fullmatch(r"/api/v1/books/files/(10[1-3])/(download|progress)", path)
+        match = re.fullmatch(r"/api/v1/books/files/(10[1-3]|202)/(download|progress)", path)
         if match and match[2] == "progress":
             file_id = match[1]
             if mode == "slow_progress" and self.command == "GET": time.sleep(0.4)
@@ -273,6 +273,8 @@ class Handler(BaseHTTPRequestHandler):
             if mode == "progress_metadata":
                 self.server.progress[file_id]["updatedAt"] = "2030-01-01T00:00:00Z"
                 fault.write_text("")
+            if mode == "fb2_remote" and file_id == "202":
+                self.server.progress[file_id] = {"cfi": "epubcfi(/6/2!/4/2/2/2/1:0)", "pageNumber": None, "percentage": 0}
             if mode == "progress_range":
                 self.server.progress[file_id] = {"cfi": "epubcfi(/6/2!/4,/42/1:0,/48/1:20)", "pageNumber": None, "percentage": 25}
                 fault.write_text("")
