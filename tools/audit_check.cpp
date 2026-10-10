@@ -17,6 +17,8 @@
 #include <QTimer>
 #include <QCryptographicHash>
 #include <QJSValue>
+#include <QUuid>
+#include <QElapsedTimer>
 #include <QQuickWindow>
 #include <QQuickItem>
 #include <cstdio>
@@ -71,6 +73,54 @@ bool until(const std::function<bool()> &predicate) {
 }
 int posts(const QString &root) {
     return QJsonDocument::fromJson(bytes(root+"/requests.json")).object()["POST /api/v1/books/files/101/progress"].toInt();
+}
+
+void cleanupRaces(const QUrl &endpoint,const QString &root,const QByteArray &epub) {
+    for(int race=0;race<4;++race) {
+        Client client(endpoint,root+"/cleanup-race-"+QString::number(race),nullptr,false);
+        require(client.configure(endpoint.toString(),"demo"),"configure cleanup race account");
+        require(waitForRecents(client),"cleanup race history settles");
+        const auto scope=ClientWorkerCheck::scope(client);
+        const auto stem="700-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const auto path=scope+"/"+stem+".epub",journal=scope+"/transfers/"+stem+".json";
+        const QJsonObject file{{"id",700},{"format","epub"},{"role","primary"}};
+        const QJsonObject book{{"id",700},{"title","Cleanup race"},{"selectedFile",file},{"files",QJsonArray{file}}};
+        const QJsonObject record{{"bookId",700},{"fileId",700},{"filename",stem+".epub"},{"format","epub"},
+            {"sha256",QString::fromLatin1(QCryptographicHash::hash(epub,QCryptographicHash::Sha256).toHex())},
+            {"bytes",epub.size()},{"book",book}};
+        require(QDir().mkpath(scope+"/transfers"),"create cleanup transfer fixture");
+        mode(path,epub); mode(scope+"/records/700.json",QJsonDocument(record).toJson());
+        mode(journal,QJsonDocument(QJsonObject{{"fileId",700},{"previous",QJsonObject{}},{"next",record}}).toJson());
+        auto &executor=ClientWorkerCheck::executor(client);
+        WorkerGate first(executor,&client);
+        require(until([&] { return first.entered->load(); }),"hold old cleanup");
+        ClientWorkerCheck::reload(client);
+        require(ClientWorkerCheck::cleanupRunning(client),"old cleanup is scheduled");
+        const auto old=ClientWorkerCheck::cleanupId(client);
+        WorkerGate next(executor,&client);
+        if(race==3) {
+            first.open();
+            QElapsedTimer deadline; deadline.start();
+            while(!next.entered->load() && deadline.elapsed()<10000) QThread::msleep(1);
+            require(next.entered->load(),"old work completes before its GUI callback");
+        }
+        if(race==0 || race==3) {
+            client.logout();
+            require(ClientWorkerCheck::cleanupCancelled(client),"logout explicitly cancels cleanup state");
+            require(wait(client,[&] { client.login(endpoint.toString(),"demo","demo"); }),"sign in again while old cleanup is pending");
+        } else if(race==1) {
+            ClientWorkerCheck::invalidateSession(client);
+            require(ClientWorkerCheck::cleanupCancelled(client),"session invalidation explicitly cancels cleanup state");
+            ClientWorkerCheck::cleanup(client);
+        } else ClientWorkerCheck::reload(client);
+        const auto fresh=ClientWorkerCheck::cleanupId(client);
+        require(fresh>old && ClientWorkerCheck::cleanupRunning(client),"a fresh cleanup can be scheduled after cancellation");
+        first.open(); require(until([&] { return next.entered->load(); }),"old cleanup drains before fresh work");
+        QCoreApplication::processEvents();
+        require(ClientWorkerCheck::cleanupRunning(client) && ClientWorkerCheck::cleanupId(client)==fresh && QFile::exists(journal),"old callback cannot clear the fresh task or consume its journal");
+        next.open();
+        require(waitForMaintenance(client) && !QFile::exists(journal) && bytes(path)==epub,"fresh cleanup finishes and preserves the registered book");
+    }
 }
 
 void workerRaces(Client &client,const QString &root,const QString &fault) {
@@ -391,6 +441,7 @@ int main(int argc,char **argv) {
     QCoreApplication::processEvents();
     require(wait(client,[&] { client.login(endpoint.toString(),"demo","demo"); }),"login and fetch catalog");
     require(wait(client,[&] { client.download(0); }),"download initial EPUB");
+    cleanupRaces(endpoint,root,bytes(client.localFile(0)));
     workerRaces(client,root,fault);
     mode(fault,"error");
     require(!wait(client,[&] { client.download(1); }),"inline download returns server error");

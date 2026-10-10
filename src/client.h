@@ -174,8 +174,11 @@ private:
     friend struct ClientWorkerCheck;
     FileExecutor files;
     FileCancellation fileTask,recentsTask,conflictTask,cleanupTask;
-    quint64 fileGeneration=0,accountGeneration=0,recentsGeneration=0,conflictGeneration=0;
-    bool fileDownloading=false,conflictPreparing=false,cleanupScheduled=false,cleanupPending=false;
+    quint64 fileGeneration=0,accountGeneration=0,recentsGeneration=0,conflictGeneration=0,cleanupGeneration=0;
+    bool fileDownloading=false,conflictPreparing=false,cleanupPending=false;
+    enum class CleanupState { Idle, Running, Completed, Cancelled };
+    CleanupState cleanupState=CleanupState::Idle;
+    void cancelCleanup();
     struct FileContext { quint64 generation,account; QString id,path,profile; QJsonObject record; };
     struct CleanupProof { FileStamp stamp; bool valid=false; };
     QMap<QString,CleanupProof> cleanupProofs;

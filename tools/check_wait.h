@@ -10,7 +10,14 @@ struct ClientWorkerCheck {
     static bool recentsIdle(const Client &client) { return !client.recentsScheduled && !client.recentsRequested; }
     static void changeAccount(Client &client) { ++client.accountGeneration; }
     static FileCancellation task(const Client &client) { return client.fileTask; }
-    static bool maintenanceIdle(const Client &client) { return !client.cleanupScheduled && !client.cleanupPending; }
+    static bool cleanupRunning(const Client &client) { return client.cleanupState==Client::CleanupState::Running; }
+    static bool cleanupCancelled(const Client &client) { return client.cleanupState==Client::CleanupState::Cancelled; }
+    static quint64 cleanupId(const Client &client) { return client.cleanupGeneration; }
+    static QString scope(const Client &client) { return client.scopeDir; }
+    static void cleanup(Client &client) { client.cleanupBooks(); }
+    static void invalidateSession(Client &client) { client.invalidateSession(); }
+    static void reload(Client &client) { client.loadRecords(); }
+    static bool maintenanceIdle(const Client &client) { return client.cleanupState!=Client::CleanupState::Running && !client.cleanupPending; }
 };
 
 inline bool waitUntil(const std::function<bool()> &predicate,int timeout=10000) {

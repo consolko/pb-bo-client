@@ -221,8 +221,8 @@ bool Client::setLanguage(const QString &language) {
 void Client::loadRecords() {
     ++accountGeneration; ++recentsGeneration;
     if (recentsTask) recentsTask->store(true);
-    if (cleanupTask) cleanupTask->store(true);
-    recentsScheduled=false; cleanupScheduled=false; cleanupPending=false; cleanupProofs.clear();
+    cancelCleanup();
+    recentsScheduled=false;
     const auto key = QCryptographicHash::hash((endpoint.toString()+"\n"+user).toUtf8(), QCryptographicHash::Sha256).toHex();
     scopeDir = rootDir + "/" + QString::fromLatin1(key.left(24));
     QDir().mkpath(scopeDir);
@@ -319,9 +319,20 @@ void Client::loadRecords() {
     }
 }
 
+void Client::cancelCleanup() {
+    ++cleanupGeneration;
+    if (cleanupTask) cleanupTask->store(true);
+    cleanupTask.reset();
+    if (cleanupState==CleanupState::Running) {
+        cleanupState=CleanupState::Cancelled;
+        logDiagnostic("cleanup.cancelled",{{"task",qint64(cleanupGeneration-1)},{"reason","account or session changed"}});
+    }
+    cleanupPending=false; cleanupProofs.clear();
+}
+
 void Client::cleanupBooks(const QString &verifiedFile) {
     if (!verifiedFile.isEmpty()) cleanupProofs[verifiedFile]={fileStamp(verifiedFile),true};
-    if (busy() || cleanupScheduled) { cleanupPending=true; return; }
+    if (busy() || cleanupState==CleanupState::Running) { cleanupPending=true; return; }
     cleanupPending=false;
     if (!canCleanupBooks || (activeDownload && !activeDownload->isFinished())) return;
     QSet<QString> referenced;
@@ -361,17 +372,20 @@ void Client::cleanupBooks(const QString &verifiedFile) {
             info.canonicalPath()==info.absolutePath() && info.size()==next["bytes"].toDouble();
         auto proof=cleanupProofs.constFind(newFile);
         if (candidate && (proof==cleanupProofs.cend() || proof->stamp!=fileStamp(newFile))) {
-            cleanupScheduled=true;
-            const auto account=accountGeneration;
+            cleanupState=CleanupState::Running;
+            const auto task=++cleanupGeneration,account=accountGeneration;
             cleanupTask=files.submit(this,[newFile,next](const FileCancellation &cancel) {
                 const auto before=fileStamp(newFile);
                 const bool valid=validContent(newFile,next["format"].toString(),cancel) &&
                     digestFile(newFile,cancel)==next["sha256"].toString().toLatin1() && fileStamp(newFile)==before;
                 return CleanupProof{before,valid};
-            },[this,newFile,account](const CleanupProof &result,bool cancelled) {
-                if (account!=accountGeneration) return;
-                cleanupScheduled=false;
-                if (!cancelled) cleanupProofs[newFile]=result;
+            },[this,newFile,account,task](const CleanupProof &result,bool cancelled) {
+                if (task!=cleanupGeneration) return;
+                cleanupTask.reset();
+                const bool current=!cancelled && account==accountGeneration;
+                cleanupState=current ? CleanupState::Completed : CleanupState::Cancelled;
+                logDiagnostic("cleanup.finished",{{"task",qint64(task)},{"result",current ? "completed" : "cancelled"}});
+                if (current) cleanupProofs[newFile]=result;
                 cleanupBooks();
             });
             return;
@@ -1248,6 +1262,7 @@ bool Client::saveSession() {
 
 void Client::invalidateSession() {
     ++accountGeneration;
+    cancelCleanup();
     token.clear(); refreshToken.clear(); sessionStored = false; sessionNotice.clear();
     stopCovers();
     const QString path = scopeDir+"/session.json";
@@ -1819,6 +1834,7 @@ void Client::selectAccount(int index) {
 void Client::logout() {
     if (busy()) return;
     ++accountGeneration;
+    cancelCleanup();
     beginFeedback("connection");
     stopCovers();
     const QString credential = refreshToken;
