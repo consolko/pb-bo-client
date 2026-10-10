@@ -21,6 +21,8 @@ bool verifyManifest(const QByteArray &data, const QByteArray &signature,
                     QJsonObject *manifest, QString *error);
 bool stageArchive(const QString &archive, const QString &destination,
                   const QString &expectedVersion, QJsonObject *manifest, QString *error);
-bool install(const QString &staged, const QString &destination,
-             const QJsonObject &manifest, QString *error);
+enum class InstallState { FailedBeforeReplace, ReplacedUnconfirmed, InstalledCleanupPending, Complete };
+struct InstallResult { InstallState state; QString detail; };
+InstallResult install(const QString &staged, const QString &destination, const QJsonObject &manifest);
+InstallResult finishInstall(const QString &staged, const QString &destination, const QJsonObject &manifest);
 }

@@ -53,6 +53,8 @@ private:
     void downloadZip(QUrl url,int redirects=5);
     void verifyArchive();
     void discardAttempt();
+    void recoverAttempts();
+    void installPrepared(bool confirmOnly);
     bool persist();
     void trace(const QString &event, QJsonObject fields={});
     void traceContext();

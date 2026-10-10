@@ -526,7 +526,7 @@ ApplicationWindow {
                     }
                     Action {
                         objectName: "installUpdateButton"
-                        text: qsTranslate("BookOrbit", "Install and close"); Layout.fillWidth: true
+                        text: window.updater && ["unconfirmed", "cleanup_pending"].indexOf(window.updater.state) >= 0 ? qsTranslate("BookOrbit", "Finish update") : qsTranslate("BookOrbit", "Install and close"); Layout.fillWidth: true
                         visible: !!window.updater && window.updater.canInstall
                         enabled: !client.busy
                         onClicked: window.updater.install()

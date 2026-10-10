@@ -61,24 +61,26 @@ bool isRunningExecutable(const QString &path) {
     return false;
 #endif
 }
-static bool commit(QSaveFile &file, QString *error) {
-    if(!file.flush()) return fail(error,"flush: "+file.errorString());
+static InstallResult commit(QSaveFile &file) {
+    auto failed=[](const QString &detail) { return InstallResult{InstallState::FailedBeforeReplace,detail}; };
+    if(!file.flush()) return failed("flush: "+file.errorString());
     // QSaveFile::commit() ignores syncToDisk() failures; check before the rename.
-    if(::fsync(file.handle())!=0) return fail(error,"sync_file: "+QString::fromLocal8Bit(std::strerror(errno)));
+    if(::fsync(file.handle())!=0) return failed("sync_file: "+QString::fromLocal8Bit(std::strerror(errno)));
     const int dir=::open(QFile::encodeName(QFileInfo(file.fileName()).absolutePath()),O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-    if(dir<0) return fail(error,"open_directory: "+QString::fromLocal8Bit(std::strerror(errno)));
-    if(!file.commit()) { ::close(dir); return fail(error,"commit: "+file.errorString()); }
+    if(dir<0) return failed("open_directory: "+QString::fromLocal8Bit(std::strerror(errno)));
+    if(!file.commit()) { ::close(dir); return failed("commit: "+file.errorString()); }
     const bool ok=::fsync(dir)==0;
-    const QString detail=ok ? QString{} : QString::fromLocal8Bit(std::strerror(errno));
+    const QString detail=ok ? QString{} : "sync_directory: "+QString::fromLocal8Bit(std::strerror(errno));
     ::close(dir);
-    return ok || fail(error,"sync_directory: "+detail);
+    return {ok ? InstallState::Complete : InstallState::ReplacedUnconfirmed,detail};
 }
 bool save(const QString &path, const QByteArray &data, QString *error) {
     const QFileInfo info(path);
     if (!safeDirectory(info.absolutePath()) || info.isSymLink()) return fail(error,"Unsafe update path");
     QSaveFile f(path); f.setDirectWriteFallback(false);
     if (!f.open(QIODevice::WriteOnly) || f.write(data)!=data.size()) return fail(error,f.errorString());
-    return commit(f,error);
+    const auto result=commit(f);
+    return result.state==InstallState::Complete || fail(error,result.detail);
 }
 bool saveJson(const QString &path, const QJsonObject &data, QString *error) {
     return save(path,QJsonDocument(data).toJson(QJsonDocument::Compact),error);
@@ -135,38 +137,59 @@ bool stageArchive(const QString &archive,const QString &destination,const QStrin
     if(fileTaskCancelled()) { QFile::remove(destination); return fail(error,"Cancelled"); }
     *manifest=m; return true;
 }
-bool install(const QString &staged,const QString &destination,const QJsonObject &m,QString *error) {
+InstallResult install(const QString &staged,const QString &destination,const QJsonObject &m) {
+    auto failed=[](const QString &detail) { return InstallResult{InstallState::FailedBeforeReplace,detail}; };
     const QFileInfo target(destination), source(staged);
-    if(staged==destination) return fail(error,"install.paths: source equals destination");
-    if(!safeDirectory(target.absolutePath()) || !safeDirectory(source.absolutePath())) return fail(error,"install.paths: unsafe or missing directory");
-    if(target.isSymLink() || !target.isFile()) return fail(error,"install.destination: missing file or symlink: "+destination);
-    if(source.isSymLink() || !source.isFile()) return fail(error,"install.source: missing file or symlink");
-    if(source.size()!=m["bytes"].toInteger()) return fail(error,"install.size: staged executable size differs");
-    if(hashFile(staged)!=m["sha256"].toString()) return fail(error,"install.hash: staged executable checksum differs");
-    if(!elf(staged)) return fail(error,"install.abi: incompatible executable");
+    if(staged==destination) return failed("install.paths: source equals destination");
+    if(!safeDirectory(target.absolutePath()) || !safeDirectory(source.absolutePath())) return failed("install.paths: unsafe or missing directory");
+    if(target.isSymLink() || !target.isFile()) return failed("install.destination: missing file or symlink: "+destination);
+    if(source.isSymLink() || !source.isFile()) return failed("install.source: missing file or symlink");
+    if(source.size()!=m["bytes"].toInteger()) return failed("install.size: staged executable size differs");
+    if(hashFile(staged)!=m["sha256"].toString()) return failed("install.hash: staged executable checksum differs");
+    if(!elf(staged)) return failed("install.abi: incompatible executable");
     // QSaveFile writes beside the installed executable and atomically replaces it.
     // Never truncate a running executable, and never retain a previous version.
     QFile input(staged); QSaveFile output(destination); output.setDirectWriteFallback(false);
-    if(!input.open(QIODevice::ReadOnly)) return fail(error,"install.open_source: "+input.errorString());
-    if(!output.open(QIODevice::WriteOnly)) return fail(error,"install.open_destination: "+output.errorString());
+    if(!input.open(QIODevice::ReadOnly)) return failed("install.open_source: "+input.errorString());
+    if(!output.open(QIODevice::WriteOnly)) return failed("install.open_destination: "+output.errorString());
     while(!input.atEnd()) {
         const auto chunk=input.read(65536);
-        if(chunk.isEmpty()) return fail(error,"install.read: "+input.errorString());
-        if(output.write(chunk)!=chunk.size()) return fail(error,"install.write: "+output.errorString());
+        if(chunk.isEmpty()) return failed("install.read: "+input.errorString());
+        if(output.write(chunk)!=chunk.size()) return failed("install.write: "+output.errorString());
     }
     // FAT exposes mount-defined execute bits and may reject chmod(0755).
     // Inspect the temporary file descriptor, not the still-installed pathname.
     struct stat mode{};
-    if(::fstat(output.handle(),&mode)!=0) return fail(error,"install.permissions: cannot inspect temporary file");
+    if(::fstat(output.handle(),&mode)!=0) return failed("install.permissions: cannot inspect temporary file");
     if(!(mode.st_mode&S_IXUSR)) {
         if(!output.setPermissions(output.permissions()|QFileDevice::ExeOwner))
-            return fail(error,"install.permissions: "+output.errorString());
+            return failed("install.permissions: "+output.errorString());
         if(::fstat(output.handle(),&mode)!=0 || !(mode.st_mode&S_IXUSR))
-            return fail(error,"install.permissions: temporary file is not executable");
+            return failed("install.permissions: temporary file is not executable");
     }
-    QString detail;
-    if(!commit(output,&detail)) return fail(error,"install."+detail);
-    if(!QFile::remove(staged)) return fail(error,"install.cleanup: cannot remove staged executable");
-    return true;
+    auto result=commit(output);
+    if(result.state!=InstallState::Complete) { result.detail="install."+result.detail; return result; }
+    if(::unlink(QFile::encodeName(staged))!=0) return {InstallState::InstalledCleanupPending,"install.cleanup: cannot remove staged executable"};
+    return {InstallState::Complete,{}};
+}
+InstallResult finishInstall(const QString &staged,const QString &destination,const QJsonObject &m) {
+    const QFileInfo target(destination);
+    const auto stamp=fileStamp(destination);
+    auto uncertain=[](const QString &detail) { return InstallResult{InstallState::ReplacedUnconfirmed,detail}; };
+    if(!safeDirectory(target.absolutePath()) || target.isSymLink() || !target.isFile() ||
+       target.canonicalFilePath()!=destination || target.size()!=m["bytes"].toInteger() ||
+       hashFile(destination)!=m["sha256"].toString() || !elf(destination))
+        return uncertain("install.confirm: installed executable does not match");
+    const int file=::open(QFile::encodeName(destination),O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
+    if(file<0) return uncertain("install.confirm: cannot open executable");
+    const bool synced=::fsync(file)==0; ::close(file);
+    if(!synced || !stamp.valid || fileStamp(destination)!=stamp) return uncertain("install.sync_file: cannot confirm installed executable");
+    const int dir=::open(QFile::encodeName(target.absolutePath()),O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if(dir<0) return uncertain("install.open_directory: cannot confirm directory");
+    const bool ok=::fsync(dir)==0; ::close(dir);
+    if(!ok || fileStamp(destination)!=stamp) return uncertain("install.sync_directory: cannot confirm replacement");
+    if(QFileInfo::exists(staged) && ::unlink(QFile::encodeName(staged))!=0)
+        return {InstallState::InstalledCleanupPending,"install.cleanup: cannot remove staged executable"};
+    return {InstallState::Complete,{}};
 }
 }
