@@ -1604,5 +1604,9 @@ Download an EPUB or FB2 from the catalog.</source><translation>Пока нече
     <message><source>Chapter and excerpt are from the book on this device.</source><translation>Глава и отрывок взяты из книги на этом устройстве.</translation></message>
     <message><source>This FB2 structure is not supported for sync yet. Images, tables, poetry and long sections require additional validation. You can still read the original file.</source><translation>Синхронизация FB2 с такой структурой пока не поддерживается. Изображения, таблицы, стихи и длинные разделы требуют дополнительной проверки. Исходную книгу можно читать как обычно.</translation></message>
     <message><source>Experimental FB2 sync: text-only books with short sections. Unsupported structures keep their progress unchanged.</source><translation>Пробная синхронизация FB2: текстовые книги с небольшими разделами. Прогресс книг с неподдерживаемой структурой остаётся без изменений.</translation></message>
+    <message><source>The file, profile or account changed. Retry the operation.</source><translation>Файл, профиль или учётная запись изменились. Повторите операцию.</translation></message>
+    <message><source>Checking the book file…</source><translation>Проверяем файл книги…</translation></message>
+    <message><source>Verifying the update package…</source><translation>Проверяем пакет обновления…</translation></message>
+    <message><source>Installing the update…</source><translation>Устанавливаем обновление…</translation></message>
 </context>
 </TS>

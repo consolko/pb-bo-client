@@ -4,6 +4,7 @@
 #include "progress.h"
 #include "sync_decision.h"
 #include "check_wait.h"
+#include "worker_gate.h"
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -30,13 +31,17 @@ bool connectNetwork() { return true; }
 QString readerProfile() { return profile; }
 bool readerPosition(const QString &,QString *value) { *value=position; return true; }
 ReaderFileState readerFileState(const QString &) { return ReaderFileState::Closed; }
-ReaderRecents readerRecents(const QStringList &) { auto result=history; result.profile=profile; return result; }
+std::function<ReaderRecents(const FileCancellation &)> readerRecentsTask(const QStringList &,const QString &profile) {
+    auto snapshot=history; snapshot.profile=profile;
+    return [snapshot](const FileCancellation &) { return snapshot; };
+}
 bool readerBookIndexed(const QString &) { return indexed; }
 void scanBook(const QString &) {}
 bool openReader(const QString &) { opened=true; return true; }
-bool saveReaderPosition(const QString &,const QString &expected,const QString &cfi,const QString &expectedProfile,QString *error) {
+bool saveReaderPosition(const QString &,const QString &expected,const PreparedReaderPosition &prepared,const QString &expectedProfile,QString *error) {
     if (expected!=position || expectedProfile!=profile) { *error="Changed fixture"; return false; }
-    position="pbr:/webkit?##"+cfi;
+    if (!prepared.coordinate || !prepared.estimate) return false;
+    position=prepared.native;
     return true;
 }
 
@@ -68,6 +73,95 @@ int posts(const QString &root) {
     return QJsonDocument::fromJson(bytes(root+"/requests.json")).object()["POST /api/v1/books/files/101/progress"].toInt();
 }
 
+void workerRaces(Client &client,const QString &root,const QString &fault) {
+    auto &executor=ClientWorkerCheck::executor(client);
+    require(waitForRecents(client),"history settled before worker races");
+    {
+        const auto path=client.localFile(0);
+        history={"default",true,{{path,{1,100}}}};
+        client.refreshRecents(); require(waitForRecents(client) && !client.recentBook().isEmpty(),"seed current profile history");
+        WorkerGate gate(executor,&client);
+        require(until([&] { return gate.entered->load(); }),"hold worker during history refresh");
+        client.refreshRecents(); profile="worker-history-other"; history.files.clear(); client.refreshRecents();
+        require(client.recentBook().isEmpty() && !client.historyAvailable(),"profile switch immediately removes the old history");
+        gate.open(); require(waitForRecents(client) && client.historyAvailable() && client.recentBook().isEmpty(),
+                             "late old-profile history is rejected before the fresh snapshot is published");
+        profile="default"; history={}; client.refreshRecents(); require(waitForRecents(client),"restore history fixture");
+    }
+    {
+        WorkerGate gate(executor,&client);
+        require(until([&] { return gate.entered->load(); }),"occupy worker before opening");
+        opened=false; client.open(0);
+        int ticks=0; QTimer timer; QObject::connect(&timer,&QTimer::timeout,[&] { ++ticks; }); timer.start(5);
+        require(client.busy() && until([&] { return ticks>=5; }) && !opened,
+                "open publishes busy and GUI timers keep running before hashing starts");
+        require(wait(client,[&] { gate.open(); }) && opened,"opening resumes after worker completion");
+    }
+    const QString path=client.localFile(0); const auto original=bytes(path);
+    position="pbr:/webkit?##epubcfi(/6/2!/4/6/1)";
+    for(int race=0;race<4;++race) {
+        WorkerGate gate(executor,&client);
+        require(until([&] { return gate.entered->load(); }),"occupy worker before sync");
+        const int before=posts(root); client.syncFile(101);
+        require(client.busy(),"sync publishes busy before local parsing and hashing");
+        if(race==0) profile="changed-during-worker";
+        if(race==1) position="pbr:/webkit?##epubcfi(/6/2!/4/8/1)";
+        if(race==2) ClientWorkerCheck::changeAccount(client);
+        if(race==3) { auto modified=original; modified[modified.size()-1]^=1; mode(path,modified); }
+        require(!wait(client,[&] { gate.open(); }) && posts(root)==before && !client.progressConflict(),
+                "changed profile, reader position, account or same-size file blocks a stale sync write");
+        profile="default"; position="pbr:/webkit?##epubcfi(/6/2!/4/6/1)";
+        if(race==3) mode(path,original);
+    }
+    {
+        WorkerGate gate(executor,&client);
+        require(until([&] { return gate.entered->load(); }),"occupy worker before verification");
+        client.verifyLibrary();
+        require(client.busy() && !wait(client,[&] { client.cancelLibraryVerification(); }),"preflight verification cancels immediately");
+        require(wait(client,[&] { client.openFile(101); QTimer::singleShot(20,&client,[&] { gate.open(); }); }),
+                "cancelled verification cannot finish a newer queued opening");
+    }
+    {
+        WorkerGate gate(executor,&client);
+        require(until([&] { return gate.entered->load(); }),"occupy worker during post-download validation");
+        client.download(1);
+        require(until([&] { return bool(ClientWorkerCheck::task(client)); }) && client.downloading(),
+                "download remains cancellable while its worker validation is pending");
+        require(!wait(client,[&] { client.cancelDownload(); }) && !client.downloading(),"post-download preparation cancels immediately");
+        require(wait(client,[&] { client.openFile(101); QTimer::singleShot(20,&client,[&] { gate.open(); }); }) && bytes(path)==original,
+                "cancelled download result cannot register a file or finish a newer operation");
+    }
+    {
+        mode(fault,"changed");
+        WorkerGate first(executor,&client);
+        require(until([&] { return first.entered->load(); }),"hold download before old-file hash");
+        client.download(0);
+        require(until([&] { return bool(ClientWorkerCheck::task(client)); }),"old-file hash is queued");
+        const auto oldTask=ClientWorkerCheck::task(client);
+        WorkerGate validation(executor,&client); first.open();
+        require(until([&] { return validation.entered->load() && ClientWorkerCheck::task(client)!=oldTask; }),
+                "hold download between old-file hash and EPUB validation");
+        auto modified=original; modified[modified.size()-1]^=1; mode(path,modified);
+        require(!wait(client,[&] { validation.open(); }) && client.localFile(0)==path && bytes(path)==modified,
+                "old file changed during staging prevents publishing a replacement");
+        mode(path,original); mode(fault,"");
+    }
+    // Hold the second worker pass after GET, then replace the local file at the same size.
+    mode(fault,"slow_progress");
+    const int before=posts(root); client.syncFile(101);
+    const auto localTask=ClientWorkerCheck::task(client);
+    // Poll the fixture request count without changing client state.
+    const auto gets=[&] { QFile file(root+"/requests.json"); if(!file.open(QIODevice::ReadOnly)) return 0; return QJsonDocument::fromJson(file.readAll()).object()["GET /api/v1/books/files/101/progress"].toInt(); };
+    const int initialGets=gets();
+    require(until([&] { return gets()>initialGets; }),"server GET begins after the first hash");
+    WorkerGate remoteGate(executor,&client);
+    require(until([&] { return remoteGate.entered->load(); }),"hold worker during remote response");
+    require(until([&] { return ClientWorkerCheck::task(client)!=localTask; }),"second integrity pass is queued after network response");
+    auto modified=original; modified[modified.size()-1]^=1; mode(path,modified);
+    require(!wait(client,[&] { remoteGate.open(); }) && posts(root)==before,"second full hash rejects a same-size rewrite after GET");
+    mode(path,original); mode(fault,"");
+}
+
 void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &endpoint, const QString &root) {
     const QString data=root+"/presentation", source=root+"/plain.epub";
     QString scope;
@@ -91,7 +185,7 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
     mode(scope+"/file-choices.json",QJsonDocument(choices).toJson());
     history.available=true; history.files[scope+"/50007.epub"]={10007,100};
     Client client(endpoint,data);
-    QCoreApplication::processEvents();
+    require(waitForRecents(client),"initial history snapshot completes");
     client.resetPresentationWork();
     QElapsedTimer clock; clock.start();
     const auto first=client.books();
@@ -184,26 +278,26 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
     require(!client.historyAvailable() && client.recentBook().isEmpty() && !client.detail()["pendingProgress"].toBool() &&
             window->property("detailData").value<QJSValue>().toVariant().toMap()["pendingProgress"]==false,
         "profile change immediately clears old profile presentation even while busy");
-    client.cancelUpdate(); client.refreshRecents(); QCoreApplication::processEvents();
-    profile="default"; client.refreshRecents(); QCoreApplication::processEvents();
+    client.cancelUpdate(); client.refreshRecents(); require(waitForRecents(client),"history refresh completes");
+    profile="default"; client.refreshRecents(); require(waitForRecents(client),"history refresh completes");
     client.closeDetail();
     const QString removed=scope+"/50007.epub";
     require(QFile::rename(removed,removed+".held"),"temporarily remove a cached test file");
     opened=false; client.openFile(50007);
     require(!opened,"fresh action checks reject a missing file before external refresh");
-    client.refreshRecents(); QCoreApplication::processEvents();
+    client.refreshRecents(); require(waitForRecents(client),"history refresh completes");
     require(client.recentBook().isEmpty() && client.syncSummary()["attention"].toInt()>0,
         "external refresh observes missing files even with identical native recents");
     client.searchDownloaded("Книга 0007");
     require(client.books().size()==1 && client.books().first().toMap()["needsRepair"].toBool(),
         "missing book remains in the library with repair action");
     require(QFile::rename(removed+".held",removed),"restore cached test file");
-    client.refreshRecents(); QCoreApplication::processEvents(); client.searchDownloaded("");
+    client.refreshRecents(); require(waitForRecents(client),"history refresh completes"); client.searchDownloaded("");
     require(client.recentBook()["fileId"].toInt()==50007,"external refresh restores available recent file");
     mode(removed,content+"changed size");
-    client.refreshRecents(); QCoreApplication::processEvents(); client.searchDownloaded("Книга 0007");
+    client.refreshRecents(); require(waitForRecents(client),"history refresh completes"); client.searchDownloaded("Книга 0007");
     require(client.books().first().toMap()["needsRepair"].toBool(),"external size change invalidates cached file availability");
-    mode(removed,content); client.refreshRecents(); QCoreApplication::processEvents(); client.searchDownloaded("");
+    mode(removed,content); client.refreshRecents(); require(waitForRecents(client),"history refresh completes"); client.searchDownloaded("");
     QObject::connect(&client,&Client::languageChanged,&engine,[&] {
         if (client.language()=="en") app.removeTranslator(&russian); else app.installTranslator(&russian);
         QLocale::setDefault(QLocale(client.language()=="en" ? "en" : "ru"));
@@ -297,6 +391,7 @@ int main(int argc,char **argv) {
     QCoreApplication::processEvents();
     require(wait(client,[&] { client.login(endpoint.toString(),"demo","demo"); }),"login and fetch catalog");
     require(wait(client,[&] { client.download(0); }),"download initial EPUB");
+    workerRaces(client,root,fault);
     mode(fault,"error");
     require(!wait(client,[&] { client.download(1); }),"inline download returns server error");
     require(until([&] { return shown("operationMessage") && shown("retryOperation"); }) &&

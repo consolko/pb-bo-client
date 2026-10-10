@@ -26,14 +26,18 @@ QString readerProfile() { return fakeProfile; }
 bool readerPosition(const QString &, QString *position) { *position=fakePosition; return true; }
 bool historyReadable=true;
 QMap<QString,ReaderRecent> fakeRecents;
-ReaderRecents readerRecents(const QStringList &) { return {fakeProfile,historyReadable,fakeRecents}; }
+std::function<ReaderRecents(const FileCancellation &)> readerRecentsTask(const QStringList &,const QString &profile) {
+    const ReaderRecents snapshot{profile,historyReadable,fakeRecents};
+    return [snapshot](const FileCancellation &) { return snapshot; };
+}
 QString appliedCfi;
 bool applyAllowed=true;
-bool saveReaderPosition(const QString &path, const QString &expected, const QString &cfi, const QString &profile, QString *error) {
+bool saveReaderPosition(const QString &path, const QString &expected, const PreparedReaderPosition &prepared, const QString &profile, QString *error) {
     *error="Тестовый отказ сохранения";
     if (!applyAllowed || expected!=fakePosition || profile!=fakeProfile) return false;
-    QString native; if (!bookPosition(path,cfi,nullptr,nullptr,nullptr,&native)) return false;
-    appliedCfi=cfi; fakePosition=native; return true;
+    Q_UNUSED(path)
+    if (!prepared.coordinate || !prepared.estimate) return false;
+    appliedCfi=prepared.cfi; fakePosition=prepared.native; return true;
 }
 bool opened = false, indexed = true;
 QString scanned;
@@ -250,6 +254,7 @@ int main(int argc, char **argv) {
     const int conflictGets=requests(root,"GET /api/v1/books/files/101/progress");
     c.dismissConflict(); networkAvailable=false;
     c.inspectConflict(101);
+    require(waitUntil([&] { return !c.busy(); }), "offline conflict preparation completes");
     require(c.progressConflict() && c.conflictPositions().size()==2 && !c.conflictPositions()[0].toMap()["excerpt"].toString().isEmpty() &&
             requests(root,"GET /api/v1/books/files/101/progress")==conflictGets, "saved conflict opens offline with local text context and no GET");
     networkAvailable=true;
@@ -487,7 +492,7 @@ int main(int argc, char **argv) {
             "fresh digest check blocks sync before refreshing the cached presentation");
     const QString damagedRecord=scope+"/records/101.json";
     require(QFile::rename(damagedRecord,damagedRecord+".held") && QDir().mkdir(damagedRecord),"inject damaged-record save failure");
-    c.open(0);
+    require(!wait(c,[&] { c.open(0); }),"opening rejects a corrupted file even when saving its invalid state fails");
     require(c.localFile(0).isEmpty() && c.books().size() == 2 && c.books()[0].toMap()["needsRepair"].toBool(), "corruption preserves library entry with repair action");
     require(QDir().rmdir(damagedRecord) && QFile::rename(damagedRecord+".held",damagedRecord),"restore record after in-memory damage notification");
     require(wait(c, [&] { c.download(0); }), "redownload repairs corruption");
@@ -813,6 +818,7 @@ int main(int argc, char **argv) {
                 for (auto state : {ReaderFileState::Open,ReaderFileState::Unknown}) {
                     fakeReader=state;
                     Client deferred(endpoint,caseRoot);
+                    require(waitForMaintenance(deferred),"deferred recovery validates the current file");
                     require(QFile::exists(previousPath) && QFile::exists(nextPath) && QFile::exists(journal),
                             "open or unknown reader retains transfer journal and both versions");
                 }
@@ -825,11 +831,13 @@ int main(int argc, char **argv) {
                 write(foreignPath,previousBytes);
                 require(QFile::remove(previousPath) && QFile::link(foreignPath,previousPath), "inject symlink instead of retired version");
                 Client linked(endpoint,caseRoot);
+                require(waitForMaintenance(linked),"symlink recovery validation completes");
                 require(QFileInfo(previousPath).isSymLink() && QFile::exists(journal) && contents(foreignPath)==previousBytes,
                         "recovery preserves symlinks and their unrelated targets");
                 require(QFile::remove(previousPath), "remove test symlink");
             }
             Client recovered(endpoint,caseRoot);
+            require(waitForMaintenance(recovered),"background recovery validation completes");
             require(!QFile::exists(journal) && !QFile::exists(part), "restart resolves durable transfer journal and staging file");
             require(phase == 2 ? QFile::exists(nextPath) && !QFile::exists(previousPath) && contents(nextPath)==nextBytes :
                     !QFile::exists(nextPath) && (!replacement || (QFile::exists(previousPath) && contents(previousPath)==previousBytes)),
@@ -927,23 +935,23 @@ int main(int argc, char **argv) {
             "every persisted sync state maps to one book category");
     }
     fakeRecents={{epubPath,{10,100}},{features.localFile(0),{10,100}},{pdfPath,{11,90}}};
-    features.refreshRecents(); QCoreApplication::processEvents();
+    features.refreshRecents(); require(waitForRecents(features),"history refresh completes");
     require(features.historyAvailable() && features.recentBook()["fileId"].toInt()==203,
         "native aliases with equal opentime prefer the user's selected variant");
-    features.selectFile(101); features.refreshRecents(); QCoreApplication::processEvents();
+    features.selectFile(101); features.refreshRecents(); require(waitForRecents(features),"history refresh completes");
     require(features.recentBook()["fileId"].toInt()==101, "equal native times honor a changed preferred file");
-    features.selectFile(201); features.refreshRecents(); QCoreApplication::processEvents();
+    features.selectFile(201); features.refreshRecents(); require(waitForRecents(features),"history refresh completes");
     require(features.recentBook()["fileId"].toInt()==101,"equal aliases without a recent preferred format choose the smaller file ID");
     require(QFile::rename(epubPath,epubPath+".recent-test"),"temporarily remove only the isolated recent candidate");
-    features.refreshRecents(); QCoreApplication::processEvents();
+    features.refreshRecents(); require(waitForRecents(features),"history refresh completes");
     require(features.recentBook()["fileId"].toInt()==203,"missing native recent file never receives a read action");
     require(QFile::rename(epubPath+".recent-test",epubPath),"restore isolated recent candidate");
     fakeProfile="empty-profile"; fakeRecents.clear(); features.refreshRecents();
     require(features.recentBook().isEmpty(), "profile switch clears the previous recent snapshot immediately");
-    QCoreApplication::processEvents(); fakeProfile="default";
-    historyReadable=false; features.refreshRecents(); QCoreApplication::processEvents();
+    require(waitForRecents(features),"new profile history completes"); fakeProfile="default";
+    historyReadable=false; features.refreshRecents(); require(waitForRecents(features),"history refresh completes");
     require(!features.historyAvailable() && features.recentBook().isEmpty(), "unavailable native history has no client-only fallback");
-    historyReadable=true; fakeRecents.clear(); features.refreshRecents(); QCoreApplication::processEvents();
+    historyReadable=true; fakeRecents.clear(); features.refreshRecents(); require(waitForRecents(features),"history refresh completes");
     features.selectFile(201);
     require(!wait(features, [&] { features.syncSelected(); }) && features.status().contains("EPUB и поддерживаемых FB2"), "PDF never enters position synchronization");
     opened = false;

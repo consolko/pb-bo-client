@@ -1,5 +1,6 @@
 #include "ota.h"
 #include "zip.h"
+#include "file_work.h"
 #include <QCryptographicHash>
 #include <QCoreApplication>
 #include <QJsonDocument>
@@ -42,12 +43,9 @@ QByteArray read(const QString &path, qint64 limit) {
     QFile file(path); return file.open(QIODevice::ReadOnly) ? file.read(limit+1) : QByteArray{};
 }
 QString hashFile(const QString &path) {
-    const QFileInfo info(path);
-    if (!info.isFile() || info.isSymLink() || info.canonicalFilePath()!=info.absoluteFilePath()) return {};
-    QFile file(path); QCryptographicHash hash(QCryptographicHash::Sha256);
-    if (!file.open(QIODevice::ReadOnly) || !hash.addData(&file)) return {};
-    return QString::fromLatin1(hash.result().toHex());
+    return QString::fromLatin1(digestFile(path,activeFileCancellation));
 }
+
 bool safeDirectory(const QString &path) {
     const QFileInfo info(path);
     return info.isDir() && !info.isSymLink() && info.canonicalFilePath()==info.absoluteFilePath();
@@ -134,6 +132,7 @@ bool stageArchive(const QString &archive,const QString &destination,const QStrin
     if(hashFile(destination)!=m["sha256"].toString() || !elf(destination)) {
         QFile::remove(destination); return fail(error,"Downloaded executable does not match");
     }
+    if(fileTaskCancelled()) { QFile::remove(destination); return fail(error,"Cancelled"); }
     *manifest=m; return true;
 }
 bool install(const QString &staged,const QString &destination,const QJsonObject &m,QString *error) {

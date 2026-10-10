@@ -1,4 +1,5 @@
 #pragma once
+#include "file_executor.h"
 #include <QFile>
 #include <QMap>
 #include <QtEndian>
@@ -97,6 +98,7 @@ struct Zip {
         qint64 remaining=compressed,written=0; uLong crc=crc32(0,nullptr,0); int rc=Z_OK; bool ok=true;
         char buffer[65536];
         while(remaining>0 && ok) {
+            if(fileTaskCancelled()) { ok=false; break; }
             const auto input=file.read(qMin(remaining,qint64(65536)));
             if(input.isEmpty()) { ok=false; break; }
             remaining-=input.size();
@@ -119,6 +121,7 @@ struct Zip {
         }
         if(method==8) { ok=ok && rc==Z_STREAM_END && z.total_in==compressed; inflateEnd(&z); }
         if(!ok || written!=expected || crc!=u32(h,16)) { out.cancelWriting(); return fail("Damaged ZIP member"); }
+        if(fileTaskCancelled()) { out.cancelWriting(); return fail("Cancelled"); }
         return out.commit() || fail(out.errorString());
     }
 };

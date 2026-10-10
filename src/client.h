@@ -13,6 +13,7 @@
 #include <QHash>
 #include <functional>
 
+class UpdateManager;
 class Client : public QObject {
     Q_OBJECT
     Q_PROPERTY(QStringList languageCodes READ languageCodes CONSTANT)
@@ -111,7 +112,7 @@ public:
     bool historyAvailable() const { return nativeRecents.available; }
     Q_INVOKABLE void openFile(int fileId, bool applyIncoming=false);
     QString status() const { return translatedText(message); }
-    bool busy() const { return working; }
+    bool busy() const { return working || conflictPreparing; }
     bool authenticated() const { return !token.isEmpty(); }
     int page() const { return currentPage; }
     int total() const { return count; }
@@ -121,8 +122,8 @@ public:
     QString username() const { return user; }
     QStringList accounts() const;
     bool offlineOnly() const { return localView; }
-    bool downloading() const { return !activeDownload.isNull(); }
-    bool canRetry() const { return !working && authenticated() && retryKind != 0; }
+    bool downloading() const { return fileDownloading || !activeDownload.isNull(); }
+    bool canRetry() const { return !busy() && authenticated() && retryKind != 0; }
     QString downloadDirectory() const;
     bool diagnosticLogging() const { return diagnostics; }
     QString diagnosticLogPath() const;
@@ -169,6 +170,18 @@ signals:
     void coversChanged();
     void completed(const QString &operation, bool success);
 private:
+    friend class UpdateManager;
+    friend struct ClientWorkerCheck;
+    FileExecutor files;
+    FileCancellation fileTask,recentsTask,conflictTask,cleanupTask;
+    quint64 fileGeneration=0,accountGeneration=0,recentsGeneration=0,conflictGeneration=0;
+    bool fileDownloading=false,conflictPreparing=false,cleanupScheduled=false,cleanupPending=false;
+    struct FileContext { quint64 generation,account; QString id,path,profile; QJsonObject record; };
+    struct CleanupProof { FileStamp stamp; bool valid=false; };
+    QMap<QString,CleanupProof> cleanupProofs;
+    FileContext fileContext(const QString &id,const QString &path) const;
+    bool acceptFileContext(const FileContext &context,const FileStamp &stamp={});
+    void startFileOperation();
     using LocalFiles = QHash<int, QString>;
     struct LibraryRow { QJsonObject book; QVariantMap summary; QString search; };
     mutable QList<LibraryRow> libraryRows;

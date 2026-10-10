@@ -10,6 +10,8 @@ build/
 !/tools/native_sync_check.cpp
 !/tools/reader_state_check.cpp
 !/tools/check_wait.h
+!/tools/worker_check.cpp
+!/tools/worker_gate.h
 !/tools/check_stage3.py
 !/tools/mock_bookorbit.py
 !/tools/test_mock.py

@@ -6,6 +6,7 @@
 #include <QJsonObject>
 #include <QTimer>
 #include <functional>
+#include "file_executor.h"
 class Client;
 
 class UpdateManager : public QObject {
@@ -22,6 +23,7 @@ class UpdateManager : public QObject {
     Q_PROPERTY(bool canInstall READ canInstall NOTIFY changed)
 public:
     UpdateManager(Client *client, QString root, QString executable, QObject *parent=nullptr);
+    ~UpdateManager() override;
     QString version() const;
     QString availableVersion() const { return candidateVersion; }
     QString notes() const { return releaseNotes; }
@@ -49,10 +51,14 @@ private:
     bool allowed(const QUrl &url) const;
     void fetch(QUrl url,qint64 limit,std::function<void(QByteArray,int)> done,int redirects=5);
     void downloadZip(QUrl url,int redirects=5);
+    void verifyArchive();
+    void discardAttempt();
     bool persist();
     void trace(const QString &event, QJsonObject fields={});
     void traceContext();
     Client *client;
+    FileCancellation fileTask;
+    QString attemptDir;
     QString root,executable,phase="idle",notice,candidateVersion,releaseNotes,zipDigest;
     QUrl apiBase,zipUrl,checksumsUrl;
     QJsonObject settings,prepared;

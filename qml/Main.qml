@@ -521,7 +521,7 @@ ApplicationWindow {
                     }
                     Action {
                         text: qsTranslate("BookOrbit", "Cancel update download"); Layout.fillWidth: true
-                        visible: !!window.updater && ["checking", "downloading"].indexOf(window.updater.state) >= 0
+                        visible: !!window.updater && ["checking", "downloading", "verifying"].indexOf(window.updater.state) >= 0
                         onClicked: window.updater.cancel()
                     }
                     Action {

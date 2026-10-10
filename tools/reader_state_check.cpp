@@ -27,7 +27,7 @@ int main(int argc, char **argv) {
         QString previous,error;
         const QString path=QString::fromLocal8Bit(argv[1]);
         if (!readerPosition(path,&previous)) return 4;
-        const bool ok=saveReaderPosition(path,previous,QString::fromLocal8Bit(argv[3]),readerProfile(),&error);
+        const bool ok=saveReaderPosition(path,previous,prepareReaderPosition(path,QString::fromLocal8Bit(argv[3])),readerProfile(),&error);
         std::puts(ok ? "saved" : qPrintable(error));
         return ok ? 0 : 5;
     }

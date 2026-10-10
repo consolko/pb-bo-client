@@ -114,32 +114,11 @@ QString plainText(const QString &text) {
     document.setHtml(text);
     return document.toPlainText();
 }
-bool validContent(const QString &path, const QString &format) {
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) return false;
-    const auto head = file.peek(1024);
-    if (format == "epub" || format == "kepub") return validEpub(path);
-    if (format == "docx" || format == "cbz") return head.startsWith(QByteArray("PK\003\004", 4));
-    if (format == "pdf") return head.startsWith("%PDF-");
-    if (format == "djvu") return head.startsWith("AT&TFORM");
-    if (format == "fb2") {
-        QXmlStreamReader xml(&file);
-        if (!xml.readNextStartElement() || xml.name() != QStringLiteral("FictionBook")) return false;
-        while (!xml.atEnd()) xml.readNext();
-        return !xml.hasError();
-    }
-    return !head.isEmpty();
-}
 bool validId(const QString &id) {
     static const QRegularExpression pattern("^[1-9][0-9]*$");
     bool ok = false;
     const qlonglong number = id.toLongLong(&ok);
     return pattern.match(id).hasMatch() && ok && number <= 2147483647;
-}
-QByteArray digestFile(const QString &path) {
-    QFile file(path);
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    return file.open(QIODevice::ReadOnly) && hash.addData(&file) ? hash.result().toHex() : QByteArray{};
 }
 bool storagePath(const QString &path) {
     if (path != QDir::cleanPath(path) || path.contains(QChar::Null)) return false;
@@ -192,8 +171,30 @@ Client::Client(QUrl server, QString root, QObject *parent, bool restoreAccount)
                QCoreApplication::translate("BookOrbit", ". Check free space and access to device storage."), false, "storage");
 }
 
+void Client::startFileOperation() {
+    ++fileGeneration;
+    if (fileTask) fileTask->store(true);
+    fileTask.reset(); working=true;
+}
+Client::FileContext Client::fileContext(const QString &id,const QString &path) const {
+    return {fileGeneration,accountGeneration,id,path,readerProfile(),downloads.value(id).toObject()};
+}
+bool Client::acceptFileContext(const FileContext &context,const FileStamp &stamp) {
+    if (context.generation!=fileGeneration) return false;
+    const auto record=downloads.value(context.id).toObject();
+    bool same=context.account==accountGeneration && readerProfile()==context.profile;
+    for (const auto key:{"bookId","fileId","filename","format","sha256","bytes","directory"})
+        same=same && record[key]==context.record[key];
+    if (stamp.valid) same=same && fileStamp(context.path)==stamp;
+    if (!same) {
+        finish(QCoreApplication::translate("BookOrbit", "The file, profile or account changed. Retry the operation."),false,"file");
+        return false;
+    }
+    return true;
+}
+
 bool Client::prepareUpdate() {
-    if(working || downloading() || checkingLibrary || syncingAll) return false;
+    if(busy() || downloading() || checkingLibrary || syncingAll) return false;
     updateLocked=true; working=true; stopCovers(); notifyOperation(); return true;
 }
 void Client::cancelUpdate() {
@@ -201,7 +202,7 @@ void Client::cancelUpdate() {
 }
 
 bool Client::setLanguage(const QString &language) {
-    if (working || (language != "system" && !interfaceLanguages().contains(language))) return false;
+    if (busy() || (language != "system" && !interfaceLanguages().contains(language))) return false;
     auto preferences = readObject(rootDir+"/preferences.json");
     preferences["language"] = language;
     beginFeedback("settings");
@@ -218,6 +219,10 @@ bool Client::setLanguage(const QString &language) {
 }
 
 void Client::loadRecords() {
+    ++accountGeneration; ++recentsGeneration;
+    if (recentsTask) recentsTask->store(true);
+    if (cleanupTask) cleanupTask->store(true);
+    recentsScheduled=false; cleanupScheduled=false; cleanupPending=false; cleanupProofs.clear();
     const auto key = QCryptographicHash::hash((endpoint.toString()+"\n"+user).toUtf8(), QCryptographicHash::Sha256).toHex();
     scopeDir = rootDir + "/" + QString::fromLatin1(key.left(24));
     QDir().mkpath(scopeDir);
@@ -315,6 +320,9 @@ void Client::loadRecords() {
 }
 
 void Client::cleanupBooks(const QString &verifiedFile) {
+    if (!verifiedFile.isEmpty()) cleanupProofs[verifiedFile]={fileStamp(verifiedFile),true};
+    if (busy() || cleanupScheduled) { cleanupPending=true; return; }
+    cleanupPending=false;
     if (!canCleanupBooks || (activeDownload && !activeDownload->isFinished())) return;
     QSet<QString> referenced;
     for (auto it = downloads.begin(); it != downloads.end(); ++it)
@@ -348,10 +356,27 @@ void Client::cleanupBooks(const QString &verifiedFile) {
         const auto current = downloads.value(id).toObject();
         const bool registered = recordFile(id, current) == newFile;
         const QFileInfo info(newFile);
-        const bool confirmed = registered && current["sha256"] == next["sha256"] && current["bytes"] == next["bytes"] &&
+        const bool candidate=registered && current["sha256"]==next["sha256"] && current["bytes"]==next["bytes"] &&
             !current["invalid"].toBool() && info.isFile() && !info.isSymLink() &&
-            info.canonicalPath() == info.absolutePath() && info.size() == next["bytes"].toDouble() &&
-            (newFile == verifiedFile || digestFile(newFile) == next["sha256"].toString().toLatin1()) && validContent(newFile, next["format"].toString());
+            info.canonicalPath()==info.absolutePath() && info.size()==next["bytes"].toDouble();
+        auto proof=cleanupProofs.constFind(newFile);
+        if (candidate && (proof==cleanupProofs.cend() || proof->stamp!=fileStamp(newFile))) {
+            cleanupScheduled=true;
+            const auto account=accountGeneration;
+            cleanupTask=files.submit(this,[newFile,next](const FileCancellation &cancel) {
+                const auto before=fileStamp(newFile);
+                const bool valid=validContent(newFile,next["format"].toString(),cancel) &&
+                    digestFile(newFile,cancel)==next["sha256"].toString().toLatin1() && fileStamp(newFile)==before;
+                return CleanupProof{before,valid};
+            },[this,newFile,account](const CleanupProof &result,bool cancelled) {
+                if (account!=accountGeneration) return;
+                cleanupScheduled=false;
+                if (!cancelled) cleanupProofs[newFile]=result;
+                cleanupBooks();
+            });
+            return;
+        }
+        const bool confirmed=candidate && proof!=cleanupProofs.cend() && proof->valid;
         bool removed = false;
         if (!registered || confirmed) {
             const bool newRemoved = registered || removeUnused(newFile);
@@ -375,6 +400,7 @@ void Client::cleanupBooks(const QString &verifiedFile) {
         }
         removeUnused(path);
     }
+    cleanupProofs.clear();
 }
 
 void Client::removeCover(int bookId) {
@@ -624,13 +650,13 @@ void Client::stopSyncAfterCurrent() {
 }
 
 void Client::searchDownloaded(const QString &query) {
-    if (working || query.size()>500) return;
+    if (busy() || query.size()>500) return;
     if (libraryQuery==query) return;
     libraryQuery=query; invalidateLibrary(false); publishDataChanges();
 }
 
 void Client::setLocalSort(const QString &sort) {
-    if (working || !QStringList{"recent","title","author"}.contains(sort)) return;
+    if (busy() || !QStringList{"recent","title","author"}.contains(sort)) return;
     auto preferences=readObject(rootDir+"/preferences.json"); preferences["localSort"]=sort;
     beginFeedback("catalog");
     if (!writeObject(rootDir+"/preferences.json",preferences)) {
@@ -646,22 +672,24 @@ void Client::refreshRecents() {
     const auto profile=readerProfile();
     if (nativeRecents.profile!=profile) { nativeRecents={}; nativeRecents.profile=profile; invalidateLibrary(); invalidateSync(); detailPending=detailPending || detailVisible(); publishDataChanges(); }
     recentsRequested=true;
-    if (working || recentsScheduled) return;
-    recentsScheduled=true;
-    QTimer::singleShot(0,this,[this] {
+    if (busy() || recentsScheduled) return;
+    recentsScheduled=true; recentsRequested=false;
+    QStringList paths;
+    for (const auto value:downloads) {
+        const auto book=value.toObject()["book"].toObject();
+        const QString path=localFile(book);
+        if (!path.isEmpty() && readableFormat(fileFormat(book["selectedFile"].toObject()))) paths << path;
+    }
+    paths.removeDuplicates();
+    const auto generation=++recentsGeneration,account=accountGeneration;
+    recentsTask=files.submit(this,readerRecentsTask(paths,profile),[this,generation,account,profile](ReaderRecents result,bool cancelled) {
+        if (generation!=recentsGeneration) return;
         recentsScheduled=false;
-        if (working || !recentsRequested) return;
-        recentsRequested=false;
-        QStringList paths;
-        for (const auto value:downloads) {
-            const auto book=value.toObject()["book"].toObject();
-            const QString path=localFile(book);
-            if (!path.isEmpty() && readableFormat(fileFormat(book["selectedFile"].toObject()))) paths << path;
-        }
-        paths.removeDuplicates();
-        nativeRecents=readerRecents(paths);
-        // Refresh also observes externally removed files, even when native recents are unchanged.
-        invalidateLibrary(); invalidateSync(); detailPending=detailPending || detailVisible(); publishDataChanges();
+        if (!cancelled && account==accountGeneration && profile==readerProfile() && !busy()) {
+            nativeRecents=std::move(result);
+            invalidateLibrary(); invalidateSync(); detailPending=detailPending || detailVisible(); publishDataChanges();
+        } else recentsRequested=true;
+        if (recentsRequested && !busy()) refreshRecents();
     });
 }
 
@@ -688,7 +716,7 @@ QVariantMap Client::recentBook() const {
 }
 
 void Client::openFile(int fileId,bool applyIncoming) {
-    if (working) return;
+    if (busy()) return;
     const auto record=downloads.value(QString::number(fileId)).toObject();
     if (!record.isEmpty()) openBook(record["book"].toObject(),applyIncoming);
 }
@@ -792,13 +820,13 @@ QVariantMap Client::syncSummary() const {
 }
 
 void Client::syncFile(int fileId) {
-    if (working || !downloads.contains(QString::number(fileId))) return;
+    if (busy() || !downloads.contains(QString::number(fileId))) return;
     beginFeedback("sync",0,fileId);
     dismissConflict(); syncBook(QString::number(fileId));
 }
 
 void Client::showSyncFile(int fileId) {
-    if (working || !downloads.contains(QString::number(fileId))) return;
+    if (busy() || !downloads.contains(QString::number(fileId))) return;
     ++detailGeneration;
     detailBook=downloads.value(QString::number(fileId)).toObject()["book"].toObject();
     detailMessage=QCoreApplication::translate("BookOrbit", "Details saved on this device");
@@ -806,7 +834,7 @@ void Client::showSyncFile(int fileId) {
 }
 
 void Client::connectForSync() {
-    if (working) return;
+    if (busy()) return;
     beginFeedback("sync");
     if (ensureNetwork()) { feedbackResult="success"; message=QCoreApplication::translate("BookOrbit", "Network connected. Retry sync now."); emit feedbackChanged(); }
 }
@@ -817,29 +845,56 @@ void Client::prepareConflict(const QString &id,const QString &local,const QJsonO
     conflictMessage=downloads.value(id).toObject()["book"].toObject()["title"].toString();
     const auto record=downloads.value(id).toObject();
     const QString path=localFile(record["book"].toObject());
-    const bool sameFile=!path.isEmpty() && digestFile(path)==record["sha256"].toString().toLatin1();
-    bool other=false;
-    for (const auto key : {"pageNumber","positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
-            "koboLocationType","koboLocationValue","koboContentSourceProgressPercent","koreaderProgress","narrationPercentage","narrationUpdatedAt"})
-        if (remote.contains(key) && !remote[key].isNull()) other=true;
-    positionChoices.clear();
-    for (bool useLocal : {true,false}) {
-        QVariantMap context; double percentage=0;
-        const auto cfi=useLocal ? local : remote["cfi"].toString();
-        const bool valid=sameFile && bookPosition(path,cfi,&percentage,nullptr,&context);
-        context["source"]=useLocal ? QCoreApplication::translate("BookOrbit", "On this PocketBook") : QCoreApplication::translate("BookOrbit", "In BookOrbit");
-        context["local"]=useLocal;
-        context["percentage"]=valid ? QCoreApplication::translate("BookOrbit", "About %1% of the book").arg(QLocale().toString(percentage,'f',1)) : cfi.isEmpty() ? QCoreApplication::translate("BookOrbit", "No position saved yet") : QCoreApplication::translate("BookOrbit", "The position does not match this book");
-        context["canUse"]=valid && !(useLocal && other) && !record["remoteFileChanged"].toBool();
-        context["notice"]=useLocal && other ? QCoreApplication::translate("BookOrbit", "Upload stopped to preserve other server position data.") : QString{};
-        positionChoices.append(context);
-    }
+    if (conflictTask) conflictTask->store(true);
+    const auto generation=++conflictGeneration,account=accountGeneration;
+    conflictPreparing=true; positionChoices.clear();
     if (different) ++positionRevision;
-    emit conflictChanged();
+    notifyOperation(); emit conflictChanged();
+    conflictTask=files.submit(this,[path,local,remote,record](const FileCancellation &cancel) {
+        QVariantList choices;
+        const auto before=fileStamp(path);
+        for (bool useLocal:{true,false}) {
+            QVariantMap context; double percentage=0;
+            const auto cfi=useLocal ? local : remote["cfi"].toString();
+            const bool valid=!fileCancelled(cancel) && bookPosition(path,cfi,&percentage,nullptr,&context);
+            context["local"]=useLocal; context["valid"]=valid; context["percentageValue"]=percentage; context["empty"]=cfi.isEmpty();
+            choices.append(context);
+        }
+        const bool same=before.valid && digestFile(path,cancel)==record["sha256"].toString().toLatin1() && fileStamp(path)==before;
+        if (!same) for (auto &choice:choices) {
+            auto context=choice.toMap(); context["valid"]=false; context.remove("chapter"); context.remove("excerpt"); choice=context;
+        }
+        return std::make_pair(choices,before);
+    },[this,id,local,remote,profile,record,path,generation,account](const auto &result,bool cancelled) {
+        if (generation!=conflictGeneration) return;
+        conflictPreparing=false; conflictTask.reset();
+        if (!cancelled && account==accountGeneration && profile==readerProfile() && conflictId==id && conflictLocal==local &&
+            conflictRemote==remote && downloads.value(id).toObject()["sha256"]==record["sha256"] &&
+            downloads.value(id).toObject()["progress"]==record["progress"] && fileStamp(path)==result.second) {
+            bool other=false;
+            for (const auto key:{"pageNumber","positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
+                "koboLocationType","koboLocationValue","koboContentSourceProgressPercent","koreaderProgress","narrationPercentage","narrationUpdatedAt"})
+                if (remote.contains(key) && !remote[key].isNull()) other=true;
+            positionChoices=result.first;
+            for (auto &choice:positionChoices) {
+                auto context=choice.toMap(); const bool useLocal=context.take("local").toBool(),valid=context.take("valid").toBool();
+                const double percentage=context.take("percentageValue").toDouble(); const bool empty=context.take("empty").toBool();
+                context["local"]=useLocal;
+                context["source"]=useLocal ? QCoreApplication::translate("BookOrbit", "On this PocketBook") : QCoreApplication::translate("BookOrbit", "In BookOrbit");
+                context["percentage"]=valid ? QCoreApplication::translate("BookOrbit", "About %1% of the book").arg(QLocale().toString(percentage,'f',1)) : empty ? QCoreApplication::translate("BookOrbit", "No position saved yet") : QCoreApplication::translate("BookOrbit", "The position does not match this book");
+                context["canUse"]=valid && !(useLocal && other) && !record["remoteFileChanged"].toBool();
+                context["notice"]=useLocal && other ? QCoreApplication::translate("BookOrbit", "Upload stopped to preserve other server position data.") : QString{};
+                choice=context;
+            }
+        }
+        notifyOperation(); emit conflictChanged();
+        if (!busy() && recentsRequested) refreshRecents();
+        if (!busy() && cleanupPending) cleanupBooks();
+    });
 }
 
 void Client::inspectConflict(int fileId) {
-    if (working) return;
+    if (busy()) return;
     const QString id=QString::number(fileId);
     const auto progress=downloads.value(id).toObject()["progress"].toObject();
     if (!progress["conflictRemote"].isObject() || progress["profile"].toString()!=readerProfile()) return;
@@ -879,7 +934,7 @@ void Client::rememberFile(const QJsonObject &book) {
 }
 
 void Client::showDetail(int bookId) {
-    if (working || bookId <= 0) return;
+    if (busy() || bookId <= 0) return;
     for (const auto value : visibleItems(false)) {
         const auto book = value.toObject();
         if (book["id"].toInt() != bookId) continue;
@@ -915,7 +970,7 @@ void Client::showDetail(int bookId) {
 }
 
 void Client::refreshDetail() {
-    if (working || detailBook.isEmpty()) return;
+    if (busy() || detailBook.isEmpty()) return;
     if (!authenticated()) { detailMessage = QCoreApplication::translate("BookOrbit", "Sign in to load full details"); notifyOperation(); emit feedbackChanged(); emit detailChanged(); return; }
     beginFeedback("book",detailBook["id"].toInt(),detailBook["selectedFile"].toObject()["id"].toInt());
     const int id = detailBook["id"].toInt(), generation = detailGeneration;
@@ -959,7 +1014,7 @@ void Client::closeDetail() {
 }
 
 void Client::selectFile(int fileId) {
-    if (working || detailBook.isEmpty()) return;
+    if (busy() || detailBook.isEmpty()) return;
     for (const auto value : detailBook["files"].toArray()) {
         if (value.toObject()["id"].toInt() != fileId) continue;
         if (feedbackContext=="book" && feedbackFileId!=fileId && feedbackResult=="success") feedbackHidden=true;
@@ -971,7 +1026,7 @@ void Client::selectFile(int fileId) {
 }
 
 void Client::downloadSelected() {
-    if (working || detailBook.isEmpty()) return;
+    if (busy() || detailBook.isEmpty()) return;
     if (!authenticated()) { finish(QCoreApplication::translate("BookOrbit", "Sign in to download"), false, "download"); return; }
     downloadBook(detailBook);
 }
@@ -981,13 +1036,13 @@ void Client::openSelected(bool applyIncoming) {
 }
 
 void Client::syncSelected() {
-    if (working || detailBook.isEmpty()) return;
+    if (busy() || detailBook.isEmpty()) return;
     dismissConflict();
     syncBook(QString::number(detailBook["selectedFile"].toObject()["id"].toInt()));
 }
 
 void Client::showCollections() {
-    if (working) return;
+    if (busy()) return;
     beginFeedback("catalog");
     closeDetail(); stopCovers(); browseHistory.clear();
     collectionList = true; localView = false; activeCollection = 0; activeCollectionName.clear();
@@ -1014,7 +1069,7 @@ void Client::showCollections() {
 }
 
 void Client::openCollection(int id, const QString &name, double catalogOffset, double detailOffset) {
-    if (working || id <= 0) return;
+    if (busy() || id <= 0) return;
     if (detailVisible() && id == activeCollection) { closeDetail(); return; }
     if (detailVisible()) {
         if (browseHistory.size() == 16) browseHistory.removeFirst();
@@ -1030,7 +1085,7 @@ void Client::openCollection(int id, const QString &name, double catalogOffset, d
 }
 
 QVariantMap Client::backFromCollection() {
-    if (working || browseHistory.isEmpty()) return {};
+    if (busy() || browseHistory.isEmpty()) return {};
     const auto saved = browseHistory.takeLast();
     stopCovers(); ++detailGeneration;
     detailBook = saved["detail"].toObject(); items = saved["items"].toArray();
@@ -1043,12 +1098,19 @@ QVariantMap Client::backFromCollection() {
 }
 
 void Client::finish(QString text, bool success, const QString &operation, const QString &syncState) {
+    struct Maintenance {
+        Client *client;
+        ~Maintenance() { if (!client->busy() && client->cleanupPending) client->cleanupBooks(); }
+    } maintenance{this};
     auto previousBatch=syncBatch();
     auto publish=[this,&previousBatch] {
         notifyOperation(); emit feedbackChanged();
         if (syncBatch()!=previousBatch) emit syncBatchChanged();
         publishDataChanges();
     };
+    ++fileGeneration;
+    if (fileTask) fileTask->store(true);
+    fileTask.reset(); fileDownloading=false;
     working = syncingAll || checkingLibrary;
     activeDownload.clear();
     if (!success && retryKind == 3 && detailVisible()) { detailMessage = text; detailPending=true; }
@@ -1185,6 +1247,7 @@ bool Client::saveSession() {
 }
 
 void Client::invalidateSession() {
+    ++accountGeneration;
     token.clear(); refreshToken.clear(); sessionStored = false; sessionNotice.clear();
     stopCovers();
     const QString path = scopeDir+"/session.json";
@@ -1194,7 +1257,7 @@ void Client::invalidateSession() {
 }
 
 void Client::restoreSession() {
-    if (working || authenticated() || refreshToken.isEmpty()) return;
+    if (busy() || authenticated() || refreshToken.isEmpty()) return;
     beginFeedback("connection");
     working = true;
     message = QCoreApplication::translate("BookOrbit", "Restoring session…");
@@ -1224,6 +1287,7 @@ bool Client::ensureNetwork() {
 void Client::jsonRequest(const QString &path, const QJsonObject &payload, const Callback &callback, bool renew, bool get, bool arrayResponse) {
     if (checkingLibrary && verificationCancelled) { finish(QCoreApplication::translate("BookOrbit", "Verification cancelled"),false,"verify"); return; }
     if (!ensureNetwork()) return;
+    const auto generation=fileGeneration,account=accountGeneration;
     auto request = this->request(path);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     auto reply = get ? network.get(request) : network.post(request, QJsonDocument(payload).toJson(QJsonDocument::Compact));
@@ -1235,8 +1299,10 @@ void Client::jsonRequest(const QString &path, const QJsonObject &payload, const 
     });
     // Bound the whole operation as well as inactivity between packets.
     QTimer::singleShot(20000, reply, [reply] { if (!reply->isFinished()) reply->abort(); });
-    connect(reply, &QNetworkReply::finished, this, [this, reply, bytes, callback, path, payload, renew, get, arrayResponse] {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, bytes, callback, path, payload, renew, get, arrayResponse,generation,account] {
         reply->deleteLater();
+        if (generation!=fileGeneration) return;
+        if (account!=accountGeneration) { finish(QCoreApplication::translate("BookOrbit", "The file, profile or account changed. Retry the operation."),false,"file"); return; }
         if (activeVerification==reply) activeVerification.clear();
         if (checkingLibrary && verificationCancelled) { finish(QCoreApplication::translate("BookOrbit", "Verification cancelled"),false,"verify"); return; }
         bytes->append(reply->readAll());
@@ -1280,7 +1346,7 @@ void Client::jsonRequest(const QString &path, const QJsonObject &payload, const 
 }
 
 void Client::login(const QString &address, const QString &username, const QString &password) {
-    if (working) return;
+    if (busy()) return;
     beginFeedback("connection");
     QString normalized = address.trimmed();
     while (normalized.endsWith('/')) normalized.chop(1);
@@ -1309,7 +1375,7 @@ void Client::login(const QString &address, const QString &username, const QStrin
 }
 
 void Client::refresh(int targetPage, const QString &query) {
-    if (working) return;
+    if (busy()) return;
     if (targetPage < 0 || query.size() > 500) return;
     if (localView || collectionList) invalidateLibrary();
     collectionList = false;
@@ -1370,7 +1436,7 @@ void Client::refresh(int targetPage, const QString &query) {
 }
 
 void Client::download(int index) {
-    if (working) return;
+    if (busy()) return;
     const auto visible = visibleItems();
     if (index < 0 || index >= visible.size()) return;
     if (token.isEmpty()) { finish(QCoreApplication::translate("BookOrbit", "Sign in to download"), false, "download"); return; }
@@ -1444,10 +1510,12 @@ void Client::transferBook(const QJsonObject &book, bool renew) {
     const QString finalPath = directory+"/"+stem+"."+format;
     auto output = std::make_shared<QSaveFile>(staging);
     if (!output->open(QIODevice::WriteOnly)) { finish(QCoreApplication::translate("BookOrbit", "Could not create the book file"), false, "download"); return; }
-    working = true; cancelled = false; message = QCoreApplication::translate("BookOrbit", "Downloading book…");
+    startFileOperation(); fileDownloading=true; cancelled=false; message=QCoreApplication::translate("BookOrbit", "Downloading book…");
     auto request = this->request("/api/v1/books/files/"+QString::number(file["id"].toInt())+"/download");
     auto reply = network.get(request);
-    activeDownload = reply;
+    activeDownload = reply; reply->setReadBufferSize(65536);
+    const auto generation=fileGeneration;
+    const auto transferContext=fileContext(id,oldFile);
     notifyOperation(); emit feedbackChanged();
     auto hash = std::make_shared<QCryptographicHash>(QCryptographicHash::Sha256);
     auto size = std::make_shared<qint64>(0);
@@ -1459,9 +1527,11 @@ void Client::transferBook(const QJsonObject &book, bool renew) {
     };
     connect(reply, &QNetworkReply::readyRead, this, drain);
     QTimer::singleShot(120000, reply, [reply] { if (!reply->isFinished()) reply->abort(); });
-    connect(reply, &QNetworkReply::finished, this, [this, reply, output, hash, size, expected, file, drain, book, id, oldFile, previous, staging, finalPath, stem, directory, renew, format] {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, output, hash, size, expected, file, drain, book, id, oldFile, previous, staging, finalPath, stem, directory, renew, format,generation,transferContext] {
+        if (generation!=fileGeneration) { output->cancelWriting(); reply->deleteLater(); return; }
         if (reply->bytesAvailable()) drain();
         reply->deleteLater();
+        if (!acceptFileContext(transferContext)) { output->cancelWriting(); return; }
         logEvent("download", int(reply->error()), reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt());
         if (cancelled) {
             output->cancelWriting(); retryKind = 0;
@@ -1488,62 +1558,88 @@ void Client::transferBook(const QJsonObject &book, bool renew) {
             finish(QCoreApplication::translate("BookOrbit", "The book is open in the built-in reader. Close it and retry the download."), false, "download"); return;
         }
         const QString newHash = QString::fromLatin1(hash->result().toHex());
-        if (downloads.value(id).toObject()["sha256"] == newHash &&
-            !localFile(book).isEmpty() && digestFile(oldFile) == newHash.toLatin1()) {
-            output->cancelWriting();
-            auto record=downloads.value(id).toObject();
-            if (record.contains("remoteFileChanged")) {
-                record.remove("remoteFileChanged");
-                record.remove("syncStatus");
-                if (!saveRecord(id,record)) {
-                    finish(QCoreApplication::translate("BookOrbit", "Could not save the download result. The previous book is still available."),false,"download"); return;
-                }
+        const auto context=transferContext;
+        message=QCoreApplication::translate("BookOrbit", "Checking the book file…"); emit feedbackChanged();
+        fileTask=files.submit(this,[oldFile](const FileCancellation &cancel) {
+            const auto before=fileStamp(oldFile); return std::make_pair(digestFile(oldFile,cancel),before);
+        },[this,context,output,book,id,oldFile,previous,staging,finalPath,stem,directory,format,newHash,size,file](const auto &result,bool wasCancelled) {
+            if (!acceptFileContext(context,result.second) || wasCancelled) { output->cancelWriting(); return; }
+            const auto oldStamp=result.second;
+            if ((QFile::exists(oldFile) || !previous.isEmpty()) && readerFileState(oldFile)!=ReaderFileState::Closed) {
+                output->cancelWriting(); finish(QCoreApplication::translate("BookOrbit", "Close the book in the built-in reader and retry the download"),false,"download"); return;
             }
-            clearSyncResult(id);
-            rememberFile(book);
-            finish(QCoreApplication::translate("BookOrbit", "Book already downloaded"), true, "download"); return;
-        }
-        QJsonObject record{{"bookId", book["id"]}, {"fileId", file["id"]}, {"filename", stem+"."+format}, {"format", format},
-                                 {"sha256", newHash}, {"bytes", double(*size)}, {"book", smallBook(book)}};
-        if (previous["sha256"].toString() == newHash && previous["format"].toString("epub") == format &&
-            previous["progress"].isObject()) record["progress"] = previous["progress"];
-        if (directory != scopeDir) record["directory"] = directory;
-        // Recovery needs file identity, not duplicated book metadata or progress.
-        auto identity = [](const QJsonObject &saved) {
-            QJsonObject result;
-            for (const auto key : {"fileId", "filename", "format", "sha256", "bytes", "directory"})
-                if (saved.contains(key)) result[key] = saved[key];
-            return result;
-        };
-        const QString transfers = scopeDir+"/transfers";
-        if (!QDir().mkpath(transfers) || !accessibleDirectory(transfers) ||
-            !writeObject(transfers+"/"+stem+".json", {{"fileId", file["id"]}, {"previous", identity(previous)}, {"next", identity(record)}})) {
-            output->cancelWriting();
-            finish(QCoreApplication::translate("BookOrbit", "Could not save the download journal. The previous book is still available."), false, "download"); return;
-        }
-        if (!accessibleDirectory(directory) || !sameStorage(scopeDir,directory) || !output->commit() ||
-            !validContent(staging, format) || !QFile::rename(staging, finalPath)) {
-            cleanupBooks();
-            finish(QCoreApplication::translate("BookOrbit", "Could not save the book"), false, "download"); return;
-        }
-        if (digestFile(finalPath) != newHash.toLatin1()) {
-            cleanupBooks();
-            finish(QCoreApplication::translate("BookOrbit", "The saved book is damaged. The previous book is still available."), false, "download"); return;
-        }
-        if (!saveRecord(id, record)) {
-            cleanupBooks();
-            finish(QCoreApplication::translate("BookOrbit", "Download record not saved. The previous book is still available."), false, "download"); return;
-        }
-        clearSyncResult(id);
-        rememberFile(book);
-        cleanupBooks(finalPath); // Its digest was verified immediately before saveRecord().
-        if (readableFormat(format)) scanBook(finalPath);
-        finish(QCoreApplication::translate("BookOrbit", "Book downloaded and available offline"), true, "download");
+            if (downloads.value(id).toObject()["sha256"] == newHash &&
+                !localFile(book).isEmpty() && result.first==newHash.toLatin1()) {
+                output->cancelWriting();
+                auto record=downloads.value(id).toObject();
+                if (record.contains("remoteFileChanged")) {
+                    record.remove("remoteFileChanged");
+                    record.remove("syncStatus");
+                    if (!saveRecord(id,record)) {
+                        finish(QCoreApplication::translate("BookOrbit", "Could not save the download result. The previous book is still available."),false,"download"); return;
+                    }
+                }
+                clearSyncResult(id);
+                rememberFile(book);
+                finish(QCoreApplication::translate("BookOrbit", "Book already downloaded"), true, "download"); return;
+            }
+            QJsonObject record{{"bookId", book["id"]}, {"fileId", file["id"]}, {"filename", stem+"."+format}, {"format", format},
+                                     {"sha256", newHash}, {"bytes", double(*size)}, {"book", smallBook(book)}};
+            if (previous["sha256"].toString() == newHash && previous["format"].toString("epub") == format &&
+                previous["progress"].isObject()) record["progress"] = previous["progress"];
+            if (directory != scopeDir) record["directory"] = directory;
+            // Recovery needs file identity, not duplicated book metadata or progress.
+            auto identity = [](const QJsonObject &saved) {
+                QJsonObject result;
+                for (const auto key : {"fileId", "filename", "format", "sha256", "bytes", "directory"})
+                    if (saved.contains(key)) result[key] = saved[key];
+                return result;
+            };
+            const QString transfers = scopeDir+"/transfers";
+            if (!QDir().mkpath(transfers) || !accessibleDirectory(transfers) ||
+                !writeObject(transfers+"/"+stem+".json", {{"fileId", file["id"]}, {"previous", identity(previous)}, {"next", identity(record)}})) {
+                output->cancelWriting();
+                finish(QCoreApplication::translate("BookOrbit", "Could not save the download journal. The previous book is still available."), false, "download"); return;
+            }
+            if (!accessibleDirectory(directory) || !sameStorage(scopeDir,directory) || !output->commit()) {
+                cleanupBooks(); finish(QCoreApplication::translate("BookOrbit", "Could not save the book"),false,"download"); return;
+            }
+            fileTask=files.submit(this,[staging,format](const FileCancellation &cancel) {
+                const auto before=fileStamp(staging);
+                return std::make_pair(validContent(staging,format,cancel),before);
+            },[this,context,oldStamp,oldFile,staging,finalPath,directory,id,record,book,newHash,format](const auto &validation,bool wasCancelled) {
+                if (!acceptFileContext(context,oldStamp) || wasCancelled) { cleanupBooks(); return; }
+                if (!validation.first || !validation.second.valid || fileStamp(staging)!=validation.second ||
+                    !accessibleDirectory(directory) || !sameStorage(scopeDir,directory) ||
+                    ((QFile::exists(oldFile) || !context.record.isEmpty()) && readerFileState(oldFile)!=ReaderFileState::Closed) ||
+                    !QFile::rename(staging,finalPath)) {
+                    cleanupBooks(); finish(QCoreApplication::translate("BookOrbit", "Could not save the book"),false,"download"); return;
+                }
+                fileTask=files.submit(this,[finalPath](const FileCancellation &cancel) {
+                    const auto before=fileStamp(finalPath); return std::make_pair(digestFile(finalPath,cancel),before);
+                },[this,context,oldStamp,oldFile,finalPath,id,record,book,newHash,format](const auto &validation,bool wasCancelled) {
+                    if (!acceptFileContext(context,oldStamp) || wasCancelled) { cleanupBooks(); return; }
+                    if (validation.first!=newHash.toLatin1() || !validation.second.valid || fileStamp(finalPath)!=validation.second ||
+                        ((QFile::exists(oldFile) || !context.record.isEmpty()) && readerFileState(oldFile)!=ReaderFileState::Closed)) {
+                        cleanupBooks(); finish(QCoreApplication::translate("BookOrbit", "The saved book is damaged. The previous book is still available."),false,"download"); return;
+                    }
+                    if (!saveRecord(id, record)) {
+                        cleanupBooks();
+                        finish(QCoreApplication::translate("BookOrbit", "Download record not saved. The previous book is still available."), false, "download"); return;
+                    }
+                    clearSyncResult(id);
+                    rememberFile(book);
+                    cleanupBooks(finalPath); // Its digest was verified immediately before saveRecord().
+                    if (readableFormat(format)) scanBook(finalPath);
+                    finish(QCoreApplication::translate("BookOrbit", "Book downloaded and available offline"), true, "download");
+                });
+            });
+        });
     });
 }
 
 void Client::open(int index, bool applyIncoming) {
-    if (working) return;
+    if (busy()) return;
     const auto visible = visibleItems();
     if (index < 0 || index >= visible.size()) return;
     openBook(visible[index].toObject(), applyIncoming);
@@ -1557,28 +1653,37 @@ void Client::openBook(const QJsonObject &book, bool applyIncoming) {
         finish(QCoreApplication::translate("BookOrbit", "File downloaded. Opening this format from the app is not supported yet."), false, "open"); return;
     }
     const QString id = QString::number(book["selectedFile"].toObject()["id"].toInt());
-    if (digestFile(path) != downloads.value(id).toObject()["sha256"].toString().toLatin1()) {
+    startFileOperation();
+    message=QCoreApplication::translate("BookOrbit", "Checking the book file…"); notifyOperation(); emit feedbackChanged();
+    const auto context=fileContext(id,path);
+    fileTask=files.submit(this,[path](const FileCancellation &cancel) {
+        const auto stamp=fileStamp(path); const auto digest=digestFile(path,cancel);
+        return std::make_pair(digest,stamp);
+    },[this,book,applyIncoming,path,id,context](const auto &result,bool cancelled) {
+        if (!acceptFileContext(context,result.second) || cancelled) return;
+        if (result.first != context.record["sha256"].toString().toLatin1()) {
+            auto record = downloads.value(id).toObject();
+            record["invalid"] = true;
+            if (!saveRecord(id, record)) storeRecord(id, record);
+            finish(QCoreApplication::translate("BookOrbit", "The book file has changed. Download it again."), false, "open"); return;
+        }
+        if (!readerBookIndexed(path)) {
+            scanBook(path);
+            finish(QCoreApplication::translate("BookOrbit", "The book is not registered in the library yet. Wait and tap Read again."), false, "open");
+            return;
+        }
         auto record = downloads.value(id).toObject();
-        record["invalid"] = true;
-        if (!saveRecord(id, record)) storeRecord(id, record);
-        finish(QCoreApplication::translate("BookOrbit", "The book file has changed. Download it again."), false, "open"); return;
-    }
-    if (!readerBookIndexed(path)) {
-        scanBook(path);
-        finish(QCoreApplication::translate("BookOrbit", "The book is not registered in the library yet. Wait and tap Read again."), false, "open");
-        return;
-    }
-    auto record = downloads.value(id).toObject();
-    auto sync = record["progress"].toObject();
-    const auto pending = sync["pending"].toObject();
-    if (applyIncoming && !pending.isEmpty()) {
-        finish(QCoreApplication::translate("BookOrbit", "The incoming position has not been applied yet. Sync the position or choose Read locally."),false,"open");
-        return;
-    }
+        auto sync = record["progress"].toObject();
+        const auto pending = sync["pending"].toObject();
+        if (applyIncoming && !pending.isEmpty()) {
+            finish(QCoreApplication::translate("BookOrbit", "The incoming position has not been applied yet. Sync the position or choose Read locally."),false,"open");
+            return;
+        }
 
-    const bool ok = openReader(path);
-    if (ok) rememberFile(book);
-    finish(ok ? QCoreApplication::translate("BookOrbit", "Opening in the built-in reader…") : QCoreApplication::translate("BookOrbit", "Could not start the reader"), ok, "open");
+        const bool ok = openReader(path);
+        if (ok) rememberFile(book);
+        finish(ok ? QCoreApplication::translate("BookOrbit", "Opening in the built-in reader…") : QCoreApplication::translate("BookOrbit", "Could not start the reader"), ok, "open");
+    });
 }
 
 QStringList Client::accounts() const {
@@ -1597,7 +1702,7 @@ bool Client::validDownloadDirectory(const QString &path) const {
 }
 
 bool Client::setDownloadDirectory(const QString &path) {
-    if (working) return false;
+    if (busy()) return false;
     beginFeedback("settings");
     if (!validDownloadDirectory(path)) {
         finish(QCoreApplication::translate("BookOrbit", "Choose an accessible folder in internal storage, outside system folders."), false, "settings"); return false;
@@ -1672,7 +1777,7 @@ QVariantList Client::directories(const QString &path) const {
 }
 
 bool Client::configure(const QString &address, const QString &name) {
-    if (working) return false;
+    if (busy()) return false;
     beginFeedback("connection");
     QString normalized = address.trimmed();
     while (normalized.endsWith('/')) normalized.chop(1);
@@ -1706,13 +1811,14 @@ bool Client::configure(const QString &address, const QString &name) {
 }
 
 void Client::selectAccount(int index) {
-    if (working || index < 0 || index >= savedAccounts.size()) return;
+    if (busy() || index < 0 || index >= savedAccounts.size()) return;
     const auto account = savedAccounts[index].toObject();
     configure(account["server"].toString(), account["username"].toString());
 }
 
 void Client::logout() {
-    if (working) return;
+    if (busy()) return;
+    ++accountGeneration;
     beginFeedback("connection");
     stopCovers();
     const QString credential = refreshToken;
@@ -1741,7 +1847,7 @@ void Client::logout() {
 }
 
 void Client::showDownloaded(bool value) {
-    if (working) return;
+    if (busy()) return;
     detailBook = {}; emit detailChanged(); ++detailGeneration; browseHistory.clear(); collectionList = false; activeCollection = 0; activeCollectionName.clear();
     if (!value) { refresh(); return; }
     localView = true;
@@ -1843,7 +1949,13 @@ QJsonArray Client::visibleItems(bool applyQuery) const {
 }
 
 void Client::cancelDownload() {
-    if (activeDownload) { cancelled = true; activeDownload->abort(); }
+    if (!downloading()) return;
+    cancelled=true;
+    if (fileTask) {
+        fileTask->store(true); cleanupBooks(); retryKind=0;
+        finish(QCoreApplication::translate("BookOrbit", "Download cancelled. The previous file was kept."),false,"download");
+    } else if (activeDownload) activeDownload->abort();
+    else { retryKind=0; finish(QCoreApplication::translate("BookOrbit", "Download cancelled. The previous file was kept."),false,"download"); }
 }
 
 void Client::retry() {
@@ -1907,29 +2019,38 @@ void Client::fetchNextCover() {
         if (reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 404) removeCover(id);
         if (reply->error() == QNetworkReply::NoError && bytes->size() <= maxJson &&
             reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200) {
-            QBuffer buffer(bytes.get()); buffer.open(QIODevice::ReadOnly);
-            QImageReader reader(&buffer);
-            const auto format = reader.format();
-            const auto size = reader.size();
-            if ((format == "png" || format == "jpeg" || format == "webp") && size.width() > 0 &&
-                size.height() > 0 && size.width() <= 2048 && size.height() <= 2048) {
-                reader.setScaledSize(size.scaled(240, 320, Qt::KeepAspectRatio));
-                const auto cover = reader.read();
-                QSaveFile file(path);
-                if (!cover.isNull() && file.open(QIODevice::WriteOnly) && cover.save(&file, "PNG") && file.commit()) {
-                    if (version.isEmpty()) coverVersions.remove(QString::number(id));
-                    else coverVersions[QString::number(id)]=version;
-                    writeObject(scopeDir+"/cover-index.json",coverVersions);
-                    coverRevisions[path]=++coverVersion; emit coversChanged();
-                    cleanupCovers();
+            const auto account=accountGeneration;
+            files.submit(this,[data=*bytes](const FileCancellation &cancel) {
+                QByteArray source=data,encoded;
+                QBuffer buffer(&source); buffer.open(QIODevice::ReadOnly); QImageReader reader(&buffer);
+                const auto format=reader.format(); const auto size=reader.size();
+                if (!fileCancelled(cancel) && (format=="png" || format=="jpeg" || format=="webp") &&
+                    size.width()>0 && size.height()>0 && size.width()<=2048 && size.height()<=2048) {
+                    reader.setScaledSize(size.scaled(240,320,Qt::KeepAspectRatio)); const auto cover=reader.read();
+                    QBuffer output(&encoded); output.open(QIODevice::WriteOnly);
+                    if (fileCancelled(cancel) || cover.isNull() || !cover.save(&output,"PNG")) encoded.clear();
                 }
-            }
+                return encoded;
+            },[this,path,id,version,generation,account](const QByteArray &encoded,bool cancelled) {
+                if (generation!=coverGeneration || account!=accountGeneration) return;
+                QSaveFile file(path);
+                if (!cancelled && !encoded.isEmpty() && file.open(QIODevice::WriteOnly) && file.write(encoded)==encoded.size() && file.commit()) {
+                    if (version.isEmpty()) coverVersions.remove(QString::number(id)); else coverVersions[QString::number(id)]=version;
+                    writeObject(scopeDir+"/cover-index.json",coverVersions);
+                    coverRevisions[path]=++coverVersion; emit coversChanged(); cleanupCovers();
+                }
+                fetchNextCover();
+            });
+            return;
         }
         fetchNextCover();
     });
 }
 
 void Client::dismissConflict() {
+    ++conflictGeneration;
+    if (conflictTask) conflictTask->store(true);
+    conflictTask.reset(); conflictPreparing=false; notifyOperation();
     if (conflictId.isEmpty() && conflictMessage.isEmpty() && positionChoices.isEmpty()) return;
     conflictId.clear(); conflictProfile.clear(); conflictLocal.clear(); conflictRemote={}; conflictMessage.clear();
     positionChoices.clear();
@@ -1937,7 +2058,7 @@ void Client::dismissConflict() {
 }
 
 void Client::syncAll() {
-    if (working) return;
+    if (busy()) return;
     beginFeedback("sync");
     if (!authenticated()) { finish(QCoreApplication::translate("BookOrbit", "Sign in to sync"),false,"sync"); return; }
     syncQueue.clear();
@@ -1952,11 +2073,11 @@ void Client::syncAll() {
 }
 
 void Client::resolveProgress(bool useLocal) {
-    if (!working && !conflictId.isEmpty()) syncBook(conflictId,useLocal?1:2);
+    if (!busy() && !conflictId.isEmpty()) syncBook(conflictId,useLocal?1:2);
 }
 
 void Client::verifyLibrary() {
-    if (working) return;
+    if (busy()) return;
     beginFeedback("settings");
     if (!authenticated()) { finish(QCoreApplication::translate("BookOrbit", "Sign in to verify library files"),false,"verify"); return; }
     syncQueue=downloads.keys();
@@ -1971,6 +2092,11 @@ void Client::verifyLibrary() {
 void Client::cancelLibraryVerification() {
     if (!checkingLibrary) return;
     verificationCancelled=true;
+    if (fileTask) {
+        fileTask->store(true);
+        finish(QCoreApplication::translate("BookOrbit", "Verification cancelled"),false,"verify");
+        return;
+    }
     if (activeVerification) activeVerification->abort();
     // Between files the queued continuation completes cancellation before starting another file.
 }
@@ -1987,18 +2113,28 @@ void Client::verifyBook(const QString &id) {
         .arg(record["format"].toString("epub").toUpper(),id);
     notifyOperation(); emit feedbackChanged();
     if (verificationCancelled) { finish(QCoreApplication::translate("BookOrbit", "Verification cancelled"),false,"verify"); return; }
-    if (path.isEmpty() || !info.isFile() || info.isSymLink() || info.canonicalPath()!=info.absolutePath() ||
-        info.size()!=record["bytes"].toDouble() || digestFile(path)!=record["sha256"].toString().toLatin1()) {
-        finish(QCoreApplication::translate("BookOrbit", "Could not verify: the local file is missing or damaged. Download it again."),false,"verify"); return;
-    }
-    verifyRemoteFile(id);
+    startFileOperation();
+    const auto context=fileContext(id,path);
+    fileTask=files.submit(this,[path](const FileCancellation &cancel) {
+        const auto stamp=fileStamp(path); return std::make_pair(digestFile(path,cancel),stamp);
+    },[this,id,path,info,record,context](const auto &result,bool cancelled) {
+        if (!acceptFileContext(context,result.second) || cancelled) return;
+        if (path.isEmpty() || !info.isFile() || info.isSymLink() || info.canonicalPath()!=info.absolutePath() ||
+            info.size()!=record["bytes"].toDouble() || result.first!=record["sha256"].toString().toLatin1()) {
+            finish(QCoreApplication::translate("BookOrbit", "Could not verify: the local file is missing or damaged. Download it again."),false,"verify"); return;
+        }
+        fileTask.reset();
+        verifyRemoteFile(id);
+    });
 }
 
 void Client::verifyRemoteFile(const QString &id, bool renew) {
     if (verificationCancelled) { finish(QCoreApplication::translate("BookOrbit", "Verification cancelled"),false,"verify"); return; }
     if (!ensureNetwork()) return;
+    const auto generation=fileGeneration;
+    const auto context=fileContext(id,recordFile(id,downloads.value(id).toObject()));
     auto reply=network.get(request("/api/v1/books/files/"+id+"/download"));
-    activeVerification=reply;
+    activeVerification=reply; reply->setReadBufferSize(65536);
     auto hash=std::make_shared<QCryptographicHash>(QCryptographicHash::Sha256);
     auto size=std::make_shared<qint64>(0);
     auto drain=[reply,hash,size] {
@@ -2009,8 +2145,10 @@ void Client::verifyRemoteFile(const QString &id, bool renew) {
     };
     connect(reply,&QNetworkReply::readyRead,this,drain);
     QTimer::singleShot(120000,reply,[reply] { if (!reply->isFinished()) reply->abort(); });
-    connect(reply,&QNetworkReply::finished,this,[this,reply,id,renew,drain,hash,size] {
+    connect(reply,&QNetworkReply::finished,this,[this,reply,id,renew,drain,hash,size,generation,context] {
         drain(); reply->deleteLater();
+        if (generation!=fileGeneration) return;
+        if (!acceptFileContext(context)) return;
         activeVerification.clear();
         if (verificationCancelled) { finish(QCoreApplication::translate("BookOrbit", "Verification cancelled"),false,"verify"); return; }
         const int code=reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -2028,24 +2166,29 @@ void Client::verifyRemoteFile(const QString &id, bool renew) {
             finish(QCoreApplication::translate("BookOrbit", "Could not verify the server file")+(code>=400 ? QString(" (HTTP %1)").arg(code) : QString{})+".",false,"verify"); return;
         }
         auto record=downloads.value(id).toObject();
-        const auto path=recordFile(id,record);
-        if (digestFile(path)!=record["sha256"].toString().toLatin1()) {
-            finish(QCoreApplication::translate("BookOrbit", "Could not verify: the local file changed during verification."),false,"verify"); return;
-        }
-        const bool different=hash->result().toHex()!=record["sha256"].toString().toLatin1();
-        if (different) record["remoteFileChanged"]=true;
-        else record.remove("remoteFileChanged");
-        if (record!=downloads.value(id).toObject() && !saveRecord(id,record)) {
-            if (different) storeRecord(id,record); // Keep the known mismatch blocked in memory even when storage fails.
-            finish(QCoreApplication::translate("BookOrbit", "Could not save the verification result. Resolve the storage error and try again."),false,"verify"); return;
-        }
-        finish(different ? QCoreApplication::translate("BookOrbit", "The server file differs. Progress sync is paused") : QCoreApplication::translate("BookOrbit", "The local file matches BookOrbit"),
-               !different,different ? "verify-different" : "verify");
+        const auto path=recordFile(id,record),remoteDigest=QString::fromLatin1(hash->result().toHex());
+        fileTask=files.submit(this,[path](const FileCancellation &cancel) {
+            const auto stamp=fileStamp(path); return std::make_pair(digestFile(path,cancel),stamp);
+        },[this,id,record,remoteDigest,context](const auto &result,bool cancelled) mutable {
+            if (!acceptFileContext(context,result.second) || cancelled) return;
+            if (result.first!=record["sha256"].toString().toLatin1()) {
+                finish(QCoreApplication::translate("BookOrbit", "Could not verify: the local file changed during verification."),false,"verify"); return;
+            }
+            const bool different=remoteDigest.toLatin1()!=record["sha256"].toString().toLatin1();
+            if (different) record["remoteFileChanged"]=true;
+            else record.remove("remoteFileChanged");
+            if (record!=downloads.value(id).toObject() && !saveRecord(id,record)) {
+                if (different) storeRecord(id,record); // Keep the known mismatch blocked in memory even when storage fails.
+                finish(QCoreApplication::translate("BookOrbit", "Could not save the verification result. Resolve the storage error and try again."),false,"verify"); return;
+            }
+            finish(different ? QCoreApplication::translate("BookOrbit", "The server file differs. Progress sync is paused") : QCoreApplication::translate("BookOrbit", "The local file matches BookOrbit"),
+                   !different,different ? "verify-different" : "verify");
+        });
     });
 }
 
 void Client::syncBook(const QString &id, int choice) {
-    if (working) return;
+    if (busy()) return;
     if (!syncingAll) beginFeedback(detailVisible() ? "book" : "sync", downloads.value(id).toObject()["bookId"].toInt(),id.toInt());
     syncingId=id;
     if (!authenticated()) { finish(QCoreApplication::translate("BookOrbit", "Sign in to sync"),false,"progress","auth"); return; }
@@ -2059,8 +2202,11 @@ void Client::syncBook(const QString &id, int choice) {
     const QString path=localFile(record["book"].toObject());
     QString position;
     const QString profile=readerProfile();
-    if (path.isEmpty() || digestFile(path)!=record["sha256"].toString().toLatin1()) {
-        invalidateLibrary(); invalidateSync(); detailPending=detailPending || detailVisible();
+    startFileOperation(); retryKind=0; stopCovers();
+    message=syncingAll ? QCoreApplication::translate("BookOrbit", "Checking file %1 of %2: %3…").arg(syncCount-syncQueue.size()).arg(syncCount)
+        .arg(record["book"].toObject()["title"].toString()) : QCoreApplication::translate("BookOrbit", "Syncing progress…");
+    notifyOperation(); emit feedbackChanged();
+    if (path.isEmpty()) {
         finish(QCoreApplication::translate("BookOrbit", "Download a valid book file before syncing"),false,"progress","file"); return;
     }
     const auto reader=readerFileState(path);
@@ -2070,126 +2216,175 @@ void Client::syncBook(const QString &id, int choice) {
     if (reader==ReaderFileState::Unknown || !readerPosition(path,&position)) {
         finish(QCoreApplication::translate("BookOrbit", "Could not check the reader state. Positions were kept unchanged; try again."),false,"progress","reader_unknown"); return;
     }
-    if (record["format"].toString()=="fb2" && bookCfi(path,"pbr:/word?page=0").isEmpty()) {
-        finish(QCoreApplication::translate("BookOrbit", "This FB2 structure is not supported for sync yet. Images, tables, poetry and long sections require additional validation. You can still read the original file."),false,"progress","position"); return;
-    }
-    const QString local=bookCfi(path,position);
-    if ((!position.isEmpty() && local.isEmpty()) || (!local.isEmpty() && !bookPosition(path,local,nullptr))) {
-        finish(QCoreApplication::translate("BookOrbit", "The local position format is unsupported. Progress was kept unchanged."),false,"progress","position"); return;
-    }
-    working=true; retryKind=0; stopCovers();
-    message=syncingAll ? QCoreApplication::translate("BookOrbit", "Checking file %1 of %2: %3…").arg(syncCount-syncQueue.size()).arg(syncCount)
-        .arg(record["book"].toObject()["title"].toString()) : QCoreApplication::translate("BookOrbit", "Syncing progress…");
-    notifyOperation(); emit feedbackChanged();
-    const QString route="/api/v1/books/files/"+id+"/progress";
-    // ponytail: trust the downloaded file identity; explicit library verification detects server replacements.
-        jsonRequest(route,{},[this,id,path,position,local,choice,route,profile](const QJsonObject &remote) {
+    struct LocalCheck { QByteArray digest; FileStamp stamp; QString local; bool supported=true,valid=false; };
+    const auto context=fileContext(id,path);
+    fileTask=files.submit(this,[path,position,format=record["format"].toString()](const FileCancellation &cancel) {
+        LocalCheck result; result.stamp=fileStamp(path);
+        if (format=="fb2") result.supported=fb2Calibration(cancel).valid && !bookCfi(path,"pbr:/word?page=0").isEmpty();
+        if (result.supported && !fileCancelled(cancel)) {
+            result.local=bookCfi(path,position);
+            result.valid=(position.isEmpty() || !result.local.isEmpty()) &&
+                (result.local.isEmpty() || bookPosition(path,result.local,nullptr));
+        }
+        result.digest=digestFile(path,cancel);
+        return result;
+    },[this,id,path,position,choice,profile,context](const LocalCheck &result,bool cancelled) {
+        if (!acceptFileContext(context,result.stamp) || cancelled) return;
+        if (result.digest!=context.record["sha256"].toString().toLatin1()) {
+            invalidateLibrary(); invalidateSync(); detailPending=detailPending || detailVisible();
+            finish(QCoreApplication::translate("BookOrbit", "Download a valid book file before syncing"),false,"progress","file"); return;
+        }
+        QString current;
+        if (readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position) {
+            finish(QCoreApplication::translate("BookOrbit", "The reader state has changed. Retry sync."),false,"progress"); return;
+        }
+        if (!result.supported) {
+            finish(QCoreApplication::translate("BookOrbit", "This FB2 structure is not supported for sync yet. Images, tables, poetry and long sections require additional validation. You can still read the original file."),false,"progress","position"); return;
+        }
+        if (!result.valid) {
+            finish(QCoreApplication::translate("BookOrbit", "The local position format is unsupported. Progress was kept unchanged."),false,"progress","position"); return;
+        }
+        const QString local=result.local;
+        const QString route="/api/v1/books/files/"+id+"/progress";
+        // shortcut: trust the downloaded file identity; explicit library verification detects server replacements.
+        jsonRequest(route,{},[this,id,path,position,local,choice,route,profile,context](const QJsonObject &remote) {
+            if (!acceptFileContext(context)) return;
             QString current;
             if (readerProfile()!=profile || readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position) {
                 finish(QCoreApplication::translate("BookOrbit", "The reader state has changed. Retry sync."),false,"progress"); return;
             }
-            if (digestFile(path)!=downloads.value(id).toObject()["sha256"].toString().toLatin1()) {
-                finish(QCoreApplication::translate("BookOrbit", "The local book file changed during sync. Progress was kept unchanged."),false,"progress","file"); return;
-            }
             const QString remoteCfi=remote["cfi"].toString();
-            QString cfi=remoteCfi;
             const auto percent=remote["percentage"];
             if (!remote.contains("cfi") || (!remote["cfi"].isNull() && !remote["cfi"].isString()) ||
                 !percent.isDouble() || percent.toDouble()<0 || percent.toDouble()>100) {
                 finish(QCoreApplication::translate("BookOrbit", "Invalid progress response: expected a CFI and a percentage from 0 to 100. Progress was kept unchanged."),false,"progress"); return;
             }
-            if (!cfi.isEmpty() && !bookPosition(path,remoteCfi,nullptr,&cfi)) {
-                finish(QCoreApplication::translate("BookOrbit", "Could not match the server CFI to this book. Progress was kept unchanged."),false,"progress","position"); return;
-            }
-            bool other=false;
-            for (const auto key : {"positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
-                                  "koboLocationType","koboLocationValue","koboContentSourceProgressPercent","koreaderProgress","narrationPercentage","narrationUpdatedAt"})
-                if (remote.contains(key) && !remote[key].isNull()) other=true;
-            const bool hasPage=remote.contains("pageNumber") && !remote["pageNumber"].isNull();
-            const bool remoteEmpty=cfi.isEmpty() && percent.toDouble()==0 && !hasPage && !other;
-            if (cfi.isEmpty() && !remoteEmpty) {
-                finish(QCoreApplication::translate("BookOrbit", "The server has progress without an exact CFI. Automatic sync is not possible."),false,"progress","position"); return;
-            }
-            auto record=downloads.value(id).toObject(); auto state=record["progress"].toObject();
-            if (state.contains("profile") && state["profile"].toString()!=profile) state={};
-            const auto pending=state["pending"].toObject();
-            auto persist=[this,id,profile,&record,&state] {
-                state["profile"]=profile;
-                record["progress"]=state;
-                if (saveRecord(id,record)) return true;
-                finish(QCoreApplication::translate("BookOrbit", "Could not save progress. Retry sync."),false,"progress"); return false;
+            struct RemoteCheck {
+                QByteArray digest; FileStamp stamp; QString point; bool valid=true,equal=false,localBaseEqual=false,remoteBaseEqual=false,estimate=false;
+                double percentage=0; PreparedReaderPosition prepared;
             };
-            auto acknowledge=[&] {
-                state={{"localBase",local},{"remoteBase",remote}};
-                if (persist()) { dismissConflict(); finish(QCoreApplication::translate("BookOrbit", "Progress synced"),true,"progress"); }
-            };
-            const auto equivalent=[&path](const QString &a,const QString &b,bool range=false) {
-                return a==b || sameBookPosition(path,a,b,range);
-            };
-            if (equivalent(local,cfi)) { acknowledge(); return; }
-            const bool known=state.contains("profile") && state["profile"].toString()==profile &&
-                state.contains("localBase") && state["remoteBase"].isObject();
-            const bool localChanged=known ? !equivalent(local,state["localBase"].toString()) : !local.isEmpty();
-            const bool remoteChanged=known ? !equivalent(remoteCfi,state["remoteBase"].toObject()["cfi"].toString(),true) : !remoteEmpty;
-            int action=0;
-            const bool changedChoice=choice && (conflictId!=id || conflictProfile!=profile || conflictLocal!=local || conflictRemote!=remote);
-            if (changedChoice) action=0; // A stale explicit choice must never become an automatic write.
-            else if (choice) action=choice;
-            else if (state.contains("profile") && !pending.isEmpty() && pending==remote && state["pendingLocal"].toString()==local && state["profile"].toString()==profile) action=2;
-            else {
-                switch (decideSync(known,localChanged,remoteChanged)) {
-                case SyncDecision::Upload: action=1; break;
-                case SyncDecision::ApplyRemote: action=2; break;
-                case SyncDecision::Unchanged:
-                    if (persist()) finish(QCoreApplication::translate("BookOrbit", "Progress unchanged"),true,"progress");
-                    return;
-                case SyncDecision::Conflict: break;
-                }
-            }
-            if (!action) {
-                // Persist both versions; after restart the next GET rechecks the conflict.
-                state["conflictLocal"]=local; state["conflictRemote"]=remote;
-                if (!persist()) return;
-                if (!syncingAll) prepareConflict(id,local,remote,profile);
-                finish(changedChoice ? QCoreApplication::translate("BookOrbit", "The position changed while you were choosing. Review the choices again.") : QCoreApplication::translate("BookOrbit", "Choose a reading position"),false,"progress","conflict"); return;
-            }
-            if (action==2) {
-                if (cfi.isEmpty()) { finish(QCoreApplication::translate("BookOrbit", "The server has no exact position to open."),false,"progress"); return; }
-                // Journal before native mutation; failed writes do not advance the agreed baseline.
-                state["pending"]=remote; state["pendingLocal"]=local;
-                if (!persist()) return;
-                QString error;
-                if (!saveReaderPosition(path,position,cfi,profile,&error)) {
-                    finish(error,false,"progress","pending"); return;
-                }
-                state={{"localBase",cfi},{"remoteBase",remote}};
-                if (persist()) { dismissConflict(); finish(QCoreApplication::translate("BookOrbit", "Position saved. Open the book from the built-in library."),true,"progress"); }
-                return;
-            }
-            if (local.isEmpty() || other || hasPage) {
-                finish(hasPage ? QCoreApplication::translate("BookOrbit", "The server position includes a page number. Upload stopped to preserve it.") :
-                       other ? QCoreApplication::translate("BookOrbit", "The server record contains other reading coordinates. Upload stopped to preserve them.") :
-                               QCoreApplication::translate("BookOrbit", "No exact position on the reader yet."),false,"progress"); return;
-            }
-            double percentage=0;
-            if (!bookPosition(path,local,&percentage)) {
-                finish(QCoreApplication::translate("BookOrbit", "The position was recognized, but the book percentage could not be estimated for upload. Positions were kept unchanged."),
-                       false,"progress","position"); return;
-            }
-            // Save before POST. An uncertain result is reconciled by the next GET, never blindly retried.
-            const QJsonObject outgoing{{"source","text"},{"cfi",local},{"pageNumber",QJsonValue::Null},{"percentage",percentage}};
-            state["outgoing"]=outgoing;
-            if (!persist()) return;
-            jsonRequest(route,outgoing,[this,id,local,route,profile](const QJsonObject &) {
-                jsonRequest(route,{},[this,id,local,profile](const QJsonObject &confirmed) {
-                    if (confirmed["cfi"].toString()!=local) {
-                        finish(QCoreApplication::translate("BookOrbit", "The server position changed after upload. Check again."),false,"progress"); return;
+            const auto progress=downloads.value(id).toObject()["progress"].toObject();
+            fileTask=files.submit(this,[path,local,remoteCfi,progress,choice](const FileCancellation &cancel) {
+                RemoteCheck result; result.stamp=fileStamp(path); result.point=remoteCfi;
+                if (!remoteCfi.isEmpty()) result.valid=bookPosition(path,remoteCfi,nullptr,&result.point);
+                if (result.valid && !fileCancelled(cancel)) {
+                    result.equal=local==result.point || sameBookPosition(path,local,result.point);
+                    if (!result.equal) {
+                        const auto localBase=progress["localBase"].toString();
+                        const auto remoteBase=progress["remoteBase"].toObject()["cfi"].toString();
+                        result.localBaseEqual=local==localBase || sameBookPosition(path,local,localBase);
+                        result.remoteBaseEqual=remoteCfi==remoteBase || sameBookPosition(path,remoteCfi,remoteBase,true);
+                        if (choice!=2 && !local.isEmpty()) result.estimate=bookPosition(path,local,&result.percentage);
+                        if (choice!=1 && !result.point.isEmpty()) result.prepared=prepareReaderPosition(path,result.point,cancel);
                     }
-                    auto record=downloads.value(id).toObject();
-                    record["progress"]=QJsonObject{{"localBase",local},{"remoteBase",confirmed},{"profile",profile}};
-                    if (!saveRecord(id,record)) { finish(QCoreApplication::translate("BookOrbit", "Uploaded, but the result could not be saved. Check again."),false,"progress"); return; }
-                    dismissConflict(); finish(QCoreApplication::translate("BookOrbit", "Progress sent to BookOrbit"),true,"progress");
-                },true,true);
+                }
+                result.digest=digestFile(path,cancel);
+                return result;
+            },[this,id,path,position,local,choice,route,profile,remote,remoteCfi,percent,context,progress](const RemoteCheck &analysis,bool cancelled) {
+                if (!acceptFileContext(context,analysis.stamp) || cancelled) return;
+                QString current;
+                if (readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position ||
+                    downloads.value(id).toObject()["progress"].toObject()!=progress) {
+                    finish(QCoreApplication::translate("BookOrbit", "The reader state has changed. Retry sync."),false,"progress"); return;
+                }
+                if (analysis.digest!=context.record["sha256"].toString().toLatin1()) {
+                    finish(QCoreApplication::translate("BookOrbit", "The local book file changed during sync. Progress was kept unchanged."),false,"progress","file"); return;
+                }
+                if (!analysis.valid) {
+                    finish(QCoreApplication::translate("BookOrbit", "Could not match the server CFI to this book. Progress was kept unchanged."),false,"progress","position"); return;
+                }
+                const QString cfi=analysis.point;
+                bool other=false;
+                for (const auto key : {"positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
+                                      "koboLocationType","koboLocationValue","koboContentSourceProgressPercent","koreaderProgress","narrationPercentage","narrationUpdatedAt"})
+                    if (remote.contains(key) && !remote[key].isNull()) other=true;
+                const bool hasPage=remote.contains("pageNumber") && !remote["pageNumber"].isNull();
+                const bool remoteEmpty=cfi.isEmpty() && percent.toDouble()==0 && !hasPage && !other;
+                if (cfi.isEmpty() && !remoteEmpty) {
+                    finish(QCoreApplication::translate("BookOrbit", "The server has progress without an exact CFI. Automatic sync is not possible."),false,"progress","position"); return;
+                }
+                auto record=downloads.value(id).toObject(); auto state=record["progress"].toObject();
+                if (state.contains("profile") && state["profile"].toString()!=profile) state={};
+                const auto pending=state["pending"].toObject();
+                auto persist=[this,id,profile,&record,&state] {
+                    state["profile"]=profile;
+                    record["progress"]=state;
+                    if (saveRecord(id,record)) return true;
+                    finish(QCoreApplication::translate("BookOrbit", "Could not save progress. Retry sync."),false,"progress"); return false;
+                };
+                auto acknowledge=[&] {
+                    state={{"localBase",local},{"remoteBase",remote}};
+                    if (persist()) { dismissConflict(); finish(QCoreApplication::translate("BookOrbit", "Progress synced"),true,"progress"); }
+                };
+                if (analysis.equal) { acknowledge(); return; }
+                const bool known=state.contains("profile") && state["profile"].toString()==profile &&
+                    state.contains("localBase") && state["remoteBase"].isObject();
+                const bool localChanged=known ? !analysis.localBaseEqual : !local.isEmpty();
+                const bool remoteChanged=known ? !analysis.remoteBaseEqual : !remoteEmpty;
+                int action=0;
+                const bool changedChoice=choice && (conflictId!=id || conflictProfile!=profile || conflictLocal!=local || conflictRemote!=remote);
+                if (changedChoice) action=0; // A stale explicit choice must never become an automatic write.
+                else if (choice) action=choice;
+                else if (state.contains("profile") && !pending.isEmpty() && pending==remote && state["pendingLocal"].toString()==local && state["profile"].toString()==profile) action=2;
+                else {
+                    switch (decideSync(known,localChanged,remoteChanged)) {
+                    case SyncDecision::Upload: action=1; break;
+                    case SyncDecision::ApplyRemote: action=2; break;
+                    case SyncDecision::Unchanged:
+                        if (persist()) finish(QCoreApplication::translate("BookOrbit", "Progress unchanged"),true,"progress");
+                        return;
+                    case SyncDecision::Conflict: break;
+                    }
+                }
+                if (!action) {
+                    // Persist both versions; after restart the next GET rechecks the conflict.
+                    state["conflictLocal"]=local; state["conflictRemote"]=remote;
+                    if (!persist()) return;
+                    if (!syncingAll) prepareConflict(id,local,remote,profile);
+                    finish(changedChoice ? QCoreApplication::translate("BookOrbit", "The position changed while you were choosing. Review the choices again.") : QCoreApplication::translate("BookOrbit", "Choose a reading position"),false,"progress","conflict"); return;
+                }
+                if (action==2) {
+                    if (cfi.isEmpty()) { finish(QCoreApplication::translate("BookOrbit", "The server has no exact position to open."),false,"progress"); return; }
+                    // Journal before native mutation; failed writes do not advance the agreed baseline.
+                    state["pending"]=remote; state["pendingLocal"]=local;
+                    if (!persist()) return;
+                    QString error;
+                    if (!saveReaderPosition(path,position,analysis.prepared,profile,&error)) {
+                        finish(error,false,"progress","pending"); return;
+                    }
+                    state={{"localBase",cfi},{"remoteBase",remote}};
+                    if (persist()) { dismissConflict(); finish(QCoreApplication::translate("BookOrbit", "Position saved. Open the book from the built-in library."),true,"progress"); }
+                    return;
+                }
+                if (local.isEmpty() || other || hasPage) {
+                    finish(hasPage ? QCoreApplication::translate("BookOrbit", "The server position includes a page number. Upload stopped to preserve it.") :
+                           other ? QCoreApplication::translate("BookOrbit", "The server record contains other reading coordinates. Upload stopped to preserve them.") :
+                                   QCoreApplication::translate("BookOrbit", "No exact position on the reader yet."),false,"progress"); return;
+                }
+                const double percentage=analysis.percentage;
+                if (!analysis.estimate) {
+                    finish(QCoreApplication::translate("BookOrbit", "The position was recognized, but the book percentage could not be estimated for upload. Positions were kept unchanged."),
+                           false,"progress","position"); return;
+                }
+                // Save before POST. An uncertain result is reconciled by the next GET, never blindly retried.
+                const QJsonObject outgoing{{"source","text"},{"cfi",local},{"pageNumber",QJsonValue::Null},{"percentage",percentage}};
+                state["outgoing"]=outgoing;
+                if (!persist()) return;
+                const auto sentContext=fileContext(id,path);
+                jsonRequest(route,outgoing,[this,id,local,route,profile,sentContext](const QJsonObject &) {
+                    if (!acceptFileContext(sentContext)) return;
+                    jsonRequest(route,{},[this,id,local,profile,sentContext](const QJsonObject &confirmed) {
+                        if (!acceptFileContext(sentContext)) return;
+                        if (confirmed["cfi"].toString()!=local) {
+                            finish(QCoreApplication::translate("BookOrbit", "The server position changed after upload. Check again."),false,"progress"); return;
+                        }
+                        auto record=downloads.value(id).toObject();
+                        record["progress"]=QJsonObject{{"localBase",local},{"remoteBase",confirmed},{"profile",profile}};
+                        if (!saveRecord(id,record)) { finish(QCoreApplication::translate("BookOrbit", "Uploaded, but the result could not be saved. Check again."),false,"progress"); return; }
+                        dismissConflict(); finish(QCoreApplication::translate("BookOrbit", "Progress sent to BookOrbit"),true,"progress");
+                    },true,true);
+                });
             });
         },true,true);
+    });
 }

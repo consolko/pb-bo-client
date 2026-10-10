@@ -28,6 +28,7 @@ bool xml(const QByteArray &bytes, QDomDocument &doc) {
     if (bytes.isEmpty()) return false;
     QXmlStreamReader reader(bytes); int depth=0, nodes=0;
     while (!reader.atEnd()) {
+        if (fileTaskCancelled()) return false;
         const auto token=reader.readNext();
         if (token==QXmlStreamReader::DTD) {
             // Permit only a declaration without a subset or external identifiers.
@@ -45,6 +46,7 @@ bool xml(const QByteArray &bytes, QDomDocument &doc) {
     return !reader.hasError() && bool(doc.setContent(bytes, QDomDocument::ParseOption::PreserveSpacingOnlyNodes));
 }
 qint64 textSize(const QDomNode &node) {
+    if (fileTaskCancelled()) return 0;
     if (node.isText() || node.isCDATASection()) return node.nodeValue().size();
     qint64 n=0; for (auto child=node.firstChild(); !child.isNull(); child=child.nextSibling()) n+=textSize(child);
     return n;
@@ -202,6 +204,7 @@ bool epubPosition(const QString &path, const QString &cfi, double *percentage, Q
     if (!resolve(root,parts[0],ref,unused,offset) || tag(ref.toElement())!="itemref" || ref.parentNode()!=package.spine) return false;
     qint64 total=0, position=-1;
     for (auto item=package.spine.firstChildElement();!item.isNull();item=item.nextSiblingElement()) {
+        if (fileTaskCancelled()) return false;
         // Coordinate-only checks must not parse unrelated chapters or depend on
         // the availability of a whole-book text-length estimate.
         if (!percentage && item!=ref) continue;
@@ -228,7 +231,7 @@ bool epubPosition(const QString &path, const QString &cfi, double *percentage, Q
         }
         total+=textSize(content.documentElement());
     }
-    if (position<0 || (percentage && (total<=0 || position>total))) return false;
+    if (fileTaskCancelled() || position<0 || (percentage && (total<=0 || position>total))) return false;
     if (percentage) *percentage=100.0*double(position)/double(total);
     if (point) *point="epubcfi("+parts[0]+"!"+start+")";
     if (context) *context=resolvedContext;
@@ -258,6 +261,7 @@ bool validEpub(const QString &path) {
     if (!loadPackage(zip,package)) return false;
     int spineItems=0;
     for (auto item=package.spine.firstChildElement();!item.isNull();item=item.nextSiblingElement()) {
+        if (fileTaskCancelled()) return false;
         if (tag(item)!="itemref") return false;
         const QString resource=package.resources.value(item.attribute("idref"));
         if (resource.isEmpty() || !zip.contains(resource)) return false;
@@ -392,6 +396,7 @@ QString fbTextPoint(const FbParagraph &p,qint64 offset) {
             else {
                 QDomNode first; qint64 length=0;
                 while (!node.isNull() && !node.isElement()) {
+                    if (fileTaskCancelled()) return {};
                     if (node.isText() || node.isCDATASection()) { if (first.isNull()) first=node; length+=node.nodeValue().size(); }
                     node=node.nextSibling();
                 }
@@ -483,7 +488,7 @@ QString bookCfi(const QString &path,const QString &position) {
     const int page=match.captured(1).toInt(&ok); if (!match.hasMatch() || !ok) return {};
     const qint64 offset=match.captured(2).isEmpty()?0:match.captured(2).toLongLong(&ok);
     if (!ok) return {};
-    FbBook book; if (!loadFb(path,book)) return {};
+    FbBook book; if (fileTaskCancelled() || !loadFb(path,book)) return {};
     for (const auto &p:book.paragraphs)
         if (p.page==page && offset>=p.offset && offset<=p.offset+textSize(p.node)) return fbTextPoint(p,offset-p.offset);
     return {};

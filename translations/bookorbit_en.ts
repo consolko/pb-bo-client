@@ -1423,5 +1423,9 @@ Choose a book from the catalog.</translation>
       <source>↑ На уровень выше</source>
       <translation>↑ Parent folder</translation>
     </message>
-  </context>
+      <message><source>The file, profile or account changed. Retry the operation.</source><translation>The file, profile or account changed. Retry the operation.</translation></message>
+    <message><source>Checking the book file…</source><translation>Checking the book file…</translation></message>
+    <message><source>Verifying the update package…</source><translation>Verifying the update package…</translation></message>
+    <message><source>Installing the update…</source><translation>Installing the update…</translation></message>
+</context>
 </TS>
