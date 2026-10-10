@@ -282,7 +282,7 @@ int main(int argc, char **argv) {
         QString::fromUtf8(contents(scope+"/records/102.json"))==untouched,
         "stop during GET finishes one file and preserves every unprocessed record");
     write(fault,"");
-    auto stopBetween=QObject::connect(&c,&Client::changed,&c,[&] {
+    auto stopBetween=QObject::connect(&c,&Client::syncBatchChanged,&c,[&] {
         if (c.syncBatch()["running"].toBool() && c.syncBatch()["completed"].toInt()==1) c.stopSyncAfterCurrent();
     });
     require(!wait(c,[&] { c.syncAll(); }) && requests(root,"GET /api/v1/books/files/102/progress")==otherGets,
@@ -305,7 +305,7 @@ int main(int argc, char **argv) {
         c.syncBooks()[0].toMap()["state"]=="uncertain", "unknown send outcome remains journaled after stopping");
     write(fault,"");
     require(wait(c,[&] { c.syncAll(); }), "a fresh batch reconciles a stopped uncertain send");
-    auto stopLast=QObject::connect(&c,&Client::changed,&c,[&] {
+    auto stopLast=QObject::connect(&c,&Client::syncBatchChanged,&c,[&] {
         if (c.syncBatch()["running"].toBool() && c.syncBatch()["completed"].toInt()==2) c.stopSyncAfterCurrent();
     });
     require(!wait(c,[&] { c.syncAll(); }) && c.syncBatch()["completed"].toInt()==2 && c.status().contains("пользователем"),
@@ -480,9 +480,16 @@ int main(int argc, char **argv) {
     require(wait(c, [&] { c.retry(); }), "retry succeeds");
     require(c.localFile(0) == file, "identical redownload keeps file identity");
     const auto progressBeforeRepair = QJsonDocument::fromJson(contents(scope+"/records/101.json")).object()["progress"].toObject();
+    require(c.books()[0].toMap()["downloaded"].toBool(),"warm presentation before external same-size corruption");
     write(file, QByteArray(contents(file).size(), 'x'));
+    const int corruptedPosts=requests(root,"POST /api/v1/books/files/101/progress");
+    require(!wait(c,[&] { c.syncFile(101); }) && requests(root,"POST /api/v1/books/files/101/progress")==corruptedPosts,
+            "fresh digest check blocks sync before refreshing the cached presentation");
+    const QString damagedRecord=scope+"/records/101.json";
+    require(QFile::rename(damagedRecord,damagedRecord+".held") && QDir().mkdir(damagedRecord),"inject damaged-record save failure");
     c.open(0);
     require(c.localFile(0).isEmpty() && c.books().size() == 2 && c.books()[0].toMap()["needsRepair"].toBool(), "corruption preserves library entry with repair action");
+    require(QDir().rmdir(damagedRecord) && QFile::rename(damagedRecord+".held",damagedRecord),"restore record after in-memory damage notification");
     require(wait(c, [&] { c.download(0); }), "redownload repairs corruption");
     const auto repaired = c.localFile(0);
     require(!repaired.isEmpty() && repaired != file, "repair switches to a new EPUB path");
@@ -970,7 +977,7 @@ int main(int argc, char **argv) {
             "verification counts all five format files of one book, not one book row");
     require(contents(pdfPath)==pdfBeforeCheck && contents(fb2Path)==fb2BeforeCheck &&
             QFile::exists(featureScope+"/records/205.json"), "full check keeps all downloaded variants unchanged");
-    auto cancelBetween=QObject::connect(&features,&Client::changed,&features,[&] {
+    auto cancelBetween=QObject::connect(&features,&Client::feedbackChanged,&features,[&] {
         if (features.verifyingLibrary() && features.status().contains("Локальный файл совпадает"))
             features.cancelLibraryVerification();
     });

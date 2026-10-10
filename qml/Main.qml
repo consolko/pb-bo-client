@@ -37,6 +37,7 @@ ApplicationWindow {
     property bool syncView: false
     property string syncFilter: "all"
     property string syncBookKey: ""
+    readonly property var catalogBooks: client.books
     readonly property var detailData: client.detail
     readonly property var syncData: client.syncSummary
     readonly property var detailFormat: (detailData.files || []).find(file => file.id === detailData.fileId) || ({})
@@ -619,7 +620,7 @@ ApplicationWindow {
         Text {
             objectName: "localCount"
             visible: client.offlineOnly && !window.settings && !window.syncView && !client.detailVisible && client.localQuery.length > 0
-            text: qsTranslate("BookOrbit", "Found: ") + client.books.length
+            text: qsTranslate("BookOrbit", "Found: ") + window.catalogBooks.length
             font.pixelSize: 14 * window.u
         }
         ColumnLayout {
@@ -751,7 +752,7 @@ ApplicationWindow {
             visible: !window.settings && !window.syncView && !client.detailVisible && !client.collectionsView && (!window.coverGrid || client.offlineOnly || count === 0)
             Layout.fillWidth: true; Layout.fillHeight: true
             clip: true
-            model: client.books
+            model: window.catalogBooks
             spacing: Math.round(6 * window.u)
             ScrollBar.vertical: ScrollBar { }
             delegate: ItemDelegate {
@@ -828,7 +829,7 @@ ApplicationWindow {
             visible: !window.settings && !window.syncView && !client.detailVisible && !client.collectionsView && !client.offlineOnly && window.coverGrid && count > 0
             Layout.fillWidth: true; Layout.fillHeight: true
             clip: true
-            model: client.books
+            model: window.catalogBooks
             cellWidth: Math.floor(width / 3)
             cellHeight: Math.round(270 * window.u)
             ScrollBar.vertical: ScrollBar { }
@@ -1127,7 +1128,7 @@ ApplicationWindow {
     }
     Connections {
         target: client
-        function onChanged() {
+        function onSyncBatchChanged() {
             if (client.syncBatch.running && !window.settings && !client.detailVisible) window.syncView = true
         }
         function onCompleted(operation, success) {

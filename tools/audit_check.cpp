@@ -14,20 +14,26 @@
 #include <QImageReader>
 #include <QEventLoop>
 #include <QTimer>
+#include <QCryptographicHash>
+#include <QJSValue>
+#include <QQuickWindow>
+#include <QQuickItem>
 #include <cstdio>
 #include <cstdlib>
 
 QString position;
 QString profile="default";
 bool indexed=true;
+bool opened=false;
+ReaderRecents history;
 bool connectNetwork() { return true; }
 QString readerProfile() { return profile; }
 bool readerPosition(const QString &,QString *value) { *value=position; return true; }
 ReaderFileState readerFileState(const QString &) { return ReaderFileState::Closed; }
-ReaderRecents readerRecents(const QStringList &) { return {profile,false,{}}; }
+ReaderRecents readerRecents(const QStringList &) { auto result=history; result.profile=profile; return result; }
 bool readerBookIndexed(const QString &) { return indexed; }
 void scanBook(const QString &) {}
-bool openReader(const QString &) { return true; }
+bool openReader(const QString &) { opened=true; return true; }
 bool saveReaderPosition(const QString &,const QString &expected,const QString &cfi,const QString &expectedProfile,QString *error) {
     if (expected!=position || expectedProfile!=profile) { *error="Changed fixture"; return false; }
     position="pbr:/webkit?##"+cfi;
@@ -60,6 +66,156 @@ bool until(const std::function<bool()> &predicate) {
 }
 int posts(const QString &root) {
     return QJsonDocument::fromJson(bytes(root+"/requests.json")).object()["POST /api/v1/books/files/101/progress"].toInt();
+}
+
+void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &endpoint, const QString &root) {
+    const QString data=root+"/presentation", source=root+"/plain.epub";
+    QString scope;
+    { Client seed(endpoint,data); scope=seed.downloadDirectory(); }
+    const auto content=bytes(source);
+    const QString digest=QString::fromLatin1(QCryptographicHash::hash(content,QCryptographicHash::Sha256).toHex());
+    QJsonObject choices;
+    for (int i=0; i<1000; ++i) {
+        const int bookId=10000+i, fileId=50000+i;
+        const QJsonObject file{{"id",fileId},{"format","epub"},{"role","content"},{"sizeBytes",content.size()}};
+        const QJsonObject book{{"id",bookId},{"title",QString("Книга %1").arg(i,4,10,QChar('0'))},
+            {"authors",QJsonArray{QString("Автор %1").arg(999-i,4,10,QChar('0'))}},
+            {"files",QJsonArray{file}},{"selectedFile",file}};
+        QJsonObject record{{"bookId",bookId},{"fileId",fileId},{"sha256",digest},{"bytes",content.size()},
+            {"format","epub"},{"filename",QString::number(fileId)+".epub"},{"book",book}};
+        if (!i) record["progress"]=QJsonObject{{"profile",profile},{"pending",QJsonObject{{"cfi","epubcfi(/6/2!/4/2/1:3)"}}}};
+        mode(scope+"/records/"+QString::number(fileId)+".json",QJsonDocument(record).toJson());
+        require(QFile::copy(source,scope+"/"+QString::number(fileId)+".epub"),"copy isolated library file");
+        choices[QString::number(bookId)]=fileId;
+    }
+    mode(scope+"/file-choices.json",QJsonDocument(choices).toJson());
+    history.available=true; history.files[scope+"/50007.epub"]={10007,100};
+    Client client(endpoint,data);
+    QCoreApplication::processEvents();
+    client.resetPresentationWork();
+    QElapsedTimer clock; clock.start();
+    const auto first=client.books();
+    const auto elapsed=clock.nsecsElapsed();
+    const auto initial=client.presentationWork();
+    require(first.size()==1000 && initial.libraryBuilds==1 && initial.librarySorts==1 && initial.localFileChecks==1000,
+        "1000-book snapshot checks each file once and groups/sorts once");
+    std::printf("MEASURE: books=1000 build_ms=%.3f file_checks=%llu builds=%llu sorts=%llu\n",
+        elapsed/1000000.0,static_cast<unsigned long long>(initial.localFileChecks),
+        static_cast<unsigned long long>(initial.libraryBuilds),static_cast<unsigned long long>(initial.librarySorts));
+    for (int i=0; i<10; ++i)
+        require(client.books()==first && client.recentBook()["fileId"].toInt()==50007,"repeated getters share the library snapshot");
+    require(client.presentationWork()==initial,"repeated getters perform no presentation work");
+    const auto summary=client.syncSummary();
+    const auto syncWork=client.presentationWork();
+    require(summary["total"].toInt()==1000 && syncWork.syncBuilds==1 && syncWork.syncSorts==1 &&
+            syncWork.localFileChecks==2000,"sync list and counters build one separate snapshot");
+    require(client.syncBooks()==summary["books"].toList() && client.syncSummary()==summary &&
+            client.presentationWork()==syncWork,"sync getters share the same snapshot");
+    client.searchDownloaded("КНИГА 0007");
+    require(client.books().size()==1 && client.books().first().toMap()["bookId"].toInt()==10007 &&
+            client.recentBook().isEmpty() && client.presentationWork()==syncWork,
+        "case-folded search only filters prepared rows and hides recents");
+    require(client.localFile(0)==scope+"/50007.epub","indexed actions select the filtered snapshot row");
+    opened=false;
+    require(wait(client,[&] { client.open(0); }) && opened,"filtered index opens its freshly checked file");
+    client.showDetail(10000);
+    require(client.detailVisible() && client.detail()["bookId"].toInt()==10000,
+        "unfiltered snapshot can open details outside search results");
+    client.closeDetail(); client.searchDownloaded("");
+    client.resetPresentationWork();
+    client.setLocalSort("author");
+    require(client.books().first().toMap()["bookId"].toInt()==10999 &&
+            client.presentationWork().librarySorts==1 && client.presentationWork().localFileChecks==0 &&
+            client.presentationWork().libraryBuilds==0,"author sort reuses prepared rows without checking files");
+    client.setLocalSort("title");
+    require(client.books().first().toMap()["bookId"].toInt()==10000,"title sort preserves original ordering semantics");
+    client.setLocalSort("recent");
+    require(client.books().first().toMap()["bookId"].toInt()==10007,"native recents determine recent ordering");
+
+    QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty("client",&client);
+    engine.rootContext()->setContextProperty("screenWidth",600);
+    engine.rootContext()->setContextProperty("screenHeight",800);
+    int warnings=0;
+    QObject::connect(&engine,&QQmlApplicationEngine::warnings,&engine,[&](const QList<QQmlError> &errors) { warnings+=errors.size(); });
+    engine.load(QUrl("qrc:/Main.qml"));
+    require(!engine.rootObjects().isEmpty(),"load production QML for 1000-book presentation checks");
+    QObject *window=engine.rootObjects().first();
+    QCoreApplication::processEvents(); QCoreApplication::processEvents();
+    const auto catalog=window->findChild<QObject *>("catalog"), grid=window->findChild<QObject *>("coverCatalog");
+    require(catalog && grid && catalog->property("count").toInt()==1000 && grid->property("count").toInt()==1000,
+        "list and grid consume the shared QML snapshot");
+    int librarySignals=0, syncSignals=0;
+    QObject::connect(&client,&Client::libraryChanged,&engine,[&] { ++librarySignals; });
+    QObject::connect(&client,&Client::syncSummaryChanged,&engine,[&] { ++syncSignals; });
+    client.books(); client.syncSummary(); client.recentBook(); client.resetPresentationWork();
+    client.connectForSync(); client.setUiContext("settings");
+    require(client.setDiagnosticLogging(true),"toggle diagnostics during notification isolation check");
+    const QString log=client.diagnosticLogPath();
+    require(QFile::rename(log,log+".held") && QFile::link(log+".held",log),"inject unsafe diagnostic log path");
+    client.logDiagnostic("presentation check");
+    require(!client.diagnosticError().isEmpty(),"diagnostic error publishes settings notification");
+    require(QFile::remove(log) && QFile::rename(log+".held",log),"restore diagnostic log path");
+    client.logDiagnostic("presentation restored");
+    require(client.diagnosticError().isEmpty(),"diagnostic recovery clears settings error");
+    require(!client.configure("http://not-allowed",""),"validation error changes only connection feedback");
+    require(client.prepareUpdate() && client.busy(),"prepare OTA changes operation state");
+    std::function<QQuickItem *(QQuickItem *)> findAction=[&](QQuickItem *parent) -> QQuickItem * {
+        if (parent->objectName()=="bookAction-10007") return parent;
+        for (auto child : parent->childItems()) if (auto found=findAction(child)) return found;
+        return nullptr;
+    };
+    const auto action=findAction(qobject_cast<QQuickWindow *>(window)->contentItem());
+    require(action && !action->property("enabled").toBool(),"busy disables the existing QML read action");
+    client.cancelUpdate();
+    require(!client.busy() && action->property("enabled").toBool(),"cancel OTA restores the QML action");
+    window->setProperty("coverGrid",true); window->setProperty("coverGrid",false);
+    QCoreApplication::processEvents();
+    require(client.presentationWork()==Client::PresentationWork{} && librarySignals==0 && syncSignals==0,
+        "feedback, diagnostics, UI context, view toggle and busy do zero library or sync work");
+    require(window->property("uiMessage").value<QJSValue>().toVariant().toMap()["text"]==client.feedback()["text"],
+        "isolated feedback notification updates the production QML message");
+    std::printf("MEASURE: message_busy_context file_checks=0 library_builds=0 library_sorts=0 sync_builds=0 sync_sorts=0\n");
+
+    client.showSyncFile(50000);
+    require(client.detail()["pendingProgress"].toBool(),"original profile exposes its pending position");
+    require(client.prepareUpdate(),"defer native recents while busy");
+    profile="presentation-other"; client.refreshRecents();
+    require(!client.historyAvailable() && client.recentBook().isEmpty() && !client.detail()["pendingProgress"].toBool() &&
+            window->property("detailData").value<QJSValue>().toVariant().toMap()["pendingProgress"]==false,
+        "profile change immediately clears old profile presentation even while busy");
+    client.cancelUpdate(); client.refreshRecents(); QCoreApplication::processEvents();
+    profile="default"; client.refreshRecents(); QCoreApplication::processEvents();
+    client.closeDetail();
+    const QString removed=scope+"/50007.epub";
+    require(QFile::rename(removed,removed+".held"),"temporarily remove a cached test file");
+    opened=false; client.openFile(50007);
+    require(!opened,"fresh action checks reject a missing file before external refresh");
+    client.refreshRecents(); QCoreApplication::processEvents();
+    require(client.recentBook().isEmpty() && client.syncSummary()["attention"].toInt()>0,
+        "external refresh observes missing files even with identical native recents");
+    client.searchDownloaded("Книга 0007");
+    require(client.books().size()==1 && client.books().first().toMap()["needsRepair"].toBool(),
+        "missing book remains in the library with repair action");
+    require(QFile::rename(removed+".held",removed),"restore cached test file");
+    client.refreshRecents(); QCoreApplication::processEvents(); client.searchDownloaded("");
+    require(client.recentBook()["fileId"].toInt()==50007,"external refresh restores available recent file");
+    mode(removed,content+"changed size");
+    client.refreshRecents(); QCoreApplication::processEvents(); client.searchDownloaded("Книга 0007");
+    require(client.books().first().toMap()["needsRepair"].toBool(),"external size change invalidates cached file availability");
+    mode(removed,content); client.refreshRecents(); QCoreApplication::processEvents(); client.searchDownloaded("");
+    QObject::connect(&client,&Client::languageChanged,&engine,[&] {
+        if (client.language()=="en") app.removeTranslator(&russian); else app.installTranslator(&russian);
+        QLocale::setDefault(QLocale(client.language()=="en" ? "en" : "ru"));
+        engine.retranslate();
+    });
+    const QString russianLabel=client.syncBooks().first().toMap()["label"].toString();
+    require(client.setLanguage("en") && client.syncBooks().first().toMap()["label"].toString()!=russianLabel &&
+            window->property("syncData").value<QJSValue>().toVariant().toMap()["books"]==client.syncSummary()["books"],
+        "live language switch retranslates cached sync labels and QML snapshot");
+    require(client.setLanguage("ru"),"restore Russian after cached language check");
+    require(!warnings,"presentation checks produce no QML warnings");
+    history={};
 }
 
 int main(int argc,char **argv) {
@@ -208,6 +364,7 @@ int main(int argc,char **argv) {
     require(!wait(client,[&] { client.downloadSelected(); }) && client.localFile(0)==replacement &&
             bytes(replacement)==replacementBytes && bytes(recordPath)==recordBefore,
             "ordinary ZIP cannot replace a valid EPUB or its persisted record");
+    presentationChecks(app,russian,endpoint,root);
     std::puts("PASS: audit regressions");
     return 0;
 }

@@ -10,6 +10,7 @@
 #include <QPointer>
 #include <QNetworkReply>
 #include <QVariantList>
+#include <QHash>
 #include <functional>
 
 class Client : public QObject {
@@ -17,44 +18,44 @@ class Client : public QObject {
     Q_PROPERTY(QStringList languageCodes READ languageCodes CONSTANT)
     Q_PROPERTY(QStringList languageNames READ languageNames CONSTANT)
     Q_PROPERTY(QString language READ language NOTIFY languageChanged)
-    Q_PROPERTY(QVariantList books READ books NOTIFY changed)
-    Q_PROPERTY(QVariantMap detail READ detail NOTIFY changed)
-    Q_PROPERTY(bool detailVisible READ detailVisible NOTIFY changed)
-    Q_PROPERTY(QVariantList collections READ collections NOTIFY changed)
-    Q_PROPERTY(bool collectionsView READ collectionsView NOTIFY changed)
-    Q_PROPERTY(int collectionId READ collectionId NOTIFY changed)
-    Q_PROPERTY(QString collectionName READ collectionName NOTIFY changed)
-    Q_PROPERTY(bool progressConflict READ progressConflict NOTIFY changed)
-    Q_PROPERTY(QString conflictDescription READ conflictDescription NOTIFY changed)
-    Q_PROPERTY(QVariantList conflictPositions READ conflictPositions NOTIFY changed)
-    Q_PROPERTY(int conflictRevision READ conflictRevision NOTIFY changed)
-    Q_PROPERTY(QVariantMap syncSummary READ syncSummary NOTIFY changed)
-    Q_PROPERTY(QVariantMap feedback READ feedback NOTIFY changed)
-    Q_PROPERTY(QVariantMap syncBatch READ syncBatch NOTIFY changed)
-    Q_PROPERTY(QString localQuery READ localQuery NOTIFY changed)
-    Q_PROPERTY(QString localSort READ localSort NOTIFY changed)
-    Q_PROPERTY(QString catalogQuery READ catalogQuery NOTIFY changed)
-    Q_PROPERTY(QVariantMap recentBook READ recentBook NOTIFY changed)
-    Q_PROPERTY(bool historyAvailable READ historyAvailable NOTIFY changed)
-    Q_PROPERTY(QString status READ status NOTIFY changed)
-    Q_PROPERTY(bool busy READ busy NOTIFY changed)
-    Q_PROPERTY(bool authenticated READ authenticated NOTIFY changed)
-    Q_PROPERTY(int page READ page NOTIFY changed)
-    Q_PROPERTY(int total READ total NOTIFY changed)
+    Q_PROPERTY(QVariantList books READ books NOTIFY libraryChanged)
+    Q_PROPERTY(QVariantMap detail READ detail NOTIFY detailChanged)
+    Q_PROPERTY(bool detailVisible READ detailVisible NOTIFY detailChanged)
+    Q_PROPERTY(QVariantList collections READ collections NOTIFY catalogChanged)
+    Q_PROPERTY(bool collectionsView READ collectionsView NOTIFY catalogChanged)
+    Q_PROPERTY(int collectionId READ collectionId NOTIFY catalogChanged)
+    Q_PROPERTY(QString collectionName READ collectionName NOTIFY catalogChanged)
+    Q_PROPERTY(bool progressConflict READ progressConflict NOTIFY conflictChanged)
+    Q_PROPERTY(QString conflictDescription READ conflictDescription NOTIFY conflictChanged)
+    Q_PROPERTY(QVariantList conflictPositions READ conflictPositions NOTIFY conflictChanged)
+    Q_PROPERTY(int conflictRevision READ conflictRevision NOTIFY conflictChanged)
+    Q_PROPERTY(QVariantMap syncSummary READ syncSummary NOTIFY syncSummaryChanged)
+    Q_PROPERTY(QVariantMap feedback READ feedback NOTIFY feedbackChanged)
+    Q_PROPERTY(QVariantMap syncBatch READ syncBatch NOTIFY syncBatchChanged)
+    Q_PROPERTY(QString localQuery READ localQuery NOTIFY libraryChanged)
+    Q_PROPERTY(QString localSort READ localSort NOTIFY libraryChanged)
+    Q_PROPERTY(QString catalogQuery READ catalogQuery NOTIFY catalogChanged)
+    Q_PROPERTY(QVariantMap recentBook READ recentBook NOTIFY libraryChanged)
+    Q_PROPERTY(bool historyAvailable READ historyAvailable NOTIFY libraryChanged)
+    Q_PROPERTY(QString status READ status NOTIFY feedbackChanged)
+    Q_PROPERTY(bool busy READ busy NOTIFY operationChanged)
+    Q_PROPERTY(bool authenticated READ authenticated NOTIFY connectionChanged)
+    Q_PROPERTY(int page READ page NOTIFY catalogChanged)
+    Q_PROPERTY(int total READ total NOTIFY catalogChanged)
     Q_PROPERTY(int coverRevision READ coverRevision NOTIFY coversChanged)
-    Q_PROPERTY(QString server READ server NOTIFY changed)
-    Q_PROPERTY(QString username READ username NOTIFY changed)
-    Q_PROPERTY(QStringList accounts READ accounts NOTIFY changed)
-    Q_PROPERTY(bool offlineOnly READ offlineOnly NOTIFY changed)
-    Q_PROPERTY(bool downloading READ downloading NOTIFY changed)
-    Q_PROPERTY(bool verifyingLibrary READ verifyingLibrary NOTIFY changed)
-    Q_PROPERTY(bool canRetry READ canRetry NOTIFY changed)
-    Q_PROPERTY(QString downloadDirectory READ downloadDirectory NOTIFY changed)
-    Q_PROPERTY(QString diagnosticError READ diagnosticError NOTIFY changed)
-    Q_PROPERTY(bool diagnosticLogging READ diagnosticLogging NOTIFY changed)
+    Q_PROPERTY(QString server READ server NOTIFY connectionChanged)
+    Q_PROPERTY(QString username READ username NOTIFY connectionChanged)
+    Q_PROPERTY(QStringList accounts READ accounts NOTIFY connectionChanged)
+    Q_PROPERTY(bool offlineOnly READ offlineOnly NOTIFY catalogChanged)
+    Q_PROPERTY(bool downloading READ downloading NOTIFY operationChanged)
+    Q_PROPERTY(bool verifyingLibrary READ verifyingLibrary NOTIFY operationChanged)
+    Q_PROPERTY(bool canRetry READ canRetry NOTIFY operationChanged)
+    Q_PROPERTY(QString downloadDirectory READ downloadDirectory NOTIFY settingsChanged)
+    Q_PROPERTY(QString diagnosticError READ diagnosticError NOTIFY settingsChanged)
+    Q_PROPERTY(bool diagnosticLogging READ diagnosticLogging NOTIFY settingsChanged)
     Q_PROPERTY(QString diagnosticLogPath READ diagnosticLogPath CONSTANT)
-    Q_PROPERTY(bool hasSavedSession READ hasSavedSession NOTIFY changed)
-    Q_PROPERTY(QString sessionWarning READ sessionWarning NOTIFY changed)
+    Q_PROPERTY(bool hasSavedSession READ hasSavedSession NOTIFY connectionChanged)
+    Q_PROPERTY(QString sessionWarning READ sessionWarning NOTIFY connectionChanged)
 public:
     Client(QUrl server, QString root, QObject *parent = nullptr, bool restoreAccount = true);
     bool prepareUpdate();
@@ -144,13 +145,51 @@ public:
     Q_INVOKABLE void download(int index);
     Q_INVOKABLE void open(int index, bool applyIncoming = true);
     QString localFile(int index) const;
+#ifdef BOOKORBIT_TEST_HTTP
+    struct PresentationWork {
+        quint64 libraryBuilds=0, librarySorts=0, localFileChecks=0, syncBuilds=0, syncSorts=0;
+        bool operator==(const PresentationWork &) const = default;
+    };
+    PresentationWork presentationWork() const { return presentationCounters; }
+    void resetPresentationWork() const { presentationCounters={}; }
+#endif
 signals:
     void diagnosticsEnabled();
     void languageChanged();
-    void changed();
+    void operationChanged();
+    void feedbackChanged();
+    void libraryChanged();
+    void catalogChanged();
+    void detailChanged();
+    void conflictChanged();
+    void syncSummaryChanged();
+    void syncBatchChanged();
+    void connectionChanged();
+    void settingsChanged();
     void coversChanged();
     void completed(const QString &operation, bool success);
 private:
+    using LocalFiles = QHash<int, QString>;
+    struct LibraryRow { QJsonObject book; QVariantMap summary; QString search; };
+    mutable QList<LibraryRow> libraryRows;
+    mutable QJsonArray libraryAll, libraryVisible;
+    mutable QVariantList libraryBooks;
+    mutable QVariantMap libraryRecent, cachedSyncSummary;
+    mutable bool libraryDirty=true, libraryOrderDirty=true, libraryFilterDirty=true, syncDirty=true;
+    bool libraryPending=false, syncPending=false, detailPending=false;
+    QVariantList lastOperation;
+    void invalidateLibrary(bool data=true);
+    void invalidateSync();
+    void publishDataChanges();
+    void notifyOperation();
+    void ensureLibrary() const;
+    QVariantList buildSyncBooks() const;
+    void storeRecord(const QString &id, const QJsonObject &record);
+    void setSyncResult(const QString &id, const QString &text);
+    void clearSyncResult(const QString &id);
+#ifdef BOOKORBIT_TEST_HTTP
+    mutable PresentationWork presentationCounters;
+#endif
     bool updateLocked=false;
     QString logError;
     QElapsedTimer diagnosticClock;
@@ -173,7 +212,7 @@ private:
     QString libraryQuery, librarySort="recent", committedQuery;
     ReaderRecents nativeRecents;
     bool recentsRequested=false, recentsScheduled=false;
-    QJsonObject recentFile(QJsonObject book) const;
+    QJsonObject recentFile(QJsonObject book, LocalFiles *files=nullptr) const;
     bool syncingAll=false, syncStopRequested=false;
     int syncCompleted=0;
     bool checkingLibrary=false, verificationCancelled=false;
@@ -197,13 +236,13 @@ private:
     void fetchNextCover();
     void stopCovers();
     QJsonArray visibleItems(bool applyQuery=true) const;
-    QString localFile(const QJsonObject &book) const;
+    QString localFile(const QJsonObject &book, LocalFiles *files=nullptr) const;
     void downloadBook(const QJsonObject &book, bool renew = true);
     void transferBook(const QJsonObject &book, bool renew);
     void openBook(const QJsonObject &book, bool applyIncoming);
-    QJsonObject selectBookFile(QJsonObject book) const;
-    QVariantMap bookSummary(const QJsonObject &book) const;
-    QVariantMap fileSummary(const QJsonObject &book) const;
+    QJsonObject selectBookFile(QJsonObject book, LocalFiles *files=nullptr) const;
+    QVariantMap bookSummary(const QJsonObject &book, LocalFiles *files=nullptr) const;
+    QVariantMap fileSummary(const QJsonObject &book, LocalFiles *files=nullptr) const;
     void rememberFile(const QJsonObject &book);
     QString pathFor(const QJsonObject &book) const;
     bool validDownloadDirectory(const QString &path) const;
