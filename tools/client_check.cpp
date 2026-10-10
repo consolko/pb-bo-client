@@ -32,8 +32,8 @@ std::function<ReaderRecents(const FileCancellation &)> readerRecentsTask(const Q
 }
 QString appliedCfi;
 bool applyAllowed=true;
-bool saveReaderPosition(const QString &path, const QString &expected, const PreparedReaderPosition &prepared, const QString &profile, QString *error) {
-    *error="Тестовый отказ сохранения";
+bool saveReaderPosition(const QString &path, const QString &expected, const PreparedReaderPosition &prepared, const QString &profile, UiMessage *error) {
+    *error=uiMessage("previous_result_unavailable");
     if (!applyAllowed || expected!=fakePosition || profile!=fakeProfile) return false;
     Q_UNUSED(path)
     if (!prepared.coordinate || !prepared.estimate) return false;

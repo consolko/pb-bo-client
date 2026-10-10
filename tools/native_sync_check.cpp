@@ -90,7 +90,7 @@ int main(int argc,char **argv) {
         "read native recents using current profile and verified schema");
     QString before;
     require(readerPosition(path,&before) && !nativeCfi(before).isEmpty(),"read saved stock-reader CFI");
-    QString error;
+    UiMessage error;
     require(saveReaderPosition(path,before,prepareReaderPosition(path,"epubcfi(/6/2!/4/122/1)"),readerProfile(),&error),"prepare distinct native paragraph 060");
     require(readerPosition(path,&before) && nativeCfi(before)=="epubcfi(/6/2!/4/122/1)","confirm distinct initial CFI");
     require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }),"real saved reader position uploaded to fixture");

@@ -17,6 +17,14 @@ struct ClientWorkerCheck {
     static void cleanup(Client &client) { client.cleanupBooks(); }
     static void invalidateSession(Client &client) { client.invalidateSession(); }
     static void reload(Client &client) { client.loadRecords(); }
+    static void saveSyncMessage(Client &client,const QString &id,const UiMessage &message) {
+        client.syncingId=id; client.finish(message,false,"progress","error");
+    }
+    static void memoryMessages(Client &client,const UiMessage &message) {
+        client.message=message; client.detailMessage=message; client.sessionNotice=message;
+        client.logError=message; client.feedbackContext="settings"; client.feedbackResult="error";
+        client.feedbackHidden=false; client.retranslate();
+    }
     static bool maintenanceIdle(const Client &client) { return client.cleanupState!=Client::CleanupState::Running && !client.cleanupPending; }
 };
 

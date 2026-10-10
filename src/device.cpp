@@ -164,19 +164,19 @@ bool networkConnected() {
     return true;
 #endif
 }
-QString updateDeviceError(QJsonObject *details) {
+UiMessage updateDeviceError(QJsonObject *details) {
 #ifdef POCKETBOOK_DEVICE
     const QString firmware=QString::fromLatin1(GetSoftwareVersion());
     const bool usb=IsUSBconnected(), charging=IsCharging();
     const int power=GetBatteryPower();
     if(details) *details={{"firmware",firmware},{"usb",usb},{"battery",power},{"charging",charging},{"connected",networkConnected()}};
-    if(firmware!="U634.6.10.3425") return QCoreApplication::translate("BookOrbit","Updates are unavailable for this firmware.");
+    if(firmware!="U634.6.10.3425") return uiMessage("updates_are_unavailable_for_this_firmware");
     // Until mass-storage mode is independently identified, conservatively block any USB connection.
-    if(usb) return QCoreApplication::translate("BookOrbit","Disconnect USB before installing the update.");
-    if(!charging && (power<30 || power>100)) return QCoreApplication::translate("BookOrbit","Charge the battery to at least 30% before updating.");
+    if(usb) return uiMessage("disconnect_usb_before_installing_the_update");
+    if(!charging && (power<30 || power>100)) return uiMessage("charge_the_battery_to_at_least_30_before_updating");
 #else
     if(details) *details={{"firmware","desktop"},{"connected",networkConnected()}};
-    return QCoreApplication::translate("BookOrbit","Updates can only be installed on PocketBook PB634.");
+    return uiMessage("updates_can_only_be_installed_on_pocketbook_pb634");
 #endif
     return {};
 }
@@ -246,8 +246,8 @@ bool readerPosition(const QString &path, QString *position) {
 }
 
 bool saveReaderPosition(const QString &path, const QString &expectedPosition,
-                        const PreparedReaderPosition &prepared, const QString &profile, QString *error) {
-    *error = QCoreApplication::translate("BookOrbit", "Native position saving is unavailable for this firmware.");
+                        const PreparedReaderPosition &prepared, const QString &profile, UiMessage *error) {
+    *error = uiMessage("native_position_saving_is_unavailable_for_this_firmware");
 #ifdef POCKETBOOK_DEVICE
     // Private native Cloud ABI, verified only in this exact U634 library. No SQL writes here.
     if (QByteArray(GetSoftwareVersion()) != "U634.6.10.3425") return false;
@@ -264,11 +264,11 @@ bool saveReaderPosition(const QString &path, const QString &expectedPosition,
         fileStamp(QFileInfo("/ebrmain/lib/libpbrdwrapper.so").canonicalFilePath())!=prepared.fb2)) return false;
     const double percentage=prepared.percentage;
     const QString incoming=prepared.native;
-    *error = QCoreApplication::translate("BookOrbit", "The position does not match this book.");
+    *error = uiMessage("the_position_does_not_match_this_book");
     if (!prepared.coordinate || incoming.isEmpty()) return false;
-    *error = QCoreApplication::translate("BookOrbit", "The position was recognized, but the book percentage could not be estimated for the built-in library.");
+    *error = uiMessage("the_position_was_recognized_but_the_book_percentage_could_not_be_b70578");
     if (!prepared.estimate || !std::isfinite(percentage) || percentage<0 || percentage>100) return false;
-    *error = QCoreApplication::translate("BookOrbit", "Close all books in the built-in reader and retry sync.");
+    *error = uiMessage("close_all_books_in_the_built_in_reader_and_retry_sync");
     if (readerFileState(path) != ReaderFileState::Closed) return false;
     // Different paths can share one native book_id. Block all open books, including aliases.
     const auto allBooksClosed=[] {
@@ -284,9 +284,9 @@ bool saveReaderPosition(const QString &path, const QString &expectedPosition,
     };
     if (!allBooksClosed()) return false;
     QString current; qint64 bookId=0;
-    *error = QCoreApplication::translate("BookOrbit", "The reader position or profile has changed. Retry sync.");
+    *error = uiMessage("the_reader_position_or_profile_has_changed_retry_sync");
     if (readerProfile()!=profile || !readReaderPosition(path,&current,&bookId) || bookId<=0 || current!=expectedPosition) return false;
-    *error = QCoreApplication::translate("BookOrbit", "Could not confirm that the position was saved. Retry sync.");
+    *error = uiMessage("could_not_confirm_that_the_position_was_saved_retry_sync");
     try {
         void *db=instance();
         if (!db) return false;

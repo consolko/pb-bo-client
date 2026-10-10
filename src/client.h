@@ -64,6 +64,7 @@ public:
     QStringList languageCodes() const { return interfaceLanguages().keys(); }
     QStringList languageNames() const { return interfaceLanguages().values(); }
     QString language() const { return languagePreference; }
+    void retranslate();
     Q_INVOKABLE bool setLanguage(const QString &language);
     QVariantList books() const;
     QVariantMap detail() const;
@@ -111,7 +112,7 @@ public:
     QVariantMap recentBook() const;
     bool historyAvailable() const { return nativeRecents.available; }
     Q_INVOKABLE void openFile(int fileId, bool applyIncoming=false);
-    QString status() const { return translatedText(message); }
+    QString status() const { return message.text(); }
     bool busy() const { return working || conflictPreparing; }
     bool authenticated() const { return !token.isEmpty(); }
     int page() const { return currentPage; }
@@ -127,10 +128,10 @@ public:
     QString downloadDirectory() const;
     bool diagnosticLogging() const { return diagnostics; }
     QString diagnosticLogPath() const;
-    QString diagnosticError() const { return logError; }
+    QString diagnosticError() const { return logError.text(); }
     void logDiagnostic(const QString &event, QJsonObject fields = {});
     bool hasSavedSession() const { return sessionStored; }
-    QString sessionWarning() const { return translatedText(sessionNotice); }
+    QString sessionWarning() const { return sessionNotice.text(); }
     Q_INVOKABLE QVariantList directories(const QString &path) const;
     Q_INVOKABLE bool setDownloadDirectory(const QString &path);
     Q_INVOKABLE bool setDiagnosticLogging(bool enabled);
@@ -201,13 +202,13 @@ private:
     void ensureLibrary() const;
     QVariantList buildSyncBooks() const;
     void storeRecord(const QString &id, const QJsonObject &record);
-    void setSyncResult(const QString &id, const QString &text);
+    void setSyncResult(const QString &id, const UiMessage &text);
     void clearSyncResult(const QString &id);
 #ifdef BOOKORBIT_TEST_HTTP
     mutable PresentationWork presentationCounters;
 #endif
     bool updateLocked=false;
-    QString logError;
+    UiMessage logError;
     QElapsedTimer diagnosticClock;
     qint64 diagnosticSequence=0;
     QVariantMap syncFileStatus(const QString &id, const QString &profile) const;
@@ -241,7 +242,7 @@ private:
     void jsonRequest(const QString &path, const QJsonObject &payload, const Callback &callback, bool renew = true, bool get = false, bool arrayResponse = false);
     bool setCredentials(const QJsonObject &response);
     void renewSession(const std::function<void()> &resume);
-    void finish(QString text, bool success, const QString &operation, const QString &syncState = {});
+    void finish(UiMessage text, bool success, const QString &operation, const QString &syncState = {});
     bool saveRecord(const QString &id, const QJsonObject &record);
     QString recordFile(const QString &id, const QJsonObject &record) const;
     void loadRecords();
@@ -268,15 +269,17 @@ private:
     QNetworkAccessManager network;
     QUrl endpoint;
     QString languagePreference = "system";
-    QString rootDir, scopeDir, bookDirectory, user, message;
+    QString rootDir, scopeDir, bookDirectory, user;
+    UiMessage message;
     QByteArray token;
     QString refreshToken;
-    QString sessionNotice;
+    UiMessage sessionNotice;
     QJsonArray items;
     QJsonArray collectionItems;
     QList<QJsonObject> browseHistory;
     QJsonObject detailBook, fileChoices, coverVersions, coverRevisions;
-    QString detailMessage, activeCollectionName;
+    UiMessage detailMessage;
+    QString activeCollectionName;
     int activeCollection = 0, detailGeneration = 0;
     bool collectionList = false;
     QJsonObject downloads;

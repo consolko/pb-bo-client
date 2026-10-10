@@ -1608,5 +1608,85 @@ Download an EPUB or FB2 from the catalog.</source><translation>Пока нече
     <message><source>Checking the book file…</source><translation>Проверяем файл книги…</translation></message>
     <message><source>Verifying the update package…</source><translation>Проверяем пакет обновления…</translation></message>
     <message><source>Installing the update…</source><translation>Устанавливаем обновление…</translation></message>
+    <message>
+      <source>A verified update was retained. Retry installation when ready.</source>
+      <translation>Проверенное обновление сохранено. Повторите установку, когда будете готовы.</translation>
+    </message>
+    <message>
+      <source>Could not create folder %1.</source>
+      <translation>Не удалось создать папку %1.</translation>
+    </message>
+    <message>
+      <source>Could not create the app data folder: %1. Check free space and access to device storage.</source>
+      <translation>Не удалось создать папку данных приложения: %1. Проверьте свободное место и доступ к памяти устройства.</translation>
+    </message>
+    <message>
+      <source>Could not save the connection: %1</source>
+      <translation>Не удалось сохранить подключение: %1</translation>
+    </message>
+    <message>
+      <source>Could not save the folder: %1</source>
+      <translation>Не удалось сохранить папку: %1</translation>
+    </message>
+    <message>
+      <source>Could not verify the server file (HTTP %1).</source>
+      <translation>Не удалось проверить файл на сервере (HTTP %1).</translation>
+    </message>
+    <message>
+      <source>Could not verify the server file.</source>
+      <translation>Не удалось проверить файл на сервере.</translation>
+    </message>
+    <message>
+      <source>Could not write diagnostic log. Check device storage.</source>
+      <translation>Не удалось записать диагностический журнал. Проверьте память устройства.</translation>
+    </message>
+    <message>
+      <source>Could not write file %1 (code %2).</source>
+      <translation>Не удалось записать файл %1 (код %2).</translation>
+    </message>
+    <message>
+      <source>Finish update</source>
+      <translation>Завершить обновление</translation>
+    </message>
+    <message>
+      <source>Installation stopped before replacement. The prepared update was kept; retry installation.</source>
+      <translation>Установка остановилась до замены приложения. Подготовленное обновление сохранено; повторите установку.</translation>
+    </message>
+    <message>
+      <source>Logging is disabled. Could not save the setting: %1</source>
+      <translation>Журнал выключен. Не удалось сохранить настройку: %1</translation>
+    </message>
+    <message>
+      <source>Logging is enabled until the app closes. Could not save the setting: %1</source>
+      <translation>Журнал включён до закрытия приложения. Не удалось сохранить настройку: %1</translation>
+    </message>
+    <message>
+      <source>Previous result details are unavailable. Retry the operation.</source>
+      <translation>Подробности предыдущего результата недоступны. Повторите операцию.</translation>
+    </message>
+    <message>
+      <source>Server not found: %1. Check Wi-Fi and DNS.</source>
+      <translation>Не найден сервер %1. Проверьте Wi-Fi и DNS.</translation>
+    </message>
+    <message>
+      <source>The application was replaced, but saving was not confirmed. The prepared update was kept; retry confirmation.</source>
+      <translation>Файл приложения заменён, но сохранение не подтверждено. Подготовленное обновление сохранено; повторите подтверждение.</translation>
+    </message>
+    <message>
+      <source>The application was replaced. Confirm saving the update before removing the prepared file.</source>
+      <translation>Файл приложения заменён. Подтвердите сохранение обновления перед удалением подготовленного файла.</translation>
+    </message>
+    <message>
+      <source>The server returned HTTP %1. Check the address and try again.</source>
+      <translation>Сервер ответил HTTP %1. Проверьте адрес и повторите.</translation>
+    </message>
+    <message>
+      <source>The settings file is too large.</source>
+      <translation>Файл настроек слишком большой.</translation>
+    </message>
+    <message>
+      <source>Update installed, but temporary files could not be removed. Retry cleanup.</source>
+      <translation>Обновление установлено, но временные файлы не удалось удалить. Повторите очистку.</translation>
+    </message>
 </context>
 </TS>

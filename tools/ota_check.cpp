@@ -382,7 +382,7 @@ int main(int argc,char **argv) {
     const auto previous=Ota::hashFile(target), own=Ota::hashFile(QCoreApplication::applicationFilePath());
     check(!updater.canInstall(),"ready PocketBook package exposes no desktop install action");
     updater.install();
-    check(updater.message()==updateDeviceError() && !client.busy() && Ota::hashFile(target)==previous && Ota::hashFile(QCoreApplication::applicationFilePath())==own && QFile::exists(root+"/update/bookorbit.next"),"desktop install rejected before touching executable or staged package");
+    check(updater.message()==updateDeviceError().text() && !client.busy() && Ota::hashFile(target)==previous && Ota::hashFile(QCoreApplication::applicationFilePath())==own && QFile::exists(root+"/update/bookorbit.next"),"desktop install rejected before touching executable or staged package");
     {
         QQmlApplicationEngine engine;
         engine.rootContext()->setContextProperty("client",&client);

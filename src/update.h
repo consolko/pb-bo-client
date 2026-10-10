@@ -7,6 +7,7 @@
 #include <QTimer>
 #include <functional>
 #include "file_executor.h"
+#include "i18n.h"
 class Client;
 
 class UpdateManager : public QObject {
@@ -28,7 +29,7 @@ public:
     QString availableVersion() const { return candidateVersion; }
     QString notes() const { return releaseNotes; }
     QString state() const { return phase; }
-    QString message() const { return notice; }
+    QString message() const { return notice.text(); }
     double progress() const { return fraction; }
     qint64 archiveBytes() const { return archiveSize; }
     QString lastChecked() const;
@@ -36,6 +37,7 @@ public:
     void setAutomatic(bool value);
     bool canInstall() const;
     void windowReady();
+    void retranslate() { emit changed(); }
     void automaticCheck();
     Q_INVOKABLE void check();
     Q_INVOKABLE void download();
@@ -47,7 +49,7 @@ signals:
 private:
     friend struct UpdateManagerCheck;
     void checkRelease(bool manual);
-    void fail(const QString &error);
+    void fail(const UiMessage &error);
     bool allowed(const QUrl &url) const;
     void fetch(QUrl url,qint64 limit,std::function<void(QByteArray,int,QString)> done,int redirects=5,bool conditional=true);
     void downloadZip(QUrl url,int redirects=5);
@@ -65,7 +67,8 @@ private:
     Client *client;
     FileCancellation fileTask;
     QString attemptDir;
-    QString root,executable,phase="idle",notice,candidateVersion,releaseNotes,zipDigest;
+    QString root,executable,phase="idle",candidateVersion,releaseNotes,zipDigest;
+    UiMessage notice;
     QUrl apiBase,zipUrl,checksumsUrl;
     QJsonObject settings,cache,prepared;
     QNetworkAccessManager network;

@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
     engine.rootContext()->setContextProperty("updateManager",&updater);
     QObject::connect(&client, &Client::languageChanged, &engine, [&] {
         applyLanguage(client.language());
-        engine.retranslate();
+        client.retranslate(); updater.retranslate(); engine.retranslate();
     });
 #ifdef POCKETBOOK_DEVICE
     engine.addImportPath("/ebrmain/qml");

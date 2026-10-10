@@ -94,7 +94,7 @@ if(BOOKORBIT_CHECKS AND NOT POCKETBOOK_TOOLCHAIN_LOADED)
 endif()
 
 if(BOOKORBIT_CHECKS)
-  set(LANGUAGE_CHECK_SOURCES tools/language_check.cpp src/client.cpp src/client.h ${FILE_SOURCES} src/device.cpp src/device.h src/progress.cpp src/progress.h)
+  set(LANGUAGE_CHECK_SOURCES tools/language_check.cpp src/update.cpp src/update.h src/ota.cpp src/ota.h src/client.cpp src/client.h ${FILE_SOURCES} src/device.cpp src/device.h src/progress.cpp src/progress.h)
   if(POCKETBOOK_TOOLCHAIN_LOADED)
     pocketbook_add_app(language_check SOURCES ${LANGUAGE_CHECK_SOURCES} QRC qml/app.qrc LIBRARIES Qt6::Network Qt6::Sql Qt6::Xml z)
     target_compile_definitions(language_check PRIVATE POCKETBOOK_DEVICE)

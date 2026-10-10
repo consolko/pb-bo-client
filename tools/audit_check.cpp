@@ -40,8 +40,8 @@ std::function<ReaderRecents(const FileCancellation &)> readerRecentsTask(const Q
 bool readerBookIndexed(const QString &) { return indexed; }
 void scanBook(const QString &) {}
 bool openReader(const QString &) { opened=true; return true; }
-bool saveReaderPosition(const QString &,const QString &expected,const PreparedReaderPosition &prepared,const QString &expectedProfile,QString *error) {
-    if (expected!=position || expectedProfile!=profile) { *error="Changed fixture"; return false; }
+bool saveReaderPosition(const QString &,const QString &expected,const PreparedReaderPosition &prepared,const QString &expectedProfile,UiMessage *error) {
+    if (expected!=position || expectedProfile!=profile) { *error=uiMessage("previous_result_unavailable"); return false; }
     if (!prepared.coordinate || !prepared.estimate) return false;
     position=prepared.native;
     return true;

@@ -5,6 +5,7 @@
 #include <QMap>
 #include <QStringList>
 #include "file_work.h"
+#include "i18n.h"
 #include <functional>
 
 struct ReaderRecent { qint64 bookId=0, openTime=0; };
@@ -25,8 +26,8 @@ ReaderFileState readerFileState(const QString &path);
 
 bool connectNetwork();
 bool networkConnected();
-QString updateDeviceError(QJsonObject *details=nullptr);
+UiMessage updateDeviceError(QJsonObject *details=nullptr);
 bool readerPosition(const QString &path, QString *position);
 QString readerProfile();
 bool saveReaderPosition(const QString &path, const QString &expectedPosition,
-                        const PreparedReaderPosition &prepared, const QString &profile, QString *error);
+                        const PreparedReaderPosition &prepared, const QString &profile, UiMessage *error);

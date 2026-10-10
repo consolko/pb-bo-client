@@ -477,6 +477,7 @@ ApplicationWindow {
                         onClicked: window.updater.automatic = checked
                     }
                     Text {
+                        objectName: "updateMessage"
                         text: window.updater ? window.updater.message : ""
                         visible: text.length > 0; textFormat: Text.PlainText
                         Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u

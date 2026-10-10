@@ -24,11 +24,11 @@ int main(int argc, char **argv) {
         std::puts(qPrintable(cfi)); return cfi.isEmpty() ? 5 : 0;
     }
     if (argc==4 && QString::fromLocal8Bit(argv[2])=="--save-cfi") {
-        QString previous,error;
+        QString previous; UiMessage error;
         const QString path=QString::fromLocal8Bit(argv[1]);
         if (!readerPosition(path,&previous)) return 4;
         const bool ok=saveReaderPosition(path,previous,prepareReaderPosition(path,QString::fromLocal8Bit(argv[3])),readerProfile(),&error);
-        std::puts(ok ? "saved" : qPrintable(error));
+        std::puts(ok ? "saved" : qPrintable(error.text()));
         return ok ? 0 : 5;
     }
     const auto state = readerFileState(QString::fromLocal8Bit(argv[1]));

@@ -30,7 +30,7 @@ static QJsonObject storageDetails(const QString &path) {
             {"readonly",storage.isReadOnly()},{"freeBytes",storage.bytesAvailable()}};
 }
 constexpr qint64 maxUpdateSettings=64*1024,maxReleaseCache=128*1024,maxReleaseResponse=1024*1024,maxLegacySettings=2*1024*1024;
-static QString trUpdate(const char *text) { return QCoreApplication::translate("BookOrbit",text); }
+static UiMessage trUpdate(const char *text) { return messageForSource(text); }
 UpdateManager::UpdateManager(Client *c,QString data,QString path,QObject *parent)
     : QObject(parent),client(c),root(std::move(data)),executable(std::move(path)),apiBase("https://api.github.com") {
     network.setTransferTimeout(30000);
@@ -98,7 +98,7 @@ void UpdateManager::trace(const QString &event,QJsonObject fields) {
 void UpdateManager::traceContext() {
     QJsonObject device; const auto blocker=updateDeviceError(&device);
     trace("context",{{"installed",version()},{"executable",executable},{"source",logUrl(apiBase)},
-          {"device",device},{"installBlocker",blocker},
+          {"device",device},{"installBlocker",blocker.code},
           {"storage",storageDetails(root)},{"stagedBytes",attemptDir.isEmpty() ? 0 : QFileInfo(attemptDir+"/bookorbit.next").size()}});
 }
 bool UpdateManager::persist() {
@@ -167,8 +167,8 @@ void UpdateManager::automaticCheck() {
     checkRelease(false);
 }
 void UpdateManager::check() { checkRelease(true); }
-void UpdateManager::fail(const QString &error) {
-    trace("failed",{{"reason",error}});
+void UpdateManager::fail(const UiMessage &error) {
+    trace("failed",{{"reason",error.code}});
     ++generation; if(fileTask) fileTask->store(true); fileTask.reset(); totalDeadline.stop(); if(active) active->abort(); active.clear();
     discardAttempt();
     phase="error"; notice=error; emit changed();
@@ -280,7 +280,7 @@ void UpdateManager::download() {
 void UpdateManager::downloadZip(QUrl url,int redirects) {
     if(!allowed(url)||redirects<0) { trace("url.rejected",{{"url",logUrl(url)},{"redirectsLeft",redirects}}); fail(trUpdate("The update server returned an unsafe download address.")); return; }
     auto out=std::make_shared<QSaveFile>(attemptDir+"/archive.zip"); out->setDirectWriteFallback(false);
-    if(!out->open(QIODevice::WriteOnly)) { trace("archive.open.failed",{{"detail",out->errorString()}}); fail(out->errorString()); return; }
+    if(!out->open(QIODevice::WriteOnly)) { trace("archive.open.failed",{{"detail",out->errorString()}}); fail(trUpdate("Could not save the update download.")); return; }
     auto hash=std::make_shared<QCryptographicHash>(QCryptographicHash::Sha256);
     auto size=std::make_shared<qint64>(0);
     QNetworkRequest request(url); request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,QNetworkRequest::ManualRedirectPolicy);
@@ -344,7 +344,7 @@ void UpdateManager::verifyArchive() {
 void UpdateManager::install() {
     trace("install.requested",{{"canInstall",canInstall()},{"busy",client->busy()},{"destination",executable},{"permissions",int(QFileInfo(executable).permissions())},{"storage",storageDetails(QFileInfo(executable).absolutePath())}});
     QJsonObject device; const auto deviceError=updateDeviceError(&device); trace("install.device",device);
-    if(!deviceError.isEmpty()) { trace("install.blocked",{{"reason",deviceError}}); notice=deviceError; emit changed(); return; }
+    if(!deviceError.isEmpty()) { trace("install.blocked",{{"reason",deviceError.code}}); notice=deviceError; emit changed(); return; }
     if(!canInstall()) { trace("install.ignored"); return; }
     const bool confirmOnly=phase=="unconfirmed" || phase=="cleanup_pending";
     if(!confirmOnly && !Ota::isRunningExecutable(executable)) {
