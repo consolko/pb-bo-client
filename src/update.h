@@ -49,13 +49,17 @@ private:
     void checkRelease(bool manual);
     void fail(const QString &error);
     bool allowed(const QUrl &url) const;
-    void fetch(QUrl url,qint64 limit,std::function<void(QByteArray,int)> done,int redirects=5);
+    void fetch(QUrl url,qint64 limit,std::function<void(QByteArray,int,QString)> done,int redirects=5,bool conditional=true);
     void downloadZip(QUrl url,int redirects=5);
     void verifyArchive();
     void discardAttempt();
     void recoverAttempts();
     void installPrepared(bool confirmOnly);
     bool persist();
+    bool persistCache();
+    QJsonObject normalizeRelease(const QJsonObject &release) const;
+    QJsonObject normalizeCache(const QJsonObject &value) const;
+    void receiveRelease(QByteArray data,int code,const QString &etag);
     void trace(const QString &event, QJsonObject fields={});
     void traceContext();
     Client *client;
@@ -63,7 +67,7 @@ private:
     QString attemptDir;
     QString root,executable,phase="idle",notice,candidateVersion,releaseNotes,zipDigest;
     QUrl apiBase,zipUrl,checksumsUrl;
-    QJsonObject settings,prepared;
+    QJsonObject settings,cache,prepared;
     QNetworkAccessManager network;
     QPointer<QNetworkReply> active;
     QTimer totalDeadline;

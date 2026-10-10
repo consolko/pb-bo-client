@@ -11,6 +11,10 @@
 #include <QDir>
 #include <QJsonDocument>
 #include <QTemporaryDir>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <QHostAddress>
+#include <QJsonArray>
 #include <QUuid>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +36,10 @@ struct UpdateManagerCheck {
         updater.client->prepareUpdate();
         updater.installPrepared(confirm);
     }
+    static void source(UpdateManager &updater,const QUrl &url) {
+        updater.apiBase=url; updater.cache=updater.normalizeCache(updater.cache); updater.startupDone=true;
+    }
+    static void loseCache(UpdateManager &updater) { updater.cache={}; }
     static void timeout(UpdateManager &updater) { QMetaObject::invokeMethod(&updater.totalDeadline,"timeout",Qt::DirectConnection); }
 };
 
@@ -91,6 +99,76 @@ static QByteArray deflateData(const QByteArray &data,int flush=Z_FINISH) {
     check(rc==(flush==Z_FINISH ? Z_STREAM_END : Z_OK) && !z.avail_in && z.avail_out,"compress fixture");
     packed.resize(z.total_out); deflateEnd(&z); return packed;
 }
+static void cacheRegressions(Client &client,const QString &root) {
+    QTcpServer server; check(server.listen(QHostAddress::LocalHost,0),"local update fixture listens");
+    const auto endpoint=QUrl("http://127.0.0.1:"+QString::number(server.serverPort()));
+    QJsonArray assets;
+    for(const auto *name:{"bookorbit-pb634.zip","SHA256SUMS"}) assets.append(QJsonObject{
+        {"name",name},{"size",100},{"browser_download_url","https://github.com/consolko/pb-bo-client/releases/download/v2.0.0/"+QString(name)}});
+    QJsonObject release{{"tag_name","v2.0.0"},{"draft",false},{"prerelease",false},{"assets",assets},
+                        {"body",QString(20000,'n')},{"ignored",QString(900000,'x')}};
+    QByteArray response=QJsonDocument(release).toJson(QJsonDocument::Compact);
+    int status=200; QList<QByteArray> requests;
+    QObject::connect(&server,&QTcpServer::newConnection,&server,[&] {
+        while(server.hasPendingConnections()) {
+            auto *socket=server.nextPendingConnection(); auto request=std::make_shared<QByteArray>();
+            QObject::connect(socket,&QTcpSocket::readyRead,socket,[&,socket,request] {
+                request->append(socket->readAll());
+                if(socket->property("served").toBool() || !request->contains("\r\n\r\n")) return;
+                socket->setProperty("served",true); requests.append(*request);
+                const auto body=status==304 ? QByteArray{} : response;
+                socket->write("HTTP/1.1 "+QByteArray::number(status)+" OK\r\nETag: \"release-v1\"\r\nContent-Length: "+QByteArray::number(body.size())+"\r\nConnection: close\r\n\r\n"+body);
+                socket->disconnectFromHost();
+            });
+            QObject::connect(socket,&QTcpSocket::disconnected,socket,&QObject::deleteLater);
+        }
+    });
+    QString error; const auto data=root+"/cache-regression";
+    {
+        UpdateManager updater(&client,data,root+"/bookorbit.app");
+        check(waitUntil([&] { return updater.state()!="recovering"; }),"cache test recovery settles");
+        updater.setAutomatic(false); UpdateManagerCheck::source(updater,endpoint);
+        updater.check(); check(waitUntil([&] { return updater.state()!="checking"; }) && updater.state()=="available","large release response passes through real HTTP handling");
+        const auto preferences=Ota::read(data+"/update/preferences.json",65536),cached=Ota::read(data+"/update/release-cache.json",128*1024);
+        check(preferences.size()<100 && QJsonDocument::fromJson(preferences).object()["automatic"]==false && !cached.isEmpty() && !cached.contains("ignored"),"network cache stores only release fields separately from settings");
+        check(updater.notes().size()==12000,"release notes are bounded before caching");
+        status=304; updater.check();
+        check(waitUntil([&] { return updater.state()!="checking"; }) && updater.state()=="available" && requests.last().toLower().contains("if-none-match: \"release-v1\""),"304 reuses the matching validated release and ETag");
+        UpdateManagerCheck::loseCache(updater); const int before=requests.size(); updater.check();
+        check(waitUntil([&] { return updater.state()!="checking"; }) && updater.state()=="error" && requests.size()==before+2 && !requests.last().toLower().contains("if-none-match"),"304 without cache retries unconditionally once and stops");
+        status=200; response="{"; updater.check();
+        check(waitUntil([&] { return updater.state()!="checking"; }) && updater.state()=="error" && !updater.automatic(),"malformed response never changes automatic preference");
+        response=QByteArray(1024*1024+1,'x'); updater.check();
+        check(waitUntil([&] { return updater.state()!="checking"; }) && updater.state()=="error" && !updater.automatic(),"oversized response never changes automatic preference");
+        auto duplicate=release; auto extra=assets; extra.append(assets.last()); duplicate["assets"]=extra;
+        response=QJsonDocument(duplicate).toJson(QJsonDocument::Compact); updater.check();
+        check(waitUntil([&] { return updater.state()!="checking"; }) && updater.state()=="error","duplicate checksum asset is rejected before caching");
+    }
+    for(const auto &damage:{QByteArray("{"),QByteArray(128*1024+1,'x')}) {
+        check(Ota::save(data+"/update/release-cache.json",damage,&error),"damage only the network cache");
+        UpdateManager restarted(&client,data,root+"/bookorbit.app");
+        check(!restarted.automatic() && waitUntil([&] { return restarted.state()!="recovering"; }),"automatic=false survives restart with invalid cache");
+        UpdateManagerCheck::source(restarted,endpoint); status=200; response=QJsonDocument(release).toJson(QJsonDocument::Compact);
+        restarted.check();
+        check(waitUntil([&] { return restarted.state()!="checking"; }) && restarted.state()=="available" && !requests.last().toLower().contains("if-none-match"),"invalid cache causes an unconditional HTTP check");
+    }
+    check(QFile::remove(data+"/update/release-cache.json") && QDir().mkdir(data+"/update/release-cache.json"),"simulate cache persistence failure");
+    {
+        UpdateManager restarted(&client,data,root+"/bookorbit.app");
+        check(waitUntil([&] { return restarted.state()!="recovering"; }),"unwritable cache recovery settles");
+        UpdateManagerCheck::source(restarted,endpoint); restarted.check();
+        check(waitUntil([&] { return restarted.state()!="checking"; }) && restarted.state()=="available" && !restarted.automatic(),"cache write failure does not fail the valid release or reset settings");
+    }
+    const auto legacy=root+"/legacy-update";
+    check(QDir().mkpath(legacy+"/update") && Ota::saveJson(legacy+"/update/preferences.json",{{"automatic",false},{"source","https://api.github.com"},{"release",release},{"etag","\"legacy\""}},&error),"large legacy preferences fixture");
+    {
+        UpdateManager migrated(&client,legacy,root+"/bookorbit.app");
+        check(!migrated.automatic() && QFileInfo(legacy+"/update/preferences.json").size()<100 && !Ota::read(legacy+"/update/release-cache.json",128*1024).isEmpty(),"legacy preferences larger than 64 KiB migrate without losing automatic=false");
+    }
+    UpdateManager migratedAgain(&client,legacy,root+"/bookorbit.app");
+    check(!migratedAgain.automatic(),"migrated preference survives another restart");
+}
+
 int main(int argc,char **argv) {
     if(qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) qputenv("QT_QPA_PLATFORM","offscreen");
     QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
@@ -297,6 +375,7 @@ int main(int argc,char **argv) {
         gate.open(); check(waitUntil([&] { return drained; }) && updater.state()=="error" && !QFile::exists(expired+"/bookorbit.next"),
                            "late verification after timeout never publishes ready and removes its own files");
     }
+    cacheRegressions(client,root);
     check(!updateDeviceError().isEmpty(),"real desktop backend disallows PocketBook installation");
     check(QDir().mkpath(root+"/update") && Ota::save(root+"/update/bookorbit.next",executable,&error),"verified PocketBook executable staged for desktop guard");
     UpdateManagerCheck::ready(updater,record);

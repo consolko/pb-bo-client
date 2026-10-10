@@ -11,6 +11,7 @@
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonArray>
+#include <QSet>
 #include <QSaveFile>
 #include <QStorageInfo>
 #include <QRegularExpression>
@@ -28,12 +29,21 @@ static QJsonObject storageDetails(const QString &path) {
     return {{"path",path},{"filesystem",QString::fromLatin1(storage.fileSystemType())},{"valid",storage.isValid()},
             {"readonly",storage.isReadOnly()},{"freeBytes",storage.bytesAvailable()}};
 }
+constexpr qint64 maxUpdateSettings=64*1024,maxReleaseCache=128*1024,maxReleaseResponse=1024*1024,maxLegacySettings=2*1024*1024;
 static QString trUpdate(const char *text) { return QCoreApplication::translate("BookOrbit",text); }
 UpdateManager::UpdateManager(Client *c,QString data,QString path,QObject *parent)
     : QObject(parent),client(c),root(std::move(data)),executable(std::move(path)),apiBase("https://api.github.com") {
     network.setTransferTimeout(30000);
     const bool directoryReady=QDir().mkpath(root+"/update");
-    settings=QJsonDocument::fromJson(Ota::read(root+"/update/preferences.json",65536)).object();
+    auto preferences=QJsonDocument::fromJson(Ota::read(root+"/update/preferences.json",maxUpdateSettings)).object();
+    if(preferences.isEmpty()) {
+        const auto legacy=QJsonDocument::fromJson(Ota::read(root+"/update/preferences.json",maxLegacySettings)).object();
+        if(!legacy.contains("schema")) preferences=legacy;
+    }
+    settings={{"schema",1},{"automatic",preferences["automatic"].toBool(true)}};
+    cache=normalizeCache(QJsonDocument::fromJson(Ota::read(root+"/update/release-cache.json",maxReleaseCache)).object());
+    if(preferences.contains("release") && cache.isEmpty()) cache=normalizeCache(preferences);
+    if(!preferences.isEmpty() && preferences!=settings && persist()) persistCache();
     const auto abandoned=QDir(root+"/update").entryInfoList({"attempt-*"},QDir::Dirs|QDir::NoDotAndDotDot);
     client->files.submit(this,[abandoned](const FileCancellation &cancel) {
         for(const auto &entry:abandoned) {
@@ -48,7 +58,6 @@ UpdateManager::UpdateManager(Client *c,QString data,QString path,QObject *parent
         }
         return true;
     },[](bool,bool) {});
-    if(settings["source"].toString()!=apiBase.toString()) settings={{"automatic",settings["automatic"].toBool(true)},{"source",apiBase.toString()}};
     recoverAttempts();
     traceContext();
     if(!directoryReady) trace("directory.failed",{{"path",root+"/update"}});
@@ -79,7 +88,7 @@ bool UpdateManager::canInstall() const {
 #endif
 }
 QString UpdateManager::lastChecked() const {
-    const auto value=settings["lastChecked"].toInteger();
+    const auto value=cache["lastChecked"].toInteger();
     return value>0 ? QLocale().toString(QDateTime::fromSecsSinceEpoch(value),QLocale::ShortFormat) : QString{};
 }
 void UpdateManager::trace(const QString &event,QJsonObject fields) {
@@ -93,9 +102,51 @@ void UpdateManager::traceContext() {
           {"storage",storageDetails(root)},{"stagedBytes",attemptDir.isEmpty() ? 0 : QFileInfo(attemptDir+"/bookorbit.next").size()}});
 }
 bool UpdateManager::persist() {
-    QString error; const bool ok=Ota::saveJson(root+"/update/preferences.json",settings,&error);
+    QString error; const bool ok=QJsonDocument(settings).toJson(QJsonDocument::Compact).size()<=maxUpdateSettings && Ota::saveJson(root+"/update/preferences.json",settings,&error);
     if(!ok) trace("settings.failed",{{"detail",error}});
     return ok;
+}
+bool UpdateManager::persistCache() {
+    QString error;
+    const bool ok=QJsonDocument(cache).toJson(QJsonDocument::Compact).size()<=maxReleaseCache &&
+        Ota::saveJson(root+"/update/release-cache.json",cache,&error);
+    if(!ok) trace("cache.failed",{{"detail",error}});
+    return ok;
+}
+QJsonObject UpdateManager::normalizeRelease(const QJsonObject &release) const {
+    const auto tag=release["tag_name"].toString();
+    if(!release["draft"].isBool() || !release["prerelease"].isBool() || release["draft"].toBool() ||
+       release["prerelease"].toBool() || !tag.startsWith('v') || !Ota::validVersion(tag.mid(1)) || !release["assets"].isArray()) return {};
+    QJsonArray assets; QSet<QString> names;
+    for(const auto &value:release["assets"].toArray()) {
+        const auto asset=value.toObject(); const auto name=asset["name"].toString();
+        if(name!="bookorbit-pb634.zip" && name!="SHA256SUMS") continue;
+        const auto url=asset["browser_download_url"].toString(); const auto bytes=asset["size"];
+        if(names.contains(name) || url.size()>4096 || !allowed(QUrl(url)) || !bytes.isDouble() ||
+           bytes.toDouble()!=bytes.toInteger() || bytes.toInteger()<1 ||
+           bytes.toInteger()>(name=="SHA256SUMS" ? 4096 : Ota::maxArchive)) return {};
+        names.insert(name);
+        assets.append(QJsonObject{{"name",name},{"size",bytes},{"browser_download_url",url}});
+    }
+    if(Ota::newer(tag.mid(1),version()) && names.size()!=2) return {};
+    return {{"tag_name",tag},{"draft",false},{"prerelease",false},{"body",release["body"].toString().left(12000)},{"assets",assets}};
+}
+QJsonObject UpdateManager::normalizeCache(const QJsonObject &value) const {
+    if(value["source"]!=apiBase.toString()) return {};
+    QJsonObject normalized{{"schema",1},{"source",apiBase.toString()}};
+    for(const auto *key:{"lastChecked","lastAutomatic","retryAfter"}) {
+        const auto field=value[key];
+        if(field.isDouble() && field.toDouble()==field.toInteger() && field.toInteger()>=0)
+            normalized[key]=qMin(field.toInteger(),QDateTime::currentSecsSinceEpoch()+86400);
+    }
+    if(value.contains("release")) {
+        const auto release=normalizeRelease(value["release"].toObject());
+        if(release.isEmpty()) return {};
+        normalized["release"]=release;
+        const auto etag=value["etag"].toString();
+        if(etag.toUtf8().size()<=1024 && !etag.contains(QRegularExpression("[\\x00-\\x20\\x7f]"))) normalized["etag"]=etag;
+    }
+    return QJsonDocument(normalized).toJson(QJsonDocument::Compact).size()<=maxReleaseCache ? normalized : QJsonObject{};
 }
 void UpdateManager::setAutomatic(bool value) {
     const auto previous=settings; settings["automatic"]=value;
@@ -110,9 +161,9 @@ void UpdateManager::windowReady() {
 void UpdateManager::automaticCheck() {
     if(automaticAttempted || !automatic() || !networkConnected() || !startupDone) { trace("automatic.skipped",{{"enabled",automatic()},{"connected",networkConnected()},{"startupDone",startupDone}}); return; }
     automaticAttempted=true;
-    const auto now=QDateTime::currentSecsSinceEpoch(),last=settings["lastAutomatic"].toInteger();
+    const auto now=QDateTime::currentSecsSinceEpoch(),last=cache["lastAutomatic"].toInteger();
     if(last>0 && now-last<86400) { trace("automatic.skipped",{{"reason","24h interval"},{"last",last},{"now",now}}); return; }
-    settings["lastAutomatic"]=now; if(!persist()) return;
+    cache["source"]=apiBase.toString(); cache["lastAutomatic"]=now; persistCache();
     checkRelease(false);
 }
 void UpdateManager::check() { checkRelease(true); }
@@ -123,17 +174,21 @@ void UpdateManager::fail(const QString &error) {
     phase="error"; notice=error; emit changed();
 }
 bool UpdateManager::allowed(const QUrl &url) const {
+#ifdef BOOKORBIT_TEST_HTTP
+    if(url.scheme()=="http" && url.host()=="127.0.0.1" && apiBase.host()==url.host() &&
+       url.port()==apiBase.port() && url.userInfo().isEmpty() && !url.hasFragment()) return true;
+#endif
     if(!url.isValid() || !url.userInfo().isEmpty() || url.hasFragment()) return false;
     return url.scheme()=="https" && url.port(443)==443 &&
         QStringList{"api.github.com","github.com","release-assets.githubusercontent.com","objects.githubusercontent.com"}.contains(url.host());
 }
-void UpdateManager::fetch(QUrl url,qint64 limit,std::function<void(QByteArray,int)> done,int redirects) {
+void UpdateManager::fetch(QUrl url,qint64 limit,std::function<void(QByteArray,int,QString)> done,int redirects,bool conditional) {
     if(!allowed(url)||redirects<0) { trace("url.rejected",{{"url",logUrl(url)},{"redirectsLeft",redirects}}); fail(trUpdate("The update server returned an unsafe download address.")); return; }
     QNetworkRequest request(url); request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,QNetworkRequest::ManualRedirectPolicy);
     request.setRawHeader("User-Agent",("BookOrbit/"+version()).toUtf8());
     request.setRawHeader("Accept","application/vnd.github+json"); request.setRawHeader("X-GitHub-Api-Version","2022-11-28");
     const bool latest=url.path().endsWith("/releases/latest");
-    if(latest && !settings["release"].toObject().isEmpty()) request.setRawHeader("If-None-Match",settings["etag"].toString().toUtf8());
+    if(latest && conditional && !cache["release"].toObject().isEmpty() && !cache["etag"].toString().isEmpty()) request.setRawHeader("If-None-Match",cache["etag"].toString().toUtf8());
     trace("http.request",{{"url",logUrl(url)},{"redirectsLeft",redirects}});
     auto *reply=network.get(request); active=reply; const int run=generation;
     auto data=std::make_shared<QByteArray>();
@@ -146,46 +201,53 @@ void UpdateManager::fetch(QUrl url,qint64 limit,std::function<void(QByteArray,in
         reply->deleteLater(); if(run!=generation) return; active.clear();
         const int status=reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         trace("http.finished",{{"url",logUrl(url)},{"http",status},{"networkError",int(reply->error())}});
-        if(status>=300 && status<400 && status!=304) { fetch(url.resolved(reply->attribute(QNetworkRequest::RedirectionTargetAttribute).toUrl()),limit,done,redirects-1); return; }
+        if(status>=300 && status<400 && status!=304) { fetch(url.resolved(reply->attribute(QNetworkRequest::RedirectionTargetAttribute).toUrl()),limit,done,redirects-1,conditional); return; }
         if(status==403 || status==429) {
             bool ok=false; const auto seconds=reply->rawHeader("Retry-After").toLongLong(&ok);
             const auto now=QDateTime::currentSecsSinceEpoch();
-            settings["retryAfter"]=ok ? now+qBound(qint64(60),seconds,qint64(86400)) : qMax(now+60,reply->rawHeader("X-RateLimit-Reset").toLongLong()); persist();
+            cache["source"]=apiBase.toString(); cache["retryAfter"]=ok ? now+qBound(qint64(60),seconds,qint64(86400)) : qMax(now+60,qMin(now+86400,reply->rawHeader("X-RateLimit-Reset").toLongLong())); persistCache();
         }
         if(status!=200 && status!=304) { fail(status==404 ? trUpdate("The published release is unavailable.") : trUpdate("Could not check updates. Try again later.")); return; }
         if(reply->error()!=QNetworkReply::NoError) { fail(trUpdate("The update connection failed.")); return; }
-        if(latest && status==200) settings["etag"]=QString::fromUtf8(reply->rawHeader("ETag"));
-        done(*data,status);
+        const auto remaining=reply->readAll();
+        if(data->size()+remaining.size()>limit) { fail(trUpdate("The update response is too large.")); return; }
+        data->append(remaining);
+        if(status==304 && (!latest || cache["release"].toObject().isEmpty())) {
+            if(latest && conditional) { fetch(url,limit,done,redirects,false); return; }
+            fail(trUpdate("The release information is invalid.")); return;
+        }
+        done(*data,status,QString::fromUtf8(reply->rawHeader("ETag")));
     });
 }
 void UpdateManager::checkRelease(bool manual) {
     if(active || phase=="checking" || phase=="downloading" || phase=="verifying" || phase=="installing" || phase=="ready" || phase=="unconfirmed" || phase=="cleanup_pending" || phase=="recovering" || !startupDone) { trace("check.ignored"); return; }
-    if(QDateTime::currentSecsSinceEpoch()<settings["retryAfter"].toInteger()) { if(manual) fail(trUpdate("The update server asked to wait. Try again later.")); return; }
+    if(QDateTime::currentSecsSinceEpoch()<cache["retryAfter"].toInteger()) { if(manual) fail(trUpdate("The update server asked to wait. Try again later.")); return; }
     if(manual && !connectNetwork()) { fail(trUpdate("Connect to the network to check updates.")); return; }
     trace("check.requested",{{"manual",manual}});
     ++generation; phase="checking"; notice.clear(); prepared={}; candidateVersion.clear(); releaseNotes.clear(); emit changed(); totalDeadline.start(30000);
     QUrl endpoint(apiBase.toString()+"/repos/consolko/pb-bo-client/releases/latest");
-    fetch(endpoint,1024*1024,[this](QByteArray data,int code) {
-        totalDeadline.stop();
-        const auto r=code==304 ? settings["release"].toObject() : QJsonDocument::fromJson(data).object();
-        const auto tag=r["tag_name"].toString();
-        if(r.isEmpty() || !r["draft"].isBool() || !r["prerelease"].isBool() || r["draft"].toBool() || r["prerelease"].toBool() || !tag.startsWith('v') || !Ota::validVersion(tag.mid(1))) { fail(trUpdate("The release information is invalid.")); return; }
-        settings["release"]=r; settings["lastChecked"]=QDateTime::currentSecsSinceEpoch(); persist();
-        trace("release.received",{{"tag",tag},{"http",code}});
-        if(!Ota::newer(tag.mid(1),version())) { trace("release.current"); phase="idle"; notice=trUpdate("You have the latest version."); emit changed(); return; }
-        QJsonObject asset,checksums;
-        for(const auto v:r["assets"].toArray()) {
-            const auto a=v.toObject();
-            if(a["name"]=="bookorbit-pb634.zip") { if(!asset.isEmpty()) { fail(trUpdate("The release information is invalid.")); return; } asset=a; }
-            if(a["name"]=="SHA256SUMS") checksums=a;
-        }
-        archiveSize=asset["size"].toInteger(); zipUrl=QUrl(asset["browser_download_url"].toString()); checksumsUrl=QUrl(checksums["browser_download_url"].toString());
-        if(asset.isEmpty() || archiveSize<1 || archiveSize>Ota::maxArchive || !allowed(zipUrl) || !allowed(checksumsUrl)) { fail(trUpdate("This release has no compatible update package.")); return; }
-        candidateVersion=tag.mid(1); releaseNotes=r["body"].toString().left(12000); phase="available";
-        trace("release.available",{{"archiveBytes",archiveSize}});
-        notice=trUpdate("An application update is available."); emit changed();
-    });
+    fetch(endpoint,maxReleaseResponse,[this](QByteArray data,int code,QString etag) { receiveRelease(data,code,etag); });
 }
+void UpdateManager::receiveRelease(QByteArray data,int code,const QString &etag) {
+    totalDeadline.stop();
+    const auto release=normalizeRelease(code==304 ? cache["release"].toObject() : QJsonDocument::fromJson(data).object());
+    if(release.isEmpty()) { fail(trUpdate("The release information is invalid.")); return; }
+    QJsonObject next=cache; next["source"]=apiBase.toString(); next["release"]=release;
+    next["lastChecked"]=QDateTime::currentSecsSinceEpoch();
+    if(code==200) next["etag"]=etag;
+    cache=normalizeCache(next); persistCache();
+    const auto tag=release["tag_name"].toString(); trace("release.received",{{"tag",tag},{"http",code}});
+    if(!Ota::newer(tag.mid(1),version())) { trace("release.current"); phase="idle"; notice=trUpdate("You have the latest version."); emit changed(); return; }
+    for(const auto &value:release["assets"].toArray()) {
+        const auto asset=value.toObject();
+        if(asset["name"]=="bookorbit-pb634.zip") { archiveSize=asset["size"].toInteger(); zipUrl=QUrl(asset["browser_download_url"].toString()); }
+        else checksumsUrl=QUrl(asset["browser_download_url"].toString());
+    }
+    candidateVersion=tag.mid(1); releaseNotes=release["body"].toString(); phase="available";
+    trace("release.available",{{"archiveBytes",archiveSize}});
+    notice=trUpdate("An application update is available."); emit changed();
+}
+
 void UpdateManager::cancel() {
     if(phase!="checking" && phase!="downloading" && phase!="verifying") return;
     trace("cancelled",{{"progress",fraction}});
@@ -202,7 +264,7 @@ void UpdateManager::download() {
     attemptDir=root+"/update/attempt-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
     if(!QDir().mkpath(attemptDir)) { fail(trUpdate("Could not save the update download.")); return; }
     ++generation; phase="downloading"; fraction=0; notice.clear(); emit changed(); totalDeadline.start(600000);
-    fetch(checksumsUrl,4096,[this](QByteArray data,int) {
+    fetch(checksumsUrl,4096,[this](QByteArray data,int,QString) {
         zipDigest.clear();
         for(const auto &line:data.split('\n')) {
             const auto fields=QString::fromLatin1(line).simplified().split(' ');
