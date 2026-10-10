@@ -77,5 +77,5 @@ private:
     qint64 archiveSize=0;
     double fraction=0;
     int generation=0;
-    bool startupDone=false,automaticAttempted=false;
+    bool startupDone=false,automaticAttempted=false,automaticDeferred=false;
 };

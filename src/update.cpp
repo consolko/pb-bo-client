@@ -21,6 +21,7 @@
 #include <tuple>
 #include <utility>
 #include <cstdio>
+#include <unistd.h>
 
 // Query strings may contain GitHub signed asset credentials. Never record them.
 static QString logUrl(const QUrl &url) { return url.adjusted(QUrl::RemoveUserInfo|QUrl::RemoveQuery|QUrl::RemoveFragment).toString().left(512); }
@@ -30,6 +31,7 @@ static QJsonObject storageDetails(const QString &path) {
             {"readonly",storage.isReadOnly()},{"freeBytes",storage.bytesAvailable()}};
 }
 constexpr qint64 maxUpdateSettings=64*1024,maxReleaseCache=128*1024,maxReleaseResponse=1024*1024,maxLegacySettings=2*1024*1024;
+constexpr qint64 maxInstallIntent=128*1024;
 static UiMessage trUpdate(const char *text) { return messageForSource(text); }
 UpdateManager::UpdateManager(Client *c,QString data,QString path,QObject *parent)
     : QObject(parent),client(c),root(std::move(data)),executable(std::move(path)),apiBase("https://api.github.com") {
@@ -160,6 +162,8 @@ void UpdateManager::windowReady() {
 }
 void UpdateManager::automaticCheck() {
     if(automaticAttempted || !automatic() || !networkConnected() || !startupDone) { trace("automatic.skipped",{{"enabled",automatic()},{"connected",networkConnected()},{"startupDone",startupDone}}); return; }
+    if(phase=="recovering") { automaticDeferred=true; return; }
+    if(phase=="ready" || phase=="unconfirmed" || phase=="cleanup_pending" || phase=="installing") return;
     automaticAttempted=true;
     const auto now=QDateTime::currentSecsSinceEpoch(),last=cache["lastAutomatic"].toInteger();
     if(last>0 && now-last<86400) { trace("automatic.skipped",{{"reason","24h interval"},{"last",last},{"now",now}}); return; }
@@ -365,8 +369,10 @@ void UpdateManager::recoverAttempts() {
             const auto directory=entry.absoluteFilePath();
             if(QUuid::fromString(entry.fileName().mid(8)).isNull() || !Ota::safeDirectory(directory)) continue;
             QJsonObject manifest; QString error;
-            if(!Ota::verifyManifest(Ota::read(directory+"/release.json",65536),Ota::read(directory+"/release.sig",64),&manifest,&error)) continue;
-            const auto marker=QJsonDocument::fromJson(Ota::read(directory+"/install.json",4096)).object();
+            const auto marker=QJsonDocument::fromJson(Ota::read(directory+"/install.json",maxInstallIntent)).object();
+            if(!Ota::verifyManifest(Ota::read(directory+"/release.json",65536),Ota::read(directory+"/release.sig",64),&manifest,&error) &&
+               !Ota::verifyManifest(QByteArray::fromBase64(marker["manifest"].toString().toLatin1()),
+                                    QByteArray::fromBase64(marker["signature"].toString().toLatin1()),&manifest,&error)) continue;
             const bool installed=marker["destination"]==destination && Ota::hashFile(destination)==manifest["sha256"].toString();
             const QFileInfo staged(directory+"/bookorbit.next");
             const bool verified=staged.isFile() && !staged.isSymLink() && staged.size()==manifest["bytes"].toInteger() &&
@@ -385,6 +391,7 @@ void UpdateManager::recoverAttempts() {
                               trUpdate("A verified update was retained. Retry installation when ready.");
         } else phase="idle";
         emit changed();
+        if(std::exchange(automaticDeferred,false) && phase=="idle") QTimer::singleShot(0,this,&UpdateManager::automaticCheck);
     });
 }
 void UpdateManager::installPrepared(bool confirmOnly) {
@@ -394,15 +401,28 @@ void UpdateManager::installPrepared(bool confirmOnly) {
         // Finish the atomic replacement even when the application is closing.
         FileCancellationScope uninterruptible({});
         QString error;
-        if(!confirmOnly && !Ota::saveJson(directory+"/install.json",{{"destination",destination}},&error))
-            return Ota::InstallResult{Ota::InstallState::FailedBeforeReplace,error};
+        auto intent=QJsonDocument::fromJson(Ota::read(directory+"/install.json",maxInstallIntent)).object();
+        intent["destination"]=destination;
+        const auto signedManifest=Ota::read(directory+"/release.json",65536),signature=Ota::read(directory+"/release.sig",64);
+        if(!signedManifest.isEmpty() && signature.size()==64) {
+            intent["manifest"]=QString::fromLatin1(signedManifest.toBase64());
+            intent["signature"]=QString::fromLatin1(signature.toBase64());
+        }
+        // The last receipt must survive removal of either signed metadata file.
+        if(!Ota::saveJson(directory+"/install.json",intent,&error))
+            return Ota::InstallResult{confirmOnly ? Ota::InstallState::ReplacedUnconfirmed : Ota::InstallState::FailedBeforeReplace,error};
         auto result=confirmOnly ? Ota::finishInstall(directory+"/bookorbit.next",destination,manifest) :
                                  Ota::install(directory+"/bookorbit.next",destination,manifest);
         if(result.state==Ota::InstallState::Complete) {
-            bool clean=true;
-            for(const auto *name:{"release.json","release.sig","install.json"})
-                if(QFileInfo::exists(directory+"/"+name) && !QFile::remove(directory+"/"+name)) clean=false;
-            if(!clean || !QDir().rmdir(directory)) result={Ota::InstallState::InstalledCleanupPending,"install.cleanup: cannot remove attempt"};
+            for(const auto *name:{"release.json","release.sig","install.json"}) {
+                const auto path=directory+"/"+name;
+                if((QFileInfo::exists(path) || QFileInfo(path).isSymLink()) && ::unlink(QFile::encodeName(path))!=0)
+                    return Ota::InstallResult{Ota::InstallState::InstalledCleanupPending,"install.cleanup: cannot remove "+QString(name)};
+            }
+            if(::rmdir(QFile::encodeName(directory))!=0) {
+                const bool retained=Ota::saveJson(directory+"/install.json",intent,&error);
+                result={Ota::InstallState::InstalledCleanupPending,retained ? "install.cleanup: cannot remove attempt" : "install.cleanup: cannot retain receipt: "+error};
+            }
         }
         return result;
     },[this](const Ota::InstallResult &result,bool) {

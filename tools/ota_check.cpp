@@ -30,7 +30,7 @@ struct UpdateManagerCheck {
     }
     static void install(UpdateManager &updater,const QString &directory,const QJsonObject &manifest,bool confirm=false) {
         updater.attemptDir=directory; updater.prepared=manifest;
-        if(!QFile::exists(directory+"/release.json")) {
+        if(!confirm && !QFile::exists(directory+"/release.json")) {
             QFile metadata(directory+"/release.json"); metadata.open(QIODevice::WriteOnly); metadata.write("test metadata");
         }
         updater.client->prepareUpdate();
@@ -40,6 +40,7 @@ struct UpdateManagerCheck {
         updater.apiBase=url; updater.cache=updater.normalizeCache(updater.cache); updater.startupDone=true;
     }
     static void loseCache(UpdateManager &updater) { updater.cache={}; }
+    static bool automaticStarted(const UpdateManager &updater) { return updater.automaticAttempted || updater.cache.contains("lastAutomatic"); }
     static void timeout(UpdateManager &updater) { QMetaObject::invokeMethod(&updater.totalDeadline,"timeout",Qt::DirectConnection); }
 };
 
@@ -51,10 +52,16 @@ static QString syncTarget,syncStaged;
 static QByteArray targetAtDirectorySync;
 static bool stagedAtDirectorySync=false;
 static bool cleanupFailure=false;
+static QString unlinkFailurePath,rmdirFailurePath;
 extern "C" int __real_unlink(const char *path);
 extern "C" int __wrap_unlink(const char *path) {
-    if(cleanupFailure && QFile::decodeName(path)==syncStaged) { errno=EACCES; return -1; }
+    if((cleanupFailure && QFile::decodeName(path)==syncStaged) || (!unlinkFailurePath.isEmpty() && QFile::decodeName(path)==unlinkFailurePath)) { errno=EACCES; return -1; }
     return __real_unlink(path);
+}
+extern "C" int __real_rmdir(const char *path);
+extern "C" int __wrap_rmdir(const char *path) {
+    if(!rmdirFailurePath.isEmpty() && QFile::decodeName(path)==rmdirFailurePath) { errno=EACCES; return -1; }
+    return __real_rmdir(path);
 }
 extern "C" int __real_fsync(int fd);
 extern "C" int __wrap_fsync(int fd) {
@@ -69,7 +76,8 @@ extern "C" int __wrap_fsync(int fd) {
     struct stat destinationDir{};
     const bool destinationSync=syncTarget.isEmpty() || (::stat(QFile::encodeName(QFileInfo(syncTarget).absolutePath()),&destinationDir)==0 &&
         destinationDir.st_dev==info.st_dev && destinationDir.st_ino==info.st_ino);
-    if((directory && destinationSync && syncFailure==SyncFailure::Directory) || (!directory && syncFailure==SyncFailure::File)) {
+    const bool destinationFile=syncTarget.isEmpty() || QFileInfo(QFileInfo("/proc/self/fd/"+QString::number(fd)).symLinkTarget()).absolutePath()==QFileInfo(syncTarget).absolutePath();
+    if((directory && destinationSync && syncFailure==SyncFailure::Directory) || (!directory && destinationFile && syncFailure==SyncFailure::File)) {
         errno=EIO; return -1;
     }
     return __real_fsync(fd);
@@ -123,6 +131,20 @@ static void cacheRegressions(Client &client,const QString &root) {
             QObject::connect(socket,&QTcpSocket::disconnected,socket,&QObject::deleteLater);
         }
     });
+    {
+        auto &executor=ClientWorkerCheck::executor(client);
+        WorkerGate gate(executor,&client);
+        check(waitUntil([&] { return gate.entered->load(); }),"hold startup recovery past the automatic-check timer");
+        UpdateManager delayed(&client,root+"/delayed-auto",root+"/bookorbit.app");
+        UpdateManagerCheck::source(delayed,endpoint);
+        const int before=requests.size();
+        delayed.automaticCheck();
+        check(delayed.state()=="recovering" && !UpdateManagerCheck::automaticStarted(delayed) && requests.size()==before,
+              "pending recovery does not consume the automatic attempt or its 24-hour interval");
+        gate.open();
+        check(waitUntil([&] { return delayed.state()=="available"; }) && requests.size()==before+1 && UpdateManagerCheck::automaticStarted(delayed),
+              "automatic HTTP check runs after delayed startup recovery");
+    }
     QString error; const auto data=root+"/cache-regression";
     {
         UpdateManager updater(&client,data,root+"/bookorbit.app");
@@ -292,6 +314,8 @@ int main(int argc,char **argv) {
                                 state==Ota::InstallState::ReplacedUnconfirmed ? "unconfirmed" :
                                 state==Ota::InstallState::InstalledCleanupPending ? "cleanup_pending" : "installed";
             check(manager.state()==expected && !client.busy(),"manager publishes correct result and releases client");
+            if(state==Ota::InstallState::FailedBeforeReplace)
+                check(QFile::exists(directory+"/install.json"),"application fsync failure is tested after the intent was durably written");
             check(Ota::read(target,100)==(state==Ota::InstallState::FailedBeforeReplace ? QByteArray("old version") : executable),"manager preserves actual replacement outcome");
             check(QFile::exists(syncStaged)==(state!=Ota::InstallState::Complete),"manager never discards staged executable on an incomplete install");
             syncFailure=SyncFailure::None; cleanupFailure=false;
@@ -310,11 +334,30 @@ int main(int argc,char **argv) {
         ClientWorkerCheck::executor(client).submit(&app,[](const FileCancellation &) { return true; },[&](bool,bool) { drained=true; });
         check(waitUntil([&] { return drained; }),"destructor cleanup settles");
         if(state==Ota::InstallState::FailedBeforeReplace) {
-            // A verified attempt remains protected even if the intent write failed.
+            // A failed replacement must remain protected after destruction.
             check(QFile::exists(syncStaged),"failed-before-replace attempt survives manager destruction");
         }
     }
     syncTarget.clear(); syncStaged.clear();
+    for(const bool confirm:{false,true}) {
+        const auto directory=root+"/update/attempt-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const auto installed=confirm ? executable : QByteArray("old version");
+        check(QDir().mkpath(directory) && Ota::save(directory+"/bookorbit.next",executable,&error) &&
+              Ota::save(directory+"/release.json","test metadata",&error) && Ota::save(target,installed,&error),"intent persistence failure fixture");
+        {
+            UpdateManager manager(&client,root,target);
+            check(waitUntil([&] { return manager.state()!="recovering"; }),"intent failure recovery settles");
+            syncTarget=directory+"/install.json"; syncFailure=SyncFailure::File;
+            UpdateManagerCheck::install(manager,directory,record,confirm);
+            check(waitUntil([&] { return manager.state()!="installing"; }) && manager.state()==(confirm ? "unconfirmed" : "ready") &&
+                  !client.busy() && Ota::read(target,100)==installed && QFile::exists(directory+"/bookorbit.next"),
+                  "intent persistence failure keeps the correct stage and both executable copies");
+            syncFailure=SyncFailure::None; syncTarget.clear();
+        }
+        bool drained=false;
+        ClientWorkerCheck::executor(client).submit(&app,[](const FileCancellation &) { return true; },[&](bool,bool) { drained=true; });
+        check(waitUntil([&] { return drained; }) && QFile::exists(directory+"/bookorbit.next"),"intent failure remains non-destructive after manager destruction");
+    }
 #endif
     if(argc==2) {
         const auto directory=root+"/update/attempt-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -332,13 +375,56 @@ int main(int argc,char **argv) {
             check(waitUntil([&] { return manager.state()=="unconfirmed"; }),"signed package reaches unconfirmed replacement");
             syncFailure=SyncFailure::None;
         }
+        check(Ota::saveJson(directory+"/install.json",{{"destination",target}},&error),"legacy destination-only installation intent");
         {
             UpdateManager restarted(&client,root,target);
-            check(waitUntil([&] { return restarted.state()!="recovering"; }) && restarted.state()=="unconfirmed" && QFile::exists(directory+"/bookorbit.next"),"startup retains and re-verifies signed unconfirmed installation");
+            check(waitUntil([&] { return restarted.state()!="recovering"; }) && restarted.state()=="unconfirmed" && QFile::exists(directory+"/bookorbit.next"),"startup retains and re-verifies signed unconfirmed legacy installation");
             UpdateManagerCheck::install(restarted,directory,release,true);
             check(waitUntil([&] { return restarted.state()=="installed"; }) && !QFile::exists(directory),"restart confirmation cleans only a confirmed installation");
         }
         syncTarget.clear(); syncStaged.clear();
+        for(const auto *failure:{"unknown","release.json","release.sig","install.json","directory"}) {
+            const auto retry=root+"/update/attempt-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
+            check(QDir().mkpath(retry) && Ota::stageArchive(QString::fromLocal8Bit(argv[1]),retry+"/bookorbit.next",Ota::version(),&release,&error) &&
+                  Ota::save(retry+"/release.json",archive.read("release.json",65536),&error) && Ota::save(retry+"/release.sig",archive.read("release.sig",64),&error),
+                  "signed metadata cleanup fixture");
+            if(QString(failure)=="unknown") check(Ota::save(retry+"/unknown.txt","keep",&error),"unknown content prevents directory cleanup");
+            else if(QString(failure)=="directory") rmdirFailurePath=retry;
+            else unlinkFailurePath=retry+"/"+failure;
+            {
+                UpdateManager manager(&client,root,target);
+                check(waitUntil([&] { return manager.state()!="recovering"; }),"metadata cleanup recovery settles");
+                UpdateManagerCheck::install(manager,retry,release);
+                check(waitUntil([&] { return manager.state()!="installing"; }) && manager.state()=="cleanup_pending" &&
+                      !QFile::exists(retry+"/bookorbit.next") && Ota::hashFile(target)==release["sha256"].toString(),
+                      "metadata cleanup error retains the confirmed installed application");
+            }
+            unlinkFailurePath.clear(); rmdirFailurePath.clear();
+            if(QString(failure)=="unknown") {
+                const auto receipt=QJsonDocument::fromJson(Ota::read(retry+"/install.json",128*1024)).object();
+                auto damaged=receipt; damaged["signature"]=QString::fromLatin1(QByteArray(64,0).toBase64());
+                check(Ota::saveJson(retry+"/install.json",damaged,&error),"tampered fallback receipt fixture");
+                {
+                    UpdateManager rejected(&client,root,target);
+                    check(waitUntil([&] { return rejected.state()!="recovering"; }) && rejected.state()=="idle" &&
+                          Ota::hashFile(target)==release["sha256"].toString() && QFile::exists(retry+"/install.json") &&
+                          Ota::read(retry+"/unknown.txt",100)=="keep","invalid receipt signature never authorizes cleanup or loses data");
+                }
+                check(Ota::saveJson(retry+"/install.json",receipt,&error),"restore the original signed receipt");
+            }
+            {
+                UpdateManager restarted(&client,root,target);
+                check(waitUntil([&] { return restarted.state()!="recovering"; }) && restarted.state()=="unconfirmed",
+                      "partial metadata cleanup remains recoverable after restart");
+                if(QString(failure)=="unknown") {
+                    check(Ota::read(retry+"/unknown.txt",100)=="keep","cleanup never removes unknown content");
+                    check(QFile::remove(retry+"/unknown.txt"),"remove the external cleanup obstacle");
+                }
+                UpdateManagerCheck::install(restarted,retry,release,true);
+                check(waitUntil([&] { return restarted.state()=="installed"; }) && !QFile::exists(retry),
+                      "recovered metadata cleanup completes without replacing the application");
+            }
+        }
 #endif
     }
     const auto package=argc==2 ? QString::fromLocal8Bit(argv[1]) : root+"/valid.zip";
