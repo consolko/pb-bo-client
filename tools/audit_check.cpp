@@ -210,12 +210,33 @@ void workerRaces(Client &client,const QString &root,const QString &fault) {
     auto modified=original; modified[modified.size()-1]^=1; mode(path,modified);
     require(!wait(client,[&] { remoteGate.open(); }) && posts(root)==before,"second full hash rejects a same-size rewrite after GET");
     mode(path,original); mode(fault,"");
+    for (int race=0;race<5;++race) {
+        mode(fault,"slow_progress"); position="pbr:/webkit?##epubcfi(/6/2!/4/6/1)";
+        const auto oldRecord=ClientWorkerCheck::record(client,"101"); const int beforePost=posts(root),beforeGet=gets();
+        client.syncFile(101); const auto localTask=ClientWorkerCheck::task(client);
+        require(until([&] { return gets()>beforeGet; }),"action race reaches server GET");
+        WorkerGate analysisGate(executor,&client);
+        require(until([&] { return analysisGate.entered->load() && ClientWorkerCheck::task(client)!=localTask; }),"hold decision validation after GET");
+        const auto analysisTask=ClientWorkerCheck::task(client); WorkerGate actionGate(executor,&client); analysisGate.open();
+        require(until([&] { return actionGate.entered->load() && ClientWorkerCheck::task(client)!=analysisTask; }),"chosen action is queued after the decision");
+        if (race==0) profile="changed-during-preparation";
+        if (race==1) position="pbr:/webkit?##epubcfi(/6/2!/4/8/1)";
+        if (race==2) ClientWorkerCheck::changeAccount(client);
+        if (race==3) { auto modified=original; modified[modified.size()-1]^=1; mode(path,modified); }
+        if (race==4) { auto record=oldRecord; record["progress"]=QJsonObject{{"profile",profile},{"localBase","changed"}}; ClientWorkerCheck::store(client,"101",record); }
+        require(!wait(client,[&] { actionGate.open(); }) && posts(root)==beforePost,
+                "late prepared action cannot write after profile, reader, account, file or journal changes");
+        profile="default"; position="pbr:/webkit?##epubcfi(/6/2!/4/6/1)";
+        if (race==3) mode(path,original);
+        if (race==4) ClientWorkerCheck::store(client,"101",oldRecord);
+        mode(fault,"");
+    }
 }
 
 void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &endpoint, const QString &root) {
     const QString data=root+"/presentation", source=root+"/plain.epub";
     QString scope;
-    { Client seed(endpoint,data); scope=seed.downloadDirectory(); }
+    { Client seed(endpoint,data); require(seed.configure(endpoint.toString(),"demo"),"configure presentation account"); scope=seed.downloadDirectory(); }
     const auto content=bytes(source);
     const QString digest=QString::fromLatin1(QCryptographicHash::hash(content,QCryptographicHash::Sha256).toHex());
     QJsonObject choices;
@@ -321,6 +342,62 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
         "isolated feedback notification updates the production QML message");
     std::printf("MEASURE: message_busy_context file_checks=0 library_builds=0 library_sorts=0 sync_builds=0 sync_sorts=0\n");
 
+    {
+        auto *model=client.bookModel(); int resets=0,updates=0;
+        const int affected=model==nullptr ? -1 : static_cast<LibraryModel *>(model)->rowFor(10007);
+        const auto resetConnection=QObject::connect(model,&QAbstractItemModel::modelReset,&engine,[&] { ++resets; });
+        auto changed=QObject::connect(model,&QAbstractItemModel::dataChanged,&engine,[&](const QModelIndex &first,const QModelIndex &last,const QList<int> &roles) {
+            require(first.row()==affected && last.row()==affected && !roles.isEmpty(),"status notification addresses one row and explicit roles"); ++updates;
+        });
+        const auto oldY=catalog->property("contentY");
+        client.resetPresentationWork();
+        ClientWorkerCheck::saveSyncMessage(client,"50007",uiMessage("previous_result_unavailable"));
+        require(waitForRecents(client),"single-book result history completes");
+        client.books(); client.syncSummary(); client.recentBook();
+        const auto work=client.presentationWork();
+        require(client.bookModel()==model && !resets && updates==1 && catalog->property("contentY")==oldY,
+                "single-book status retains model, other delegates and scroll position");
+        require(!work.libraryBuilds && !work.librarySorts && !work.syncBuilds && !work.syncSorts && work.localFileChecks==1 && work.bookUpdates==1 && work.syncUpdates==1,
+                "single-book completion updates one group and checks only its file among 1000 books");
+        QObject::disconnect(changed);
+
+        auto record=ClientWorkerCheck::record(client,"50007"); client.resetPresentationWork();
+        require(ClientWorkerCheck::save(client,"50007",record) && !client.presentationWork().recordWrites,"confirmed identical JSON skips writing");
+        const auto path=scope+"/records/50007.json";
+        require(QFile::rename(path,path+".held") && QDir().mkdir(path),"inject record commit failure");
+        record["invalid"]=true;
+        require(!ClientWorkerCheck::save(client,"50007",record),"record commit fails without a saved proof");
+        ClientWorkerCheck::store(client,"50007",record);
+        require(QDir().rmdir(path) && QFile::rename(path+".held",path),"restore record storage");
+        require(ClientWorkerCheck::save(client,"50007",record) && client.presentationWork().recordWrites==2 &&
+                QJsonDocument::fromJson(bytes(path)).object()==record,"memory equality after failed commit still writes and persists");
+        record.remove("invalid"); require(ClientWorkerCheck::save(client,"50007",record),"restore valid record");
+        require(QFile::remove(path) && ClientWorkerCheck::save(client,"50007",record),"missing confirmed JSON is recreated");
+        auto moved=record; moved["bookId"]=10008; auto book=moved["book"].toObject(); book["id"]=10008; moved["book"]=book;
+        ClientWorkerCheck::store(client,"50007",moved);
+        require(ClientWorkerCheck::bookFiles(client,10007).isEmpty() && ClientWorkerCheck::bookFiles(client,10008).size()==2,"book index moves a file without duplicate entries");
+        ClientWorkerCheck::publish(client);
+        require(client.books().size()==999 && catalog->property("count").toInt()==999 && grid->property("count").toInt()==999,"removing a book group notifies both shared views");
+        ClientWorkerCheck::store(client,"50007",record); ClientWorkerCheck::publish(client);
+        require(client.books().size()==1000 && ClientWorkerCheck::bookFiles(client,10007)==QStringList{"50007"},"book index and model recover original membership");
+        client.setLocalSort("title"); client.searchDownloaded("Книга 0007");
+        auto renamed=record; book=renamed["book"].toObject(); book["title"]=""; renamed["book"]=book;
+        client.resetPresentationWork(); ClientWorkerCheck::store(client,"50007",renamed); ClientWorkerCheck::publish(client);
+        require(client.books().isEmpty() && catalog->property("count").toInt()==0,"changing the title removes only the affected search result");
+        client.searchDownloaded("");
+        std::printf("MEASURE: title_move first_book=%d builds=%llu sorts=%llu\n",client.books().first().toMap()["bookId"].toInt(),
+                     static_cast<unsigned long long>(client.presentationWork().libraryBuilds),static_cast<unsigned long long>(client.presentationWork().librarySorts));
+        require(client.books().first().toMap()["bookId"].toInt()==10007 && !client.presentationWork().libraryBuilds && !client.presentationWork().librarySorts,
+                "changed sort key moves one prepared book without sorting the library");
+        ClientWorkerCheck::store(client,"50007",record); ClientWorkerCheck::publish(client); client.setLocalSort("recent");
+        require(!resets,"record updates and membership changes never reset the model");
+        // The model outlives this local signal counter.
+        QObject::disconnect(resetConnection);
+        const auto incremental=client.books(); const auto incrementalSync=client.syncSummary();
+        ClientWorkerCheck::rebuild(client);
+        require(client.books()==incremental && client.syncSummary()==incrementalSync,"incremental rows, order and counters match a fresh complete build");
+    }
+
     client.showSyncFile(50000);
     require(client.detail()["pendingProgress"].toBool(),"original profile exposes its pending position");
     require(client.prepareUpdate(),"defer native recents while busy");
@@ -358,6 +435,23 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
             window->property("syncData").value<QJSValue>().toVariant().toMap()["books"]==client.syncSummary()["books"],
         "live language switch retranslates cached sync labels and QML snapshot");
     require(client.setLanguage("ru"),"restore Russian after cached language check");
+    mode(root+"/fault.txt","");
+    for (int i=0;i<3;++i) {
+        const auto id=QString::number(50000+i); auto record=ClientWorkerCheck::record(client,id);
+        record["bookId"]=i+1; auto book=record["book"].toObject(); book["id"]=i+1; record["book"]=book;
+        require(ClientWorkerCheck::save(client,id,record),"bind three fixture records to catalog books");
+    }
+    client.resetPresentationWork();
+    require(wait(client,[&] { client.login(endpoint.toString(),"demo","demo"); }) &&
+            client.presentationWork().metadataVisits==3 && client.presentationWork().recordWrites==3,
+            "initial catalog refresh visits and writes only three linked records among 1000 files");
+    client.resetPresentationWork();
+    require(wait(client,[&] { client.refresh(); }) && client.presentationWork().metadataVisits==3 && !client.presentationWork().recordWrites,
+            "identical catalog metadata performs zero record writes");
+    require(wait(client,[&] { client.showDetail(1); }),"load detailed metadata through the same file index");
+    client.resetPresentationWork();
+    require(wait(client,[&] { client.refreshDetail(); }) && client.presentationWork().metadataVisits==1 && !client.presentationWork().recordWrites,
+            "identical detailed metadata also skips JSON writing");
     require(!warnings,"presentation checks produce no QML warnings");
     history={};
 }
@@ -397,6 +491,34 @@ int main(int argc,char **argv) {
     require(validEpub(fixture("plain")) && validEpub(fixture("doctype")),"validate EPUB container and resources");
     for (const auto &name:QStringList{"missing_container","missing_opf","missing_spine","ordinary_zip","truncated_zip"})
         require(!validEpub(fixture(name)),"reject invalid EPUB structure before replacement");
+    resetProgressWork(); PositionInfo resolved;
+    require(epubPosition(fixture("cache"),point,nullptr,nullptr,nullptr,&resolved) && progressWork().lengthPasses==0,
+            "coordinate validation parses only the target chapter before choosing an action");
+    require(positionEstimate(fixture("cache"),resolved,&percentage),"chosen action calculates chapter offsets once");
+    const auto cacheWork=progressWork();
+    require(cacheWork.packages==1 && cacheWork.chapters==12 && cacheWork.lengthPasses==1,"first estimate builds one package and twelve chapter lengths");
+    require(epubPosition(fixture("cache"),"epubcfi(/6/24!/4/2/1:100)",&percentage) &&
+            progressWork().packages==1 && progressWork().lengthPasses==1 && progressWork().chapters==12,
+            "second position reuses the package, chapter DOM and all accumulated lengths");
+    const auto cachePath=fixture("cache"); const auto cacheBytes=bytes(cachePath);
+    mode(cachePath,cacheBytes);
+    require(!positionEstimate(cachePath,resolved,&percentage),"same-size rewrite rejects coordinates resolved against an older identity");
+    require(epubPosition(cachePath,point,&percentage) && progressWork().packages==2 && progressWork().lengthPasses==2,
+            "changed file rebuilds the EPUB index");
+    require(QFile::rename(cachePath,cachePath+".held"),"move the indexed inode aside");
+    mode(cachePath,cacheBytes);
+    require(epubPosition(cachePath,point,&percentage) && progressWork().packages==3,"atomic replacement also invalidates the index");
+    require(QFile::remove(cachePath+".held"),"remove superseded cache fixture");
+    for (const auto &name:QStringList{"plain","doctype","comment","cdata","unicode"})
+        require(epubPosition(fixture(name),point,&percentage),"exercise bounded multi-book cache");
+    require(progressWork().cachedBooks<=4 && progressWork().cachedBytes<=16*1024*1024 && progressWork().cachedNodes<=100000 && progressWork().evictions>0,
+            "cache enforces book, memory and DOM-node limits");
+    expireEpubCache(); require(!progressWork().cachedBooks,"idle lifetime releases cached books");
+    {
+        FileCancellationScope cancelled(std::make_shared<std::atomic_bool>(true));
+        require(!epubPosition(cachePath,point,&percentage),"cancelled index construction cannot produce a position");
+    }
+    clearEpubCache();
     for (bool known:{false,true}) for (bool local:{false,true}) for (bool remote:{false,true}) {
         const auto expected=local!=remote ? (local ? SyncDecision::Upload : SyncDecision::ApplyRemote) :
             known && !local ? SyncDecision::Unchanged : SyncDecision::Conflict;

@@ -199,7 +199,10 @@ int main(int argc, char **argv) {
     require(!epubPosition(root+"/multi.epub","epubcfi(/6/4[wrong]!/4/14/1)",nullptr), "reject wrong CFI ID assertion");
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/14/1:65)";
     const int syncDownloads=requests(root,"GET /api/v1/books/files/101/download")+requests(root,"GET /api/v1/books/files/102/download");
+    c.resetPresentationWork();
     require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }), "upload native reading position to empty server");
+    require(c.presentationWork().uploadPreparations==1 && !c.presentationWork().remotePreparations && !c.presentationWork().conflictPreviews,
+            "upload prepares only the outgoing action");
     require(c.syncSummary()["synced"].toInt()==1, "only confirmed sync contributes to success count");
     Client statusRestart(endpoint,root);
     require(statusRestart.syncSummary()["synced"].toInt()==1, "confirmed status survives restart without a network session");
@@ -209,16 +212,21 @@ int main(int argc, char **argv) {
     require(wait(c,[&] { c.syncFile(101); }), "retry restores the confirmed state");
     require(QJsonDocument::fromJson(contents(scope+"/records/101.json")).object()["progress"].toObject()["localBase"]==nativeCfi(fakePosition), "persist agreed baseline");
     const int firstDownloads = requests(root, "GET /api/v1/books/files/101/download");
+    c.resetPresentationWork();
     require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && requests(root, "GET /api/v1/books/files/101/download") == firstDownloads,
             "unchanged progress uses GET without downloading EPUB again");
+    require(!c.presentationWork().uploadPreparations && !c.presentationWork().remotePreparations && !c.presentationWork().conflictPreviews,
+            "equal positions prepare neither direction");
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/6/1)";
     const int beforeMovedDownload=requests(root,"GET /api/v1/books/files/101/download");
     require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }), "sync deliberate backwards reading without percentage ordering");
     require(requests(root,"GET /api/v1/books/files/101/download")==beforeMovedDownload,
             "changed local position uploads without downloading EPUB");
     write(fault,"progress_remote");
-    applyAllowed=false; opened=false;
+    applyAllowed=false; opened=false; c.resetPresentationWork();
     require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }), "native write failure is not reported as synchronization success");
+    require(c.presentationWork().remotePreparations==1 && !c.presentationWork().uploadPreparations && !c.presentationWork().conflictPreviews,
+            "incoming position prepares only the native action");
     Client pendingRestart(endpoint,root);
     pendingRestart.showDownloaded(true);
     require(pendingRestart.books()[0].toMap()["pendingProgress"].toBool(), "incoming position survives restart");
@@ -239,9 +247,11 @@ int main(int argc, char **argv) {
     require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) &&
             QJsonDocument::fromJson(contents(scope+"/records/101.json")).object()["progress"].toObject()["remoteBase"].toObject()["cfi"].toString().contains(','),
             "repeat sync preserves original server range without echo upload");
-    fakeProfile="range-first-sync";
+    fakeProfile="range-first-sync"; c.resetPresentationWork();
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/6/1)";
     require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && c.progressConflict(), "first sync with local point and remote range requires explicit choice");
+    require(c.presentationWork().conflictPreviews==1 && !c.presentationWork().uploadPreparations && !c.presentationWork().remotePreparations,
+            "conflict uses checked coordinates without preparing either write direction");
     require(wait(c,[&] { c.resolveProgress(false); }) && appliedCfi=="epubcfi(/6/2!/4/42/1:0)",
             "explicit range choice saves validated start");
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/8/1)";
@@ -257,6 +267,9 @@ int main(int argc, char **argv) {
     require(waitUntil([&] { return !c.busy(); }), "offline conflict preparation completes");
     require(c.progressConflict() && c.conflictPositions().size()==2 && !c.conflictPositions()[0].toMap()["excerpt"].toString().isEmpty() &&
             requests(root,"GET /api/v1/books/files/101/progress")==conflictGets, "saved conflict opens offline with local text context and no GET");
+    const auto excerpt=c.conflictPositions()[0].toMap()["excerpt"];
+    require(c.setLanguage("en") && !c.busy() && c.conflictPositions()[0].toMap()["excerpt"]==excerpt &&
+            c.setLanguage("ru") && !c.busy(),"conflict translation reuses verified previews without a new file task");
     networkAvailable=true;
     const int revision=c.conflictRevision(), postsBeforeChoice=requests(root,"POST /api/v1/books/files/101/progress");
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/12/1)";

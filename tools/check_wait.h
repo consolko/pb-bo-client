@@ -17,6 +17,12 @@ struct ClientWorkerCheck {
     static void cleanup(Client &client) { client.cleanupBooks(); }
     static void invalidateSession(Client &client) { client.invalidateSession(); }
     static void reload(Client &client) { client.loadRecords(); }
+    static QJsonObject record(const Client &client,const QString &id) { return client.downloads.value(id).toObject(); }
+    static bool save(Client &client,const QString &id,const QJsonObject &record) { return client.saveRecord(id,record); }
+    static void store(Client &client,const QString &id,const QJsonObject &record) { client.storeRecord(id,record); }
+    static QStringList bookFiles(const Client &client,int bookId) { return client.filesByBook.value(bookId); }
+    static void publish(Client &client) { client.publishDataChanges(); }
+    static void rebuild(Client &client) { client.invalidateLibrary(); client.invalidateSync(); }
     static void saveSyncMessage(Client &client,const QString &id,const UiMessage &message) {
         client.syncingId=id; client.finish(message,false,"progress","error");
     }

@@ -28,6 +28,7 @@
 #include <QXmlStreamReader>
 #include <QTextDocument>
 #include <memory>
+#include <utility>
 
 namespace {
 constexpr qint64 maxBook = 100 * 1024 * 1024;
@@ -139,8 +140,69 @@ bool sameStorage(const QString &first, const QString &second) {
 }
 }
 
+namespace {
+const QStringList libraryRoles{"bookId","title","author","seriesName","seriesIndex","readStatus","readingProgress",
+    "fileId","format","fileCount","formats","localFormats","downloaded","readable","canSync","supported",
+    "needsRepair","syncResult","pendingProgress","remoteFileChanged","hasConflict"};
+int libraryBookId(const QJsonObject &record) {
+    const auto book=record["book"].toObject();
+    return book.isEmpty() ? record["bookId"].toInt() : book["id"].toInt();
+}
+QString syncGroupKey(const QString &id,const QJsonObject &record) {
+    const auto book=record["book"].toObject();
+    return positiveId(book["id"]) ? "book:"+QString::number(book["id"].toInt()) : "file:"+id;
+}
+const QStringList syncPriority{"conflict","file","position","reader","reader_unknown","error","auth","pending","uncertain","network","unknown","synced"};
+bool syncLess(const QVariant &a,const QVariant &b) {
+    const auto left=a.toMap(),right=b.toMap();
+    const int l=syncPriority.indexOf(left["state"].toString()),r=syncPriority.indexOf(right["state"].toString());
+    if (l!=r) return l<r;
+    const int title=QString::localeAwareCompare(left["title"].toString(),right["title"].toString());
+    return title ? title<0 : left["key"].toString()<right["key"].toString();
+}
+}
+QHash<int,QByteArray> LibraryModel::roleNames() const {
+    QHash<int,QByteArray> result;
+    for (int i=0;i<libraryRoles.size();++i) result[Qt::UserRole+1+i]=libraryRoles[i].toUtf8();
+    return result;
+}
+QVariant LibraryModel::data(const QModelIndex &index,int role) const {
+    const int name=role-Qt::UserRole-1;
+    if (!index.isValid() || index.row()<0 || index.row()>=rows.size() || name<0 || name>=libraryRoles.size()) return {};
+    return rows[index.row()].toMap().value(libraryRoles[name]);
+}
+int LibraryModel::rowFor(int bookId) const {
+    for (int i=0;i<rows.size();++i) if (rows[i].toMap()["bookId"].toInt()==bookId) return i;
+    return -1;
+}
+void LibraryModel::update(int row,const QVariantMap &value) {
+    const auto before=rows[row].toMap(); QList<int> roles;
+    for (int i=0;i<libraryRoles.size();++i) if (before.value(libraryRoles[i])!=value.value(libraryRoles[i])) roles.append(Qt::UserRole+1+i);
+    if (roles.isEmpty()) return;
+    rows[row]=value; emit dataChanged(index(row),index(row),roles);
+}
+void LibraryModel::insert(int row,const QVariantMap &value) {
+    beginInsertRows({},row,row); rows.insert(row,value); endInsertRows();
+}
+void LibraryModel::remove(int row) {
+    beginRemoveRows({},row,row); rows.removeAt(row); endRemoveRows();
+}
+void LibraryModel::move(int from,int to) {
+    if (from==to) return;
+    beginMoveRows({},from,from,{},to>from ? to+1 : to); rows.move(from,to); endMoveRows();
+}
+void LibraryModel::replace(const QVariantList &values,bool reset) {
+    if (reset) { beginResetModel(); rows=values; endResetModel(); return; }
+    QSet<int> ids; for (const auto &row:values) ids.insert(row.toMap()["bookId"].toInt());
+    for (int i=rows.size()-1;i>=0;--i) if (!ids.contains(rows[i].toMap()["bookId"].toInt())) remove(i);
+    for (int i=0;i<values.size();++i) {
+        const auto value=values[i].toMap(); const int old=rowFor(value["bookId"].toInt());
+        if (old<0) insert(i,value); else { move(old,i); update(i,value); }
+    }
+}
+
 Client::Client(QUrl server, QString root, QObject *parent, bool restoreAccount)
-    : QObject(parent), endpoint(server), rootDir(root) {
+    : QObject(parent), libraryModel(this), endpoint(server), rootDir(root) {
     diagnosticClock.start();
     network.setTransferTimeout(15000);
     const bool dataDirectoryCreated = QDir().mkpath(rootDir);
@@ -225,9 +287,10 @@ void Client::retranslate() {
 
 void Client::loadRecords() {
     ++accountGeneration; ++recentsGeneration;
+    files.submit(this,[](const FileCancellation &) { clearEpubCache(); return true; },[](bool,bool) {});
     if (recentsTask) recentsTask->store(true);
     cancelCleanup();
-    recentsScheduled=false;
+    recentsScheduled=false; recentsFull=false; recentsBooks.clear(); recentsRequested=false;
     const auto key = QCryptographicHash::hash((endpoint.toString()+"\n"+user).toUtf8(), QCryptographicHash::Sha256).toHex();
     scopeDir = rootDir + "/" + QString::fromLatin1(key.left(24));
     QDir().mkpath(scopeDir);
@@ -265,6 +328,7 @@ void Client::loadRecords() {
     coverVersions = readObject(scopeDir+"/cover-index.json");
     count = currentPage = 0;
     downloads = {};
+    savedRecordStamps.clear(); filesByBook.clear();
     syncResults = {};
     bool recordsReadable = true;
     const QString recordsDir = scopeDir+"/records";
@@ -277,8 +341,12 @@ void Client::loadRecords() {
         if (!validId(id)) continue;
         const QFileInfo info(recordsDir+"/"+name);
         if (!info.isFile() || info.isSymLink()) { recordsReadable = false; continue; }
+        const auto stamp=fileStamp(info.absoluteFilePath());
         const auto record = readObject(recordsDir+"/"+name);
-        if (!recordFile(id, record).isEmpty()) downloads[id] = record;
+        if (!recordFile(id, record).isEmpty()) {
+            downloads[id] = record;
+            if (stamp.valid && fileStamp(info.absoluteFilePath())==stamp) savedRecordStamps[id]=stamp;
+        }
         else recordsReadable = false;
     }
     const QString oldPath = scopeDir+"/downloads.json";
@@ -311,8 +379,10 @@ void Client::loadRecords() {
         if (recordFile(id, record).isEmpty()) { migrated = false; continue; }
         const QString destination = recordsDir+"/"+id+".json";
         if (!writeObject(destination, record) || readObject(destination) != record) migrated = false;
+        else savedRecordStamps[id]=fileStamp(destination);
         downloads[id] = record;
     }
+    for (auto it=downloads.begin(); it!=downloads.end(); ++it) indexRecord(it.key(),{},it.value().toObject());
     if (QFile::exists(oldPath) && migrated)
         migrated = QFile::rename(oldPath, scopeDir+"/downloads-v1.json");
     if (migrated) QFile::remove(scopeDir+"/catalog.json");
@@ -473,7 +543,7 @@ void Client::invalidateSync() {
 
 void Client::publishDataChanges() {
     // Reading a dirty snapshot must not consume the notification still owed to QML.
-    if (libraryPending) { libraryPending=false; emit libraryChanged(); }
+    if (libraryPending) { libraryPending=false; if (modelObserved) ensureLibrary(); emit libraryChanged(); }
     if (syncPending) { syncPending=false; emit syncSummaryChanged(); }
     if (detailPending) { detailPending=false; emit detailChanged(); }
 }
@@ -486,17 +556,25 @@ void Client::notifyOperation() {
 }
 
 void Client::storeRecord(const QString &id, const QJsonObject &record) {
-    if (downloads.value(id).toObject() == record) return;
+    const auto before=downloads.value(id).toObject();
+    if (before == record) return;
+    savedRecordStamps.remove(id);
+    indexRecord(id,before,record);
     downloads[id] = record;
-    invalidateLibrary();
-    invalidateSync();
-    if (detailBook.value("id") == record["bookId"]) detailPending=true;
+    for (const auto key:{"filename","directory","bytes","sha256","invalid"}) if (before[key]!=record[key]) {
+        libraryFiles.remove(id.toInt()); syncFiles.remove(id.toInt()); break;
+    }
+    invalidateBook(libraryBookId(before)); invalidateBook(libraryBookId(record));
+    changedSyncGroups.insert(syncGroupKey(id,before)); changedSyncGroups.insert(syncGroupKey(id,record));
+    changedUnsupported.insert(before["book"].toObject()["id"].toInt());
+    changedUnsupported.insert(record["book"].toObject()["id"].toInt());
+    if (detailBook.value("id") == record["bookId"] || detailBook.value("id")==before["bookId"]) detailPending=true;
 }
 
 void Client::setSyncResult(const QString &id, const UiMessage &text) {
     if (syncResults.value(id) == text.toJson()) return;
     syncResults[id] = text.toJson();
-    invalidateLibrary();
+    invalidateBook(libraryBookId(downloads.value(id).toObject()),false);
     if (detailBook.value("id") == downloads.value(id).toObject()["bookId"] ||
         detailBook.value("selectedFile").toObject()["id"].toInt() == id.toInt()) detailPending=true;
 }
@@ -504,15 +582,43 @@ void Client::setSyncResult(const QString &id, const UiMessage &text) {
 void Client::clearSyncResult(const QString &id) {
     if (!syncResults.contains(id)) return;
     syncResults.remove(id);
-    invalidateLibrary();
+    invalidateBook(libraryBookId(downloads.value(id).toObject()),false);
     if (detailBook.value("id") == downloads.value(id).toObject()["bookId"]) detailPending=true;
 }
 
 bool Client::saveRecord(const QString &id, const QJsonObject &record) {
-    if (recordFile(id, record).isEmpty() ||
-        !writeObject(scopeDir+"/records/"+id+".json", record)) return false;
+    if (recordFile(id, record).isEmpty()) return false;
+    const auto path=scopeDir+"/records/"+id+".json";
+    const auto saved=savedRecordStamps.value(id);
+    if (saved.valid && downloads.value(id).toObject()==record && fileStamp(path)==saved) return true;
+    savedRecordStamps.remove(id);
+#ifdef BOOKORBIT_TEST_HTTP
+    ++presentationCounters.recordWrites;
+#endif
+    if (!writeObject(path, record)) return false;
     storeRecord(id, record);
+    savedRecordStamps[id]=fileStamp(path);
     return true;
+}
+
+void Client::indexRecord(const QString &id,const QJsonObject &before,const QJsonObject &after) {
+    auto keys=[](const QJsonObject &record) {
+        QSet<int> result;
+        if (!record.isEmpty()) {
+            result.insert(record["bookId"].toInt());
+            result.insert(record["book"].toObject()["id"].toInt());
+        }
+        return result;
+    };
+    const auto old=keys(before),next=keys(after);
+    for (int key:old-next) {
+        filesByBook[key].removeAll(id);
+        if (filesByBook[key].isEmpty()) filesByBook.remove(key);
+    }
+    for (int key:next-old) {
+        auto &ids=filesByBook[key];
+        ids.insert(std::lower_bound(ids.begin(),ids.end(),id),id);
+    }
 }
 
 QString Client::recordFile(const QString &id, const QJsonObject &record) const {
@@ -689,26 +795,59 @@ void Client::setLocalSort(const QString &sort) {
 
 void Client::refreshRecents() {
     const auto profile=readerProfile();
-    if (nativeRecents.profile!=profile) { nativeRecents={}; nativeRecents.profile=profile; invalidateLibrary(); invalidateSync(); detailPending=detailPending || detailVisible(); publishDataChanges(); }
-    recentsRequested=true;
-    if (busy() || recentsScheduled) return;
+    if (nativeRecents.profile!=profile) {
+        nativeRecents={}; nativeRecents.profile=profile;
+        invalidateLibrary(); invalidateSync(); detailPending=detailPending || detailVisible(); publishDataChanges();
+    }
+    recentsFull=true; recentsRequested=true; runRecents();
+}
+void Client::refreshBookRecents(int bookId) {
+    if (nativeRecents.profile!=readerProfile()) { refreshRecents(); return; }
+    recentsBooks.insert(bookId); recentsRequested=true; runRecents();
+}
+void Client::runRecents() {
+    if (!recentsRequested || busy() || recentsScheduled) return;
+    const bool full=std::exchange(recentsFull,false);
+    const auto books=std::exchange(recentsBooks,{});
     recentsScheduled=true; recentsRequested=false;
-    QStringList paths;
-    for (const auto value:downloads) {
-        const auto book=value.toObject()["book"].toObject();
-        const QString path=localFile(book);
+    QStringList ids;
+    if (full) ids=downloads.keys(); else for (int bookId:books) ids.append(filesByBook.value(bookId));
+    ids.removeDuplicates(); QStringList paths,affectedPaths; QHash<QString,int> owners;
+    for (const auto &id:ids) {
+        const auto record=downloads.value(id).toObject(),book=record["book"].toObject();
+        const auto path=localFile(book),old=libraryFiles.value(id.toInt());
+        if ((libraryFiles.contains(id.toInt()) && old!=path) ||
+            (syncFiles.contains(id.toInt()) && syncFiles.value(id.toInt())!=path)) invalidateBook(libraryBookId(record));
+        libraryFiles[id.toInt()]=path; syncFiles[id.toInt()]=path;
+        const auto known=recordFile(id,record);
+        if (!known.isEmpty()) { affectedPaths.append(known); owners[known]=libraryBookId(record); }
         if (!path.isEmpty() && readableFormat(fileFormat(book["selectedFile"].toObject()))) paths << path;
     }
     paths.removeDuplicates();
-    const auto generation=++recentsGeneration,account=accountGeneration;
-    recentsTask=files.submit(this,readerRecentsTask(paths,profile),[this,generation,account,profile](ReaderRecents result,bool cancelled) {
+    const auto generation=++recentsGeneration,account=accountGeneration; const auto profile=readerProfile();
+    recentsTask=files.submit(this,readerRecentsTask(paths,profile),[this,generation,account,profile,full,books,affectedPaths,owners](ReaderRecents result,bool cancelled) {
         if (generation!=recentsGeneration) return;
         recentsScheduled=false;
         if (!cancelled && account==accountGeneration && profile==readerProfile() && !busy()) {
-            nativeRecents=std::move(result);
-            invalidateLibrary(); invalidateSync(); detailPending=detailPending || detailVisible(); publishDataChanges();
-        } else recentsRequested=true;
-        if (recentsRequested && !busy()) refreshRecents();
+            const auto before=nativeRecents;
+            if (full || !result.available || before.available!=result.available) nativeRecents=std::move(result);
+            else {
+                for (const auto &path:affectedPaths) {
+                    nativeRecents.files.remove(path);
+                    if (result.files.contains(path)) nativeRecents.files[path]=result.files[path];
+                }
+            }
+            if (before.available!=nativeRecents.available) { invalidateLibrary(); invalidateSync(); }
+            else for (const auto &path:affectedPaths) {
+                const auto a=before.files.value(path),b=nativeRecents.files.value(path);
+                if (a.bookId!=b.bookId || a.openTime!=b.openTime || before.files.contains(path)!=nativeRecents.files.contains(path)) invalidateBook(owners.value(path),false);
+            }
+            if (detailVisible() && changedBooks.contains(detailBook["id"].toInt())) detailPending=true;
+            publishDataChanges();
+        } else {
+            recentsFull=recentsFull || full; recentsBooks.unite(books); recentsRequested=true;
+        }
+        runRecents();
     });
 }
 
@@ -742,10 +881,11 @@ void Client::openFile(int fileId,bool applyIncoming) {
 
 QVariantList Client::books() const {
     ensureLibrary();
-    return libraryBooks;
+    return libraryModel.snapshot();
 }
+QAbstractItemModel *Client::bookModel() const { ensureLibrary(); modelObserved=true; return &libraryModel; }
 
-QVariantMap Client::syncFileStatus(const QString &id, const QString &profile) const {
+QVariantMap Client::syncFileStatus(const QString &id, const QString &profile,LocalFiles *files) const {
     const auto record=downloads.value(id).toObject(), progress=record["progress"].toObject();
     const auto saved=record["syncStatus"].toObject();
     const bool sameProfile=saved["profile"].toString()==profile;
@@ -753,7 +893,7 @@ QVariantMap Client::syncFileStatus(const QString &id, const QString &profile) co
     QString state=sameProfile ? saved["state"].toString("unknown") : "unknown";
     QString reason=sameProfile ? UiMessage::fromJson(saved.contains("message") ? saved["message"] : saved["text"]).text() : QString{};
     const auto book=record["book"].toObject();
-    const bool available=!localFile(book).isEmpty();
+    const bool available=!localFile(book,files).isEmpty();
     if (record["remoteFileChanged"].toBool()) {
         state="file"; reason=QCoreApplication::translate("BookOrbit", "The server file differs. Download the new version before syncing positions.");
     } else if (!available) {
@@ -781,60 +921,87 @@ QVariantList Client::syncBooks() const {
     return syncSummary()["books"].toList();
 }
 
-QVariantList Client::buildSyncBooks() const {
-#ifdef BOOKORBIT_TEST_HTTP
-    ++presentationCounters.syncBuilds;
-#endif
-    QMap<QString,QVariantMap> grouped;
-    const QString profile=readerProfile();
-    const QStringList priority{"conflict","file","position","reader","reader_unknown","error","auth","pending","uncertain","network","unknown","synced"};
-    for (auto it=downloads.begin(); it!=downloads.end(); ++it) {
-        const auto record=it.value().toObject();
-        if (!syncFormat(record["format"].toString("epub"))) continue;
-        const auto book=record["book"].toObject();
-        const QString key=positiveId(book["id"]) ? "book:"+QString::number(book["id"].toInt()) : "file:"+it.key();
-        const auto file=syncFileStatus(it.key(),profile);
-        auto &entry=grouped[key];
+void Client::invalidateSyncBook(int bookId) {
+    if (bookId>0) changedSyncGroups.insert("book:"+QString::number(bookId));
+    for (const auto &id:filesByBook.value(bookId)) changedSyncGroups.insert(syncGroupKey(id,downloads.value(id).toObject()));
+    changedUnsupported.insert(bookId); syncPending=true;
+}
+QVariantMap Client::syncGroup(const QString &key) const {
+    const auto ids=key.startsWith("book:") ? filesByBook.value(key.mid(5).toInt()) : QStringList{key.mid(5)};
+    QVariantMap entry; QVariantList variants;
+    for (const auto &id:ids) {
+        const auto record=downloads.value(id).toObject();
+        if (record.isEmpty() || syncGroupKey(id,record)!=key || !syncFormat(record["format"].toString("epub"))) continue;
+        const auto book=record["book"].toObject(); const auto file=syncFileStatus(id,readerProfile(),&syncFiles);
         if (entry.isEmpty()) entry={{"key",key},{"title",book["title"].toString(QCoreApplication::translate("BookOrbit", "Untitled"))},
             {"author",authorNames(book["authors"].toArray())},{"state","synced"},{"label",QCoreApplication::translate("BookOrbit", "Synced")}};
-        auto files=entry["files"].toList(); files.append(file); entry["files"]=files;
-        if (priority.indexOf(file["state"].toString())<=priority.indexOf(entry["state"].toString())) {
+        variants.append(file);
+        if (syncPriority.indexOf(file["state"].toString())<=syncPriority.indexOf(entry["state"].toString())) {
             entry["state"]=file["state"]; entry["label"]=file["label"];
         }
     }
-    QVariantList result;
-    for (auto entry : grouped) {
-        const QString state=entry["state"].toString();
+    if (!entry.isEmpty()) {
+        entry["files"]=variants; const auto state=entry["state"].toString();
         entry["group"]=state=="synced" ? "synced" : (state=="unknown" || state=="network") ? "waiting" : "attention";
-        result.append(entry);
     }
+    return entry;
+}
+QVariantList Client::buildSyncBooks() const {
 #ifdef BOOKORBIT_TEST_HTTP
-    ++presentationCounters.syncSorts;
+    ++presentationCounters.syncBuilds; ++presentationCounters.syncSorts;
 #endif
-    std::stable_sort(result.begin(),result.end(),[&priority](const QVariant &a,const QVariant &b) {
-        const auto left=a.toMap(),right=b.toMap();
-        const int l=priority.indexOf(left["state"].toString()),r=priority.indexOf(right["state"].toString());
-        return l!=r ? l<r : QString::localeAwareCompare(left["title"].toString(),right["title"].toString())<0;
-    });
+    syncGroups.clear(); syncFiles.clear(); QSet<QString> keys;
+    for (auto it=downloads.begin();it!=downloads.end();++it) keys.insert(syncGroupKey(it.key(),it.value().toObject()));
+    QVariantList result;
+    for (const auto &key:keys) {
+        const auto group=syncGroup(key);
+        if (!group.isEmpty()) { syncGroups[key]=group; result.append(group); }
+    }
+    std::sort(result.begin(),result.end(),syncLess);
     return result;
 }
-
 QVariantMap Client::syncSummary() const {
-    if (!syncDirty) return cachedSyncSummary;
-    const auto books=buildSyncBooks();
-    int synced=0,waiting=0,attention=0;
-    for (const auto &book:books) {
-        const auto group=book.toMap()["group"];
-        if (group=="synced") ++synced; else if (group=="waiting") ++waiting; else ++attention;
+    if (syncDirty) {
+        syncOrder=buildSyncBooks();
+        int synced=0,waiting=0,attention=0;
+        for (const auto &book:syncOrder) {
+            const auto group=book.toMap()["group"];
+            if (group=="synced") ++synced; else if (group=="waiting") ++waiting; else ++attention;
+        }
+        QSet<int> supported; unsupportedBooks.clear();
+        for (const auto value:downloads) {
+            const auto record=value.toObject(); const int id=record["book"].toObject()["id"].toInt();
+            if (syncFormat(record["format"].toString("epub"))) supported.insert(id); else unsupportedBooks.insert(id);
+        }
+        unsupportedBooks.subtract(supported);
+        cachedSyncSummary={{"books",syncOrder},{"total",syncOrder.size()},{"synced",synced},{"waiting",waiting},{"attention",attention},{"unsupported",unsupportedBooks.size()}};
+        syncDirty=false; changedSyncGroups.clear(); changedUnsupported.clear();
+    } else if (!changedSyncGroups.isEmpty() || !changedUnsupported.isEmpty()) {
+        for (const auto &key:std::exchange(changedSyncGroups,{})) {
+            const auto old=syncGroups.take(key),next=syncGroup(key);
+            if (old==next) { if (!next.isEmpty()) syncGroups[key]=next; continue; }
+#ifdef BOOKORBIT_TEST_HTTP
+            ++presentationCounters.syncUpdates;
+#endif
+            auto count=[this](const QVariantMap &group,int delta) {
+                if (group.isEmpty()) return;
+                const auto name=group["group"].toString(); cachedSyncSummary[name]=cachedSyncSummary[name].toInt()+delta;
+            };
+            count(old,-1); count(next,1);
+            for (int i=0;i<syncOrder.size();++i) if (syncOrder[i].toMap()["key"]==key) { syncOrder.removeAt(i); break; }
+            if (!next.isEmpty()) { syncGroups[key]=next; syncOrder.insert(std::lower_bound(syncOrder.begin(),syncOrder.end(),QVariant(next),syncLess),next); }
+        }
+        for (int bookId:std::exchange(changedUnsupported,{})) {
+            bool supported=false,unsupported=false;
+            for (const auto &id:filesByBook.value(bookId)) {
+                const auto record=downloads.value(id).toObject();
+                if (record["book"].toObject()["id"].toInt()!=bookId) continue;
+                if (syncFormat(record["format"].toString("epub"))) supported=true; else unsupported=true;
+            }
+            if (unsupported && !supported) unsupportedBooks.insert(bookId); else unsupportedBooks.remove(bookId);
+        }
+        cachedSyncSummary["books"]=syncOrder; cachedSyncSummary["total"]=syncOrder.size(); cachedSyncSummary["unsupported"]=unsupportedBooks.size();
     }
-    QSet<int> unsupported,supported;
-    for (const auto value : downloads) {
-        const auto record=value.toObject(); const int id=record["book"].toObject()["id"].toInt();
-        if (syncFormat(record["format"].toString("epub"))) supported.insert(id); else unsupported.insert(id);
-    }
-    unsupported.subtract(supported);
-    cachedSyncSummary={{"books",books},{"total",books.size()},{"synced",synced},{"waiting",waiting},{"attention",attention},{"unsupported",unsupported.size()}};
-    syncDirty=false;
     return cachedSyncSummary;
 }
 
@@ -858,7 +1025,7 @@ void Client::connectForSync() {
     if (ensureNetwork()) { feedbackResult="success"; message =uiMessage("network_connected_retry_sync_now"); emit feedbackChanged(); }
 }
 
-void Client::prepareConflict(const QString &id,const QString &local,const QJsonObject &remote,const QString &profile) {
+void Client::prepareConflict(const QString &id,const QString &local,const QJsonObject &remote,const QString &profile,const QVariantList &prepared,const FileStamp &proof) {
     const bool different=conflictId!=id || conflictLocal!=local || conflictRemote!=remote || conflictProfile!=profile;
     conflictId=id; conflictLocal=local; conflictRemote=remote; conflictProfile=profile;
     conflictMessage=downloads.value(id).toObject()["book"].toObject()["title"].toString();
@@ -867,9 +1034,38 @@ void Client::prepareConflict(const QString &id,const QString &local,const QJsonO
     if (conflictTask) conflictTask->store(true);
     const auto generation=++conflictGeneration,account=accountGeneration;
     conflictPreparing=true; positionChoices.clear();
-    if (different) ++positionRevision;
+    if (different) { ++positionRevision; conflictPreview.clear(); conflictStamp={}; conflictDigest.clear(); }
     notifyOperation(); emit conflictChanged();
-    conflictTask=files.submit(this,[path,local,remote,record](const FileCancellation &cancel) {
+    auto done=[this,id,local,remote,profile,record,path,generation,account](const std::pair<QVariantList,FileStamp> &result,bool cancelled) {
+        if (generation!=conflictGeneration) return;
+        conflictPreparing=false; conflictTask.reset();
+        if (!cancelled && account==accountGeneration && profile==readerProfile() && conflictId==id && conflictLocal==local &&
+            conflictRemote==remote && downloads.value(id).toObject()["sha256"]==record["sha256"] &&
+            downloads.value(id).toObject()["progress"]==record["progress"] && fileStamp(path)==result.second) {
+            bool other=false;
+            for (const auto key:{"pageNumber","positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
+                "koboLocationType","koboLocationValue","koboContentSourceProgressPercent","koreaderProgress","narrationPercentage","narrationUpdatedAt"})
+                if (remote.contains(key) && !remote[key].isNull()) other=true;
+            conflictPreview=result.first; conflictStamp=result.second; conflictDigest=record["sha256"].toString();
+            positionChoices=result.first;
+            for (auto &choice:positionChoices) {
+                auto context=choice.toMap(); const bool useLocal=context.take("local").toBool(),valid=context.take("valid").toBool();
+                const double percentage=context.take("percentageValue").toDouble(); const bool empty=context.take("empty").toBool();
+                context["local"]=useLocal;
+                context["source"]=useLocal ? QCoreApplication::translate("BookOrbit", "On this PocketBook") : QCoreApplication::translate("BookOrbit", "In BookOrbit");
+                context["percentage"]=valid ? QCoreApplication::translate("BookOrbit", "About %1% of the book").arg(QLocale().toString(percentage,'f',1)) : empty ? QCoreApplication::translate("BookOrbit", "No position saved yet") : QCoreApplication::translate("BookOrbit", "The position does not match this book");
+                context["canUse"]=valid && !(useLocal && other) && !record["remoteFileChanged"].toBool();
+                context["notice"]=useLocal && other ? QCoreApplication::translate("BookOrbit", "Upload stopped to preserve other server position data.") : QString{};
+                choice=context;
+            }
+        }
+        notifyOperation(); emit conflictChanged();
+        if (!busy() && recentsRequested) runRecents();
+        if (!busy() && cleanupPending) cleanupBooks();
+    };
+    if (!prepared.isEmpty()) done({prepared,proof},false);
+    else if (!different && !conflictPreview.isEmpty() && fileStamp(path)==conflictStamp && conflictDigest==record["sha256"].toString()) done({conflictPreview,conflictStamp},false);
+    else conflictTask=files.submit(this,[path,local,remote,record](const FileCancellation &cancel) {
         QVariantList choices;
         const auto before=fileStamp(path);
         for (bool useLocal:{true,false}) {
@@ -884,34 +1080,8 @@ void Client::prepareConflict(const QString &id,const QString &local,const QJsonO
             auto context=choice.toMap(); context["valid"]=false; context.remove("chapter"); context.remove("excerpt"); choice=context;
         }
         return std::make_pair(choices,before);
-    },[this,id,local,remote,profile,record,path,generation,account](const auto &result,bool cancelled) {
-        if (generation!=conflictGeneration) return;
-        conflictPreparing=false; conflictTask.reset();
-        if (!cancelled && account==accountGeneration && profile==readerProfile() && conflictId==id && conflictLocal==local &&
-            conflictRemote==remote && downloads.value(id).toObject()["sha256"]==record["sha256"] &&
-            downloads.value(id).toObject()["progress"]==record["progress"] && fileStamp(path)==result.second) {
-            bool other=false;
-            for (const auto key:{"pageNumber","positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
-                "koboLocationType","koboLocationValue","koboContentSourceProgressPercent","koreaderProgress","narrationPercentage","narrationUpdatedAt"})
-                if (remote.contains(key) && !remote[key].isNull()) other=true;
-            positionChoices=result.first;
-            for (auto &choice:positionChoices) {
-                auto context=choice.toMap(); const bool useLocal=context.take("local").toBool(),valid=context.take("valid").toBool();
-                const double percentage=context.take("percentageValue").toDouble(); const bool empty=context.take("empty").toBool();
-                context["local"]=useLocal;
-                context["source"]=useLocal ? QCoreApplication::translate("BookOrbit", "On this PocketBook") : QCoreApplication::translate("BookOrbit", "In BookOrbit");
-                context["percentage"]=valid ? QCoreApplication::translate("BookOrbit", "About %1% of the book").arg(QLocale().toString(percentage,'f',1)) : empty ? QCoreApplication::translate("BookOrbit", "No position saved yet") : QCoreApplication::translate("BookOrbit", "The position does not match this book");
-                context["canUse"]=valid && !(useLocal && other) && !record["remoteFileChanged"].toBool();
-                context["notice"]=useLocal && other ? QCoreApplication::translate("BookOrbit", "Upload stopped to preserve other server position data.") : QString{};
-                choice=context;
-            }
-        }
-        notifyOperation(); emit conflictChanged();
-        if (!busy() && recentsRequested) refreshRecents();
-        if (!busy() && cleanupPending) cleanupBooks();
-    });
+    },done);
 }
-
 void Client::inspectConflict(int fileId) {
     if (busy()) return;
     const QString id=QString::number(fileId);
@@ -948,7 +1118,7 @@ void Client::rememberFile(const QJsonObject &book) {
     auto choices = fileChoices;
     choices[QString::number(book["id"].toInt())] = file["id"];
     if (choices != fileChoices && writeObject(scopeDir+"/file-choices.json", choices)) {
-        fileChoices = choices; invalidateLibrary();
+        fileChoices = choices; invalidateBook(book["id"].toInt(),false);
     }
 }
 
@@ -958,8 +1128,8 @@ void Client::showDetail(int bookId) {
         const auto book = value.toObject();
         if (book["id"].toInt() != bookId) continue;
         detailBook = book;
-        for (auto it = downloads.begin(); it != downloads.end(); ++it) {
-            const auto saved = it.value().toObject()["book"].toObject();
+        for (const auto &id:filesByBook.value(bookId)) {
+            const auto saved = downloads.value(id).toObject()["book"].toObject();
             if (saved["id"].toInt() == bookId && saved["detailed"].toBool()) {
                 detailBook = saved;
                 auto files = saved["files"].toArray();
@@ -1012,8 +1182,11 @@ void Client::refreshDetail() {
             if (file.toObject()["id"] == selectedFile.toObject()["id"]) book["selectedFile"] = file;
         detailBook = book; detailPending=true;
         bool saved = true;
-        const auto ids = downloads.keys();
+        const auto ids = filesByBook.value(id);
         for (const auto &key : ids) {
+#ifdef BOOKORBIT_TEST_HTTP
+            ++presentationCounters.metadataVisits;
+#endif
             auto record = downloads.value(key).toObject();
             if (record["bookId"].toInt() != id) continue;
             auto metadata = book;
@@ -1117,6 +1290,7 @@ QVariantMap Client::backFromCollection() {
 }
 
 void Client::finish(UiMessage text, bool success, const QString &operation, const QString &syncState) {
+    const int finishedBook=syncingId.isEmpty() ? feedbackBookId : libraryBookId(downloads.value(syncingId).toObject());
     struct Maintenance {
         Client *client;
         ~Maintenance() { if (!client->busy() && client->cleanupPending) client->cleanupBooks(); }
@@ -1168,6 +1342,7 @@ void Client::finish(UiMessage text, bool success, const QString &operation, cons
         if (syncBatch()!=previousBatch) { emit syncBatchChanged(); previousBatch=syncBatch(); }
         dismissConflict(); // Each unresolved conflict remains in its book record for individual retry.
         if (!syncQueue.isEmpty()) {
+            if (hasFile && !checkingLibrary) refreshBookRecents(finishedBook);
             working=true;
             publish();
             QTimer::singleShot(0,this,[this] {
@@ -1189,7 +1364,7 @@ void Client::finish(UiMessage text, bool success, const QString &operation, cons
             message =uiMessage("1_files_2_matching_3_different_4_errors_5_unchecked_6_see_book_d_4bf1b3")
                 .arg(verificationCancelled ? uiMessage("verification_cancelled") : !authenticated() ? uiMessage("verification_stopped_sign_in_again") : uiMessage("verification_complete"))
                 .arg(syncCount).arg(syncSucceeded).arg(verificationDifferent).arg(verificationErrors).arg(unchecked);
-            if (recentsRequested) refreshRecents();
+            if (recentsRequested) runRecents();
             publish();
             emit completed("verify",!verificationCancelled && syncSucceeded==syncCount);
             return;
@@ -1203,12 +1378,13 @@ void Client::finish(UiMessage text, bool success, const QString &operation, cons
             .arg(syncCompleted).arg(syncCount).arg(summary["synced"].toInt()).arg(summary["total"].toInt())
             .arg(summary["attention"].toInt()).arg(summary["waiting"].toInt());
         feedbackResult=allOk ? "success" : "error";
-        refreshRecents();
+        refreshBookRecents(finishedBook);
         publish();
         emit completed("sync",allOk);
         return;
     }
-    if (operation=="progress" || operation=="download" || operation=="open" || recentsRequested) refreshRecents();
+    if (operation=="progress" || operation=="download" || operation=="open") refreshBookRecents(finishedBook);
+    else if (recentsRequested) runRecents();
     publish();
     emit completed(operation, success);
 }
@@ -1431,10 +1607,14 @@ void Client::refresh(int targetPage, const QString &query) {
                 parsed.append(selectBookFile(book));
             }
             stopCovers();
+            bool saved=true;
             for (auto value : parsed) {
                 const auto book = value.toObject();
                 const int bookId = book["id"].toInt();
-                for (const auto &fileId : downloads.keys()) {
+                for (const auto &fileId : filesByBook.value(bookId)) {
+#ifdef BOOKORBIT_TEST_HTTP
+                    ++presentationCounters.metadataVisits;
+#endif
                     auto record = downloads.value(fileId).toObject();
                     if (record["bookId"].toInt() != bookId) continue;
                     auto stored = record["book"].toObject();
@@ -1443,7 +1623,7 @@ void Client::refresh(int targetPage, const QString &query) {
                     stored["readStatus"] = book["readStatus"];
                     stored["readingProgress"] = book["readingProgress"];
                     record["book"] = stored;
-                    saveRecord(fileId, record);
+                    if (!saveRecord(fileId, record)) saved=false;
                 }
                 if (book["hasCover"] == false) removeCover(bookId);
             }
@@ -1451,7 +1631,7 @@ void Client::refresh(int targetPage, const QString &query) {
             invalidateLibrary(); emit catalogChanged();
             cleanupCovers();
             queueCovers();
-            finish(items.isEmpty() ? uiMessage("no_books_found") : UiMessage{}, true, "catalog");
+            finish(!saved ? uiMessage("details_received_but_not_saved_for_offline_use") : items.isEmpty() ? uiMessage("no_books_found") : UiMessage{}, saved, "catalog");
         }, true, activeCollection > 0);
 }
 
@@ -1668,7 +1848,11 @@ void Client::open(int index, bool applyIncoming) {
 void Client::openBook(const QJsonObject &book, bool applyIncoming) {
     beginFeedback("book",book["id"].toInt(),book["selectedFile"].toObject()["id"].toInt());
     const auto path = localFile(book);
-    if (path.isEmpty()) { invalidateLibrary(); invalidateSync(); detailPending=detailPending || detailVisible(); finish(uiMessage("download_the_book_first"), false, "open"); return; }
+    if (path.isEmpty()) {
+        const int id=book["selectedFile"].toObject()["id"].toInt();
+        libraryFiles.remove(id); syncFiles.remove(id); invalidateBook(book["id"].toInt());
+        detailPending=detailPending || detailVisible(); finish(uiMessage("download_the_book_first"), false, "open"); return;
+    }
     if (!readableFormat(fileFormat(book["selectedFile"].toObject()))) {
         finish(uiMessage("file_downloaded_opening_this_format_from_the_app_is_not_supported_yet"), false, "open"); return;
     }
@@ -1879,94 +2063,153 @@ void Client::showDownloaded(bool value) {
     invalidateLibrary(); emit catalogChanged(); publishDataChanges();
 }
 
+void Client::invalidateBook(int bookId,bool sync) {
+    changedBooks.insert(bookId); libraryPending=true;
+    if (sync) invalidateSyncBook(bookId);
+}
+
+QJsonObject Client::localBook(int bookId) const {
+    QJsonObject merged; QJsonArray variants;
+    for (const auto &id:filesByBook.value(bookId)) {
+        const auto record=downloads.value(id).toObject();
+        if (libraryBookId(record)!=bookId) continue;
+        auto book=record["book"].toObject();
+        if (book.isEmpty()) book={{"id",record["bookId"]},{"title",QCoreApplication::translate("BookOrbit", "Book · file ")+id}};
+        auto file=book["selectedFile"].toObject();
+        file["id"]=record["fileId"]; file["format"]=record["format"].toString("epub"); file["role"]="content";
+        if (!file.contains("sizeBytes")) file["sizeBytes"]=record["bytes"];
+        if (merged.isEmpty() || book["detailed"].toBool()) merged=book;
+        variants.append(file);
+    }
+    if (!merged.isEmpty()) merged["files"]=variants;
+    return merged;
+}
+
+Client::LibraryRow Client::libraryRow(QJsonObject book) const {
+    book=selectBookFile(book,&libraryFiles);
+    const auto recent=recentFile(book,&libraryFiles);
+    book["nativeOpenTime"]=recent["nativeOpenTime"];
+    const auto search=(book["title"].toString()+"\n"+authorNames(book["authors"].toArray())+"\n"+book["seriesName"].toString())
+        .normalized(QString::NormalizationForm_KC).toCaseFolded();
+    return {book,bookSummary(book,&libraryFiles),nativeRecents.available && recent["nativeOpenTime"].toDouble()>0 ? bookSummary(recent,&libraryFiles) : QVariantMap{},search};
+}
+
+bool Client::libraryLess(const LibraryRow &left,const LibraryRow &right) const {
+    const auto &a=left.book,&b=right.book;
+    if (librarySort=="recent" && nativeRecents.available) {
+        const double l=a["nativeOpenTime"].toDouble(),r=b["nativeOpenTime"].toDouble();
+        if (l!=r) return l>r;
+    }
+    if (librarySort=="author") {
+        const int cmp=QString::localeAwareCompare(left.summary["author"].toString(),right.summary["author"].toString());
+        if (cmp) return cmp<0;
+    }
+    const int cmp=QString::localeAwareCompare(a["title"].toString(),b["title"].toString());
+    return cmp ? cmp<0 : a["id"].toInt()<b["id"].toInt();
+}
+bool Client::libraryMatches(const LibraryRow &row) const {
+    return !localView || libraryQuery.isEmpty() || row.search.contains(libraryQuery.normalized(QString::NormalizationForm_KC).toCaseFolded());
+}
+void Client::indexLibrary() const {
+    libraryIndex.clear();
+    for (int i=0;i<libraryRows.size();++i) libraryIndex[libraryRows[i].book["id"].toInt()]=i;
+}
+void Client::updateRecent() const {
+    int latest=-1;
+    for (int i=0;i<libraryRows.size();++i) {
+        if (libraryRows[i].recent.isEmpty()) continue;
+        const auto &a=libraryRows[i].book;
+        if (latest<0) { latest=i; continue; }
+        const auto &b=libraryRows[latest].book;
+        const int title=QString::localeAwareCompare(a["title"].toString(),b["title"].toString());
+        if (a["nativeOpenTime"].toDouble()>b["nativeOpenTime"].toDouble() ||
+            (a["nativeOpenTime"]==b["nativeOpenTime"] && (title<0 || (a["title"]==b["title"] && a["id"].toInt()<b["id"].toInt())))) latest=i;
+    }
+    libraryRecent=latest<0 ? QVariantMap{} : libraryRows[latest].recent;
+}
+
 void Client::ensureLibrary() const {
+    const bool reset=libraryDirty;
     if (libraryDirty) {
 #ifdef BOOKORBIT_TEST_HTTP
         ++presentationCounters.libraryBuilds;
 #endif
-        LocalFiles files;
-        QJsonArray source=items;
+        libraryFiles.clear(); libraryRows.clear();
         if (localView) {
-            QMap<int, QJsonObject> grouped;
-            for (auto it = downloads.begin(); it != downloads.end(); ++it) {
-                const auto record = it.value().toObject();
-                auto book = record["book"].toObject();
-                if (book.isEmpty()) book = {{"id", record["bookId"]}, {"title", QCoreApplication::translate("BookOrbit", "Book · file ")+it.key()}};
-                auto file = book["selectedFile"].toObject();
-                file["id"] = record["fileId"];
-                file["format"] = record["format"].toString("epub");
-                file["role"] = "content";
-                if (!file.contains("sizeBytes")) file["sizeBytes"] = record["bytes"];
-                book["selectedFile"] = file;
-                const int id = book["id"].toInt();
-                auto merged = grouped.value(id);
-                auto files = merged.value("files").toArray();
-                if (merged.isEmpty() || book["detailed"].toBool()) merged = book;
-                files.append(file);
-                merged["files"] = files;
-                grouped[id] = merged;
+            for (auto it=filesByBook.begin();it!=filesByBook.end();++it) {
+                const auto book=localBook(it.key());
+                if (!book.isEmpty()) libraryRows.append(libraryRow(book));
             }
-            source={};
-            for (const auto &book : grouped) source.append(book);
-        }
-        libraryRows.clear();
-        libraryRecent.clear();
-        QJsonObject latest;
-        for (const auto value : source) {
-            auto book=selectBookFile(value.toObject(), &files);
-            const auto recent=recentFile(book, &files);
-            book["nativeOpenTime"]=recent["nativeOpenTime"];
-            const QString text =(book["title"].toString()+"\n"+authorNames(book["authors"].toArray())+"\n"+book["seriesName"].toString())
-                .normalized(QString::NormalizationForm_KC).toCaseFolded();
-            libraryRows.append({book, bookSummary(book, &files), text});
-            if (nativeRecents.available && recent["nativeOpenTime"].toDouble()>0 &&
-                (latest.isEmpty() || recent["nativeOpenTime"].toDouble()>latest["nativeOpenTime"].toDouble() ||
-                 (recent["nativeOpenTime"]==latest["nativeOpenTime"] &&
-                  (QString::localeAwareCompare(recent["title"].toString(),latest["title"].toString())<0 ||
-                   (recent["title"]==latest["title"] && recent["id"].toInt()<latest["id"].toInt()))))) latest=recent;
-        }
-        if (!latest.isEmpty()) libraryRecent=bookSummary(latest, &files);
-        libraryDirty=false;
-        libraryOrderDirty=true;
+        } else for (const auto &book:items) libraryRows.append(libraryRow(book.toObject()));
+        changedBooks.clear(); libraryDirty=false; libraryOrderDirty=true;
     }
     if (libraryOrderDirty) {
         if (localView) {
 #ifdef BOOKORBIT_TEST_HTTP
             ++presentationCounters.librarySorts;
 #endif
-            std::sort(libraryRows.begin(),libraryRows.end(),[this](const LibraryRow &left,const LibraryRow &right) {
-                const auto &a=left.book, &b=right.book;
-                if (librarySort=="recent" && nativeRecents.available) {
-                    const double l=a["nativeOpenTime"].toDouble(),r=b["nativeOpenTime"].toDouble();
-                    if (l!=r) return l>r;
-                }
-                if (librarySort=="author") {
-                    const int cmp=QString::localeAwareCompare(left.summary["author"].toString(),right.summary["author"].toString());
-                    if (cmp) return cmp<0;
-                }
-                const int cmp=QString::localeAwareCompare(a["title"].toString(),b["title"].toString());
-                return cmp ? cmp<0 : a["id"].toInt()<b["id"].toInt();
-            });
+            std::sort(libraryRows.begin(),libraryRows.end(),[this](const LibraryRow &a,const LibraryRow &b) { return libraryLess(a,b); });
         }
-        libraryAll={};
-        for (const auto &row : libraryRows) libraryAll.append(row.book);
-        libraryOrderDirty=false;
-        libraryFilterDirty=true;
+        indexLibrary(); libraryOrderDirty=false; libraryFilterDirty=true;
+    }
+    const auto changed=std::exchange(changedBooks,{});
+    for (int id:changed) {
+        QJsonObject book;
+        if (localView) book=localBook(id);
+        else for (const auto &value:items) if (value.toObject()["id"].toInt()==id) { book=value.toObject(); break; }
+        int old=libraryIndex.value(id,-1);
+        if (book.isEmpty()) {
+            if (old>=0) libraryRows.removeAt(old);
+        } else {
+            auto row=libraryRow(book);
+#ifdef BOOKORBIT_TEST_HTTP
+            ++presentationCounters.bookUpdates;
+#endif
+            if (old>=0 && (!localView || (!libraryLess(row,libraryRows[old]) && !libraryLess(libraryRows[old],row)))) libraryRows[old]=row;
+            else {
+                if (old>=0) libraryRows.removeAt(old);
+                if (localView) libraryRows.insert(std::lower_bound(libraryRows.begin(),libraryRows.end(),row,[this](const LibraryRow &a,const LibraryRow &b) { return libraryLess(a,b); }),row);
+                else libraryRows.append(row);
+            }
+        }
+        indexLibrary();
+    }
+    if (!libraryFilterDirty) {
+        // Remove vanished matches before placing survivors; a file can change two book groups.
+        for (int id:changed) {
+            const int at=libraryIndex.value(id,-1),visible=libraryModel.rowFor(id);
+            if ((at<0 || !libraryMatches(libraryRows[at])) && visible>=0) libraryModel.remove(visible);
+        }
+        for (int id:changed) {
+            int visible=libraryModel.rowFor(id),at=libraryIndex.value(id,-1);
+            if (at>=0 && libraryMatches(libraryRows[at])) {
+                int target=0;
+                for (const auto &value:libraryModel.snapshot()) {
+                    const int other=value.toMap()["bookId"].toInt();
+                    const int position=libraryIndex.value(other,-1);
+                    if (other!=id && position>=0 && position<at) ++target;
+                }
+                if (visible<0) libraryModel.insert(target,libraryRows[at].summary);
+                else { libraryModel.move(visible,target); libraryModel.update(target,libraryRows[at].summary); }
+            }
+        }
     }
     if (libraryFilterDirty) {
-        const QString query=libraryQuery.normalized(QString::NormalizationForm_KC).toCaseFolded();
-        libraryVisible={}; libraryBooks.clear();
-        for (const auto &row : libraryRows) {
-            if (localView && !query.isEmpty() && !row.search.contains(query)) continue;
-            libraryVisible.append(row.book); libraryBooks.append(row.summary);
-        }
-        libraryFilterDirty=false;
+        QVariantList visible;
+        for (const auto &row:libraryRows) if (libraryMatches(row)) visible.append(row.summary);
+        libraryModel.replace(visible,reset); libraryFilterDirty=false;
     }
+    if (reset || !changed.isEmpty()) updateRecent();
 }
 
 QJsonArray Client::visibleItems(bool applyQuery) const {
-    ensureLibrary();
-    return applyQuery ? libraryVisible : libraryAll;
+    ensureLibrary(); QJsonArray result;
+    if (!applyQuery) for (const auto &row:libraryRows) result.append(row.book);
+    else for (const auto &value:libraryModel.snapshot()) {
+        const int row=libraryIndex.value(value.toMap()["bookId"].toInt(),-1);
+        if (row>=0) result.append(libraryRows[row].book);
+    }
+    return result;
 }
 
 void Client::cancelDownload() {
@@ -2075,6 +2318,7 @@ void Client::dismissConflict() {
     if (conflictId.isEmpty() && conflictMessage.isEmpty() && positionChoices.isEmpty()) return;
     conflictId.clear(); conflictProfile.clear(); conflictLocal.clear(); conflictRemote={}; conflictMessage.clear();
     positionChoices.clear();
+    conflictPreview.clear(); conflictStamp={}; conflictDigest.clear();
     emit conflictChanged();
 }
 
@@ -2198,7 +2442,7 @@ void Client::verifyRemoteFile(const QString &id, bool renew) {
             const bool different=remoteDigest.toLatin1()!=record["sha256"].toString().toLatin1();
             if (different) record["remoteFileChanged"]=true;
             else record.remove("remoteFileChanged");
-            if (record!=downloads.value(id).toObject() && !saveRecord(id,record)) {
+            if (!saveRecord(id,record)) {
                 if (different) storeRecord(id,record); // Keep the known mismatch blocked in memory even when storage fails.
                 finish(uiMessage("could_not_save_the_verification_result_resolve_the_storage_error_bf59aa"),false,"verify"); return;
             }
@@ -2237,7 +2481,7 @@ void Client::syncBook(const QString &id, int choice) {
     if (reader==ReaderFileState::Unknown || !readerPosition(path,&position)) {
         finish(uiMessage("could_not_check_the_reader_state_positions_were_kept_unchanged_try_again"),false,"progress","reader_unknown"); return;
     }
-    struct LocalCheck { QByteArray digest; FileStamp stamp; QString local; bool supported=true,valid=false; };
+    struct LocalCheck { QByteArray digest; FileStamp stamp; QString local; PositionInfo info; bool supported=true,valid=false; };
     const auto context=fileContext(id,path);
     fileTask=files.submit(this,[path,position,format=record["format"].toString()](const FileCancellation &cancel) {
         LocalCheck result; result.stamp=fileStamp(path);
@@ -2245,14 +2489,14 @@ void Client::syncBook(const QString &id, int choice) {
         if (result.supported && !fileCancelled(cancel)) {
             result.local=bookCfi(path,position);
             result.valid=(position.isEmpty() || !result.local.isEmpty()) &&
-                (result.local.isEmpty() || bookPosition(path,result.local,nullptr));
+                (result.local.isEmpty() || bookPosition(path,result.local,nullptr,nullptr,nullptr,nullptr,&result.info));
         }
         result.digest=digestFile(path,cancel);
         return result;
     },[this,id,path,position,choice,profile,context](const LocalCheck &result,bool cancelled) {
         if (!acceptFileContext(context,result.stamp) || cancelled) return;
         if (result.digest!=context.record["sha256"].toString().toLatin1()) {
-            invalidateLibrary(); invalidateSync(); detailPending=detailPending || detailVisible();
+            libraryFiles.remove(id.toInt()); syncFiles.remove(id.toInt()); invalidateBook(libraryBookId(context.record)); detailPending=detailPending || detailVisible();
             finish(uiMessage("download_a_valid_book_file_before_syncing"),false,"progress","file"); return;
         }
         QString current;
@@ -2268,7 +2512,7 @@ void Client::syncBook(const QString &id, int choice) {
         const QString local=result.local;
         const QString route="/api/v1/books/files/"+id+"/progress";
         // shortcut: trust the downloaded file identity; explicit library verification detects server replacements.
-        jsonRequest(route,{},[this,id,path,position,local,choice,route,profile,context](const QJsonObject &remote) {
+        jsonRequest(route,{},[this,id,path,position,local,localInfo=result.info,choice,route,profile,context](const QJsonObject &remote) {
             if (!acceptFileContext(context)) return;
             QString current;
             if (readerProfile()!=profile || readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position) {
@@ -2281,13 +2525,12 @@ void Client::syncBook(const QString &id, int choice) {
                 finish(uiMessage("invalid_progress_response_expected_a_cfi_and_a_percentage_from_0_2d14d6"),false,"progress"); return;
             }
             struct RemoteCheck {
-                QByteArray digest; FileStamp stamp; QString point; bool valid=true,equal=false,localBaseEqual=false,remoteBaseEqual=false,estimate=false;
-                double percentage=0; PreparedReaderPosition prepared;
+                QByteArray digest; FileStamp stamp; QString point; PositionInfo info; bool valid=true,equal=false,localBaseEqual=false,remoteBaseEqual=false;
             };
             const auto progress=downloads.value(id).toObject()["progress"].toObject();
-            fileTask=files.submit(this,[path,local,remoteCfi,progress,choice](const FileCancellation &cancel) {
+            fileTask=files.submit(this,[path,local,remoteCfi,progress](const FileCancellation &cancel) {
                 RemoteCheck result; result.stamp=fileStamp(path); result.point=remoteCfi;
-                if (!remoteCfi.isEmpty()) result.valid=bookPosition(path,remoteCfi,nullptr,&result.point);
+                if (!remoteCfi.isEmpty()) result.valid=bookPosition(path,remoteCfi,nullptr,&result.point,nullptr,nullptr,&result.info);
                 if (result.valid && !fileCancelled(cancel)) {
                     result.equal=local==result.point || sameBookPosition(path,local,result.point);
                     if (!result.equal) {
@@ -2295,13 +2538,11 @@ void Client::syncBook(const QString &id, int choice) {
                         const auto remoteBase=progress["remoteBase"].toObject()["cfi"].toString();
                         result.localBaseEqual=local==localBase || sameBookPosition(path,local,localBase);
                         result.remoteBaseEqual=remoteCfi==remoteBase || sameBookPosition(path,remoteCfi,remoteBase,true);
-                        if (choice!=2 && !local.isEmpty()) result.estimate=bookPosition(path,local,&result.percentage);
-                        if (choice!=1 && !result.point.isEmpty()) result.prepared=prepareReaderPosition(path,result.point,cancel);
                     }
                 }
                 result.digest=digestFile(path,cancel);
                 return result;
-            },[this,id,path,position,local,choice,route,profile,remote,remoteCfi,percent,context,progress](const RemoteCheck &analysis,bool cancelled) {
+            },[this,id,path,position,local,localInfo,choice,route,profile,remote,percent,context,progress](const RemoteCheck &analysis,bool cancelled) {
                 if (!acceptFileContext(context,analysis.stamp) || cancelled) return;
                 QString current;
                 if (readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position ||
@@ -2357,53 +2598,95 @@ void Client::syncBook(const QString &id, int choice) {
                     case SyncDecision::Conflict: break;
                     }
                 }
-                if (!action) {
+                if (!action && syncingAll) {
                     // Persist both versions; after restart the next GET rechecks the conflict.
                     state["conflictLocal"]=local; state["conflictRemote"]=remote;
                     if (!persist()) return;
-                    if (!syncingAll) prepareConflict(id,local,remote,profile);
                     finish(changedChoice ? uiMessage("the_position_changed_while_you_were_choosing_review_the_choices_again") : uiMessage("choose_a_reading_position"),false,"progress","conflict"); return;
                 }
-                if (action==2) {
-                    if (cfi.isEmpty()) { finish(uiMessage("the_server_has_no_exact_position_to_open"),false,"progress"); return; }
-                    // Journal before native mutation; failed writes do not advance the agreed baseline.
-                    state["pending"]=remote; state["pendingLocal"]=local;
-                    if (!persist()) return;
-                    UiMessage error;
-                    if (!saveReaderPosition(path,position,analysis.prepared,profile,&error)) {
-                        finish(error,false,"progress","pending"); return;
-                    }
-                    state={{"localBase",cfi},{"remoteBase",remote}};
-                    if (persist()) { dismissConflict(); finish(uiMessage("position_saved_open_the_book_from_the_built_in_library"),true,"progress"); }
-                    return;
-                }
-                if (local.isEmpty() || other || hasPage) {
+                if (action==2 && cfi.isEmpty()) { finish(uiMessage("the_server_has_no_exact_position_to_open"),false,"progress"); return; }
+                if (action==1 && (local.isEmpty() || other || hasPage)) {
                     finish(hasPage ? uiMessage("the_server_position_includes_a_page_number_upload_stopped_to_preserve_it") :
                            other ? uiMessage("the_server_record_contains_other_reading_coordinates_upload_stop_23d8ab") :
                                    uiMessage("no_exact_position_on_the_reader_yet"),false,"progress"); return;
                 }
-                const double percentage=analysis.percentage;
-                if (!analysis.estimate) {
-                    finish(uiMessage("the_position_was_recognized_but_the_book_percentage_could_not_be_68fd96"),
-                           false,"progress","position"); return;
-                }
-                // Save before POST. An uncertain result is reconciled by the next GET, never blindly retried.
-                const QJsonObject outgoing{{"source","text"},{"cfi",local},{"pageNumber",QJsonValue::Null},{"percentage",percentage}};
-                state["outgoing"]=outgoing;
-                if (!persist()) return;
-                const auto sentContext=fileContext(id,path);
-                jsonRequest(route,outgoing,[this,id,local,route,profile,sentContext](const QJsonObject &) {
-                    if (!acceptFileContext(sentContext)) return;
-                    jsonRequest(route,{},[this,id,local,profile,sentContext](const QJsonObject &confirmed) {
-                        if (!acceptFileContext(sentContext)) return;
-                        if (confirmed["cfi"].toString()!=local) {
-                            finish(uiMessage("the_server_position_changed_after_upload_check_again"),false,"progress"); return;
+                struct PreparedSync {
+                    FileStamp stamp; PreparedReaderPosition reader; QVariantList choices; double percentage=0; bool estimate=false;
+                };
+#ifdef BOOKORBIT_TEST_HTTP
+                if (action==1) ++presentationCounters.uploadPreparations;
+                else if (action==2) ++presentationCounters.remotePreparations;
+                else ++presentationCounters.conflictPreviews;
+#endif
+                fileTask=files.submit(this,[path,localInfo,remoteInfo=analysis.info,cfi,action,stamp=analysis.stamp](const FileCancellation &cancel) {
+                    PreparedSync result; result.stamp=stamp;
+                    if (fileCancelled(cancel) || fileStamp(path)!=stamp) return result;
+                    if (action==1) result.estimate=positionEstimate(path,localInfo,&result.percentage);
+                    else if (action==2) result.reader=prepareReaderPosition(path,cfi,cancel);
+                    else for (bool useLocal:{true,false}) {
+                        const auto &info=useLocal ? localInfo : remoteInfo;
+                        auto preview=info.context; double percentage=0;
+                        const bool valid=!fileCancelled(cancel) && positionEstimate(path,info,&percentage);
+                        preview["local"]=useLocal; preview["valid"]=valid; preview["percentageValue"]=percentage; preview["empty"]=info.point.isEmpty();
+                        result.choices.append(preview);
+                    }
+                    return result;
+                },[this,id,path,position,local,cfi,route,profile,remote,context,progress,action,changedChoice](const PreparedSync &prepared,bool cancelled) {
+                    if (!acceptFileContext(context,prepared.stamp) || cancelled) return;
+                    QString current;
+                    if (readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position ||
+                        downloads.value(id).toObject()["progress"].toObject()!=progress) {
+                        finish(uiMessage("the_reader_state_has_changed_retry_sync"),false,"progress"); return;
+                    }
+                    auto record=downloads.value(id).toObject(); auto state=record["progress"].toObject();
+                    if (state.contains("profile") && state["profile"].toString()!=profile) state={};
+                    auto persist=[this,id,profile,&record,&state] {
+                        state["profile"]=profile; record["progress"]=state;
+                        if (saveRecord(id,record)) return true;
+                        finish(uiMessage("could_not_save_progress_retry_sync"),false,"progress"); return false;
+                    };
+                    if (!action) {
+                        // Persist both versions; after restart the next GET rechecks the conflict.
+                        state["conflictLocal"]=local; state["conflictRemote"]=remote;
+                        if (!persist()) return;
+                        if (!syncingAll) prepareConflict(id,local,remote,profile,prepared.choices,prepared.stamp);
+                        finish(changedChoice ? uiMessage("the_position_changed_while_you_were_choosing_review_the_choices_again") : uiMessage("choose_a_reading_position"),false,"progress","conflict"); return;
+                    }
+                    if (action==2) {
+                        // Journal before native mutation; failed writes do not advance the agreed baseline.
+                        state["pending"]=remote; state["pendingLocal"]=local;
+                        if (!persist()) return;
+                        UiMessage error;
+                        if (!saveReaderPosition(path,position,prepared.reader,profile,&error)) {
+                            finish(error,false,"progress","pending"); return;
                         }
-                        auto record=downloads.value(id).toObject();
-                        record["progress"]=QJsonObject{{"localBase",local},{"remoteBase",confirmed},{"profile",profile}};
-                        if (!saveRecord(id,record)) { finish(uiMessage("uploaded_but_the_result_could_not_be_saved_check_again"),false,"progress"); return; }
-                        dismissConflict(); finish(uiMessage("progress_sent_to_bookorbit"),true,"progress");
-                    },true,true);
+                        state={{"localBase",cfi},{"remoteBase",remote}};
+                        if (persist()) { dismissConflict(); finish(uiMessage("position_saved_open_the_book_from_the_built_in_library"),true,"progress"); }
+                        return;
+                    }
+                    const double percentage=prepared.percentage;
+                    if (!prepared.estimate) {
+                        finish(uiMessage("the_position_was_recognized_but_the_book_percentage_could_not_be_68fd96"),
+                               false,"progress","position"); return;
+                    }
+                    // Save before POST. An uncertain result is reconciled by the next GET, never blindly retried.
+                    const QJsonObject outgoing{{"source","text"},{"cfi",local},{"pageNumber",QJsonValue::Null},{"percentage",percentage}};
+                    state["outgoing"]=outgoing;
+                    if (!persist()) return;
+                    const auto sentContext=fileContext(id,path);
+                    jsonRequest(route,outgoing,[this,id,local,route,profile,sentContext](const QJsonObject &) {
+                        if (!acceptFileContext(sentContext)) return;
+                        jsonRequest(route,{},[this,id,local,profile,sentContext](const QJsonObject &confirmed) {
+                            if (!acceptFileContext(sentContext)) return;
+                            if (confirmed["cfi"].toString()!=local) {
+                                finish(uiMessage("the_server_position_changed_after_upload_check_again"),false,"progress"); return;
+                            }
+                            auto record=downloads.value(id).toObject();
+                            record["progress"]=QJsonObject{{"localBase",local},{"remoteBase",confirmed},{"profile",profile}};
+                            if (!saveRecord(id,record)) { finish(uiMessage("uploaded_but_the_result_could_not_be_saved_check_again"),false,"progress"); return; }
+                            dismissConflict(); finish(uiMessage("progress_sent_to_bookorbit"),true,"progress");
+                        },true,true);
+                    });
                 });
             });
         },true,true);

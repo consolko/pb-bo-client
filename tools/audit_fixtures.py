@@ -54,5 +54,20 @@ def write_fixtures(directory: Path) -> None:
         'ordinary_zip': ordinary_zip(),
         'truncated_zip': archive()[:-15],
     }
+    with zipfile.ZipFile(io.BytesIO(cases['plain'])) as original:
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as result:
+            for name in original.namelist():
+                raw = original.read(name)
+                if name == 'book.opf':
+                    raw = raw.replace(b'</manifest>', b''.join(
+                        f'<item id="c{i}" href="c{i}.xhtml" media-type="application/xhtml+xml"/>'.encode()
+                        for i in range(1, 12)) + b'</manifest>')
+                    raw = raw.replace(b'</spine>', b''.join(
+                        f'<itemref idref="c{i}"/>'.encode() for i in range(1, 12)) + b'</spine>')
+                result.writestr(name, raw)
+            for i in range(1, 12):
+                result.writestr(f'c{i}.xhtml', '<html><head/><body><p>' + 'x' * 10000 + '</p></body></html>')
+        cases['cache'] = output.getvalue()
     for name, raw in cases.items():
         (directory / (name + '.epub')).write_bytes(raw)

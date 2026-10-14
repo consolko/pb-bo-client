@@ -61,8 +61,9 @@ FileStamp fb2Calibration(const FileCancellation &cancel) {
 PreparedReaderPosition prepareReaderPosition(const QString &path,const QString &cfi,const FileCancellation &cancel) {
     PreparedReaderPosition result; result.cfi=cfi; result.file=fileStamp(path);
     if (fileCancelled(cancel)) return result;
-    result.coordinate=bookPosition(path,cfi,nullptr,nullptr,nullptr,&result.native);
-    if (result.coordinate && !fileCancelled(cancel)) result.estimate=bookPosition(path,cfi,&result.percentage);
+    PositionInfo resolved;
+    result.coordinate=bookPosition(path,cfi,nullptr,nullptr,nullptr,&result.native,&resolved);
+    if (result.coordinate && !fileCancelled(cancel)) result.estimate=positionEstimate(path,resolved,&result.percentage);
 #ifdef POCKETBOOK_DEVICE
     const QString framework=QFileInfo("/ebrmain/lib/libframework2.so").canonicalFilePath();
     const auto before=fileStamp(framework);

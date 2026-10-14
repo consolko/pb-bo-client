@@ -621,7 +621,7 @@ ApplicationWindow {
         Text {
             objectName: "localCount"
             visible: client.offlineOnly && !window.settings && !window.syncView && !client.detailVisible && client.localQuery.length > 0
-            text: qsTranslate("BookOrbit", "Found: ") + window.catalogBooks.length
+            text: qsTranslate("BookOrbit", "Found: ") + catalog.count
             font.pixelSize: 14 * window.u
         }
         ColumnLayout {
@@ -758,7 +758,28 @@ ApplicationWindow {
             ScrollBar.vertical: ScrollBar { }
             delegate: ItemDelegate {
                 id: bookRow
-                required property var modelData
+                required property var bookId
+                required property var title
+                required property var author
+                required property var seriesName
+                required property var seriesIndex
+                required property var readStatus
+                required property var readingProgress
+                required property var fileId
+                required property var format
+                required property var fileCount
+                required property var formats
+                required property var localFormats
+                required property var downloaded
+                required property var readable
+                required property var canSync
+                required property var supported
+                required property var needsRepair
+                required property var syncResult
+                required property var pendingProgress
+                required property var remoteFileChanged
+                required property var hasConflict
+                readonly property var modelData: ({bookId: bookId, title: title, author: author, seriesName: seriesName, seriesIndex: seriesIndex, readStatus: readStatus, readingProgress: readingProgress, fileId: fileId, format: format, fileCount: fileCount, formats: formats, localFormats: localFormats, downloaded: downloaded, readable: readable, canSync: canSync, supported: supported, needsRepair: needsRepair, syncResult: syncResult, pendingProgress: pendingProgress, remoteFileChanged: remoteFileChanged, hasConflict: hasConflict})
                 required property int index
                 objectName: "book-" + modelData.bookId
                 width: catalog.width
@@ -836,7 +857,28 @@ ApplicationWindow {
             ScrollBar.vertical: ScrollBar { }
             delegate: ItemDelegate {
                 id: coverTile
-                required property var modelData
+                required property var bookId
+                required property var title
+                required property var author
+                required property var seriesName
+                required property var seriesIndex
+                required property var readStatus
+                required property var readingProgress
+                required property var fileId
+                required property var format
+                required property var fileCount
+                required property var formats
+                required property var localFormats
+                required property var downloaded
+                required property var readable
+                required property var canSync
+                required property var supported
+                required property var needsRepair
+                required property var syncResult
+                required property var pendingProgress
+                required property var remoteFileChanged
+                required property var hasConflict
+                readonly property var modelData: ({bookId: bookId, title: title, author: author, seriesName: seriesName, seriesIndex: seriesIndex, readStatus: readStatus, readingProgress: readingProgress, fileId: fileId, format: format, fileCount: fileCount, formats: formats, localFormats: localFormats, downloaded: downloaded, readable: readable, canSync: canSync, supported: supported, needsRepair: needsRepair, syncResult: syncResult, pendingProgress: pendingProgress, remoteFileChanged: remoteFileChanged, hasConflict: hasConflict})
                 objectName: "gridBook-" + modelData.bookId
                 width: coverCatalog.cellWidth; height: coverCatalog.cellHeight
                 padding: 8 * window.u

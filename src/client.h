@@ -3,6 +3,7 @@
 #include <QElapsedTimer>
 #include "i18n.h"
 #include "device.h"
+#include "progress.h"
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
@@ -11,15 +12,33 @@
 #include <QNetworkReply>
 #include <QVariantList>
 #include <QHash>
+#include <QSet>
+#include <QAbstractListModel>
 #include <functional>
 
 class UpdateManager;
+class LibraryModel : public QAbstractListModel {
+    Q_OBJECT
+    QVariantList rows;
+public:
+    using QAbstractListModel::QAbstractListModel;
+    int rowCount(const QModelIndex &parent={}) const override { return parent.isValid() ? 0 : rows.size(); }
+    QVariant data(const QModelIndex &index,int role) const override;
+    QHash<int,QByteArray> roleNames() const override;
+    const QVariantList &snapshot() const { return rows; }
+    int rowFor(int bookId) const;
+    void update(int row,const QVariantMap &value);
+    void insert(int row,const QVariantMap &value);
+    void remove(int row);
+    void move(int from,int to);
+    void replace(const QVariantList &values,bool reset);
+};
 class Client : public QObject {
     Q_OBJECT
     Q_PROPERTY(QStringList languageCodes READ languageCodes CONSTANT)
     Q_PROPERTY(QStringList languageNames READ languageNames CONSTANT)
     Q_PROPERTY(QString language READ language NOTIFY languageChanged)
-    Q_PROPERTY(QVariantList books READ books NOTIFY libraryChanged)
+    Q_PROPERTY(QAbstractItemModel* books READ bookModel CONSTANT)
     Q_PROPERTY(QVariantMap detail READ detail NOTIFY detailChanged)
     Q_PROPERTY(bool detailVisible READ detailVisible NOTIFY detailChanged)
     Q_PROPERTY(QVariantList collections READ collections NOTIFY catalogChanged)
@@ -67,6 +86,7 @@ public:
     void retranslate();
     Q_INVOKABLE bool setLanguage(const QString &language);
     QVariantList books() const;
+    QAbstractItemModel *bookModel() const;
     QVariantMap detail() const;
     bool detailVisible() const { return !detailBook.isEmpty(); }
     QVariantList collections() const { return collectionItems.toVariantList(); }
@@ -150,6 +170,8 @@ public:
 #ifdef BOOKORBIT_TEST_HTTP
     struct PresentationWork {
         quint64 libraryBuilds=0, librarySorts=0, localFileChecks=0, syncBuilds=0, syncSorts=0;
+        quint64 recordWrites=0, metadataVisits=0, bookUpdates=0, syncUpdates=0;
+        quint64 uploadPreparations=0,remotePreparations=0,conflictPreviews=0;
         bool operator==(const PresentationWork &) const = default;
     };
     PresentationWork presentationWork() const { return presentationCounters; }
@@ -187,19 +209,35 @@ private:
     bool acceptFileContext(const FileContext &context,const FileStamp &stamp={});
     void startFileOperation();
     using LocalFiles = QHash<int, QString>;
-    struct LibraryRow { QJsonObject book; QVariantMap summary; QString search; };
+    struct LibraryRow { QJsonObject book; QVariantMap summary,recent; QString search; };
     mutable QList<LibraryRow> libraryRows;
-    mutable QJsonArray libraryAll, libraryVisible;
-    mutable QVariantList libraryBooks;
+    mutable LibraryModel libraryModel;
+    mutable bool modelObserved=false;
+    mutable QHash<int,int> libraryIndex;
+    mutable QSet<int> changedBooks;
+    mutable LocalFiles libraryFiles,syncFiles;
     mutable QVariantMap libraryRecent, cachedSyncSummary;
+    mutable QMap<QString,QVariantMap> syncGroups;
+    mutable QVariantList syncOrder;
+    mutable QSet<QString> changedSyncGroups;
+    mutable QSet<int> changedUnsupported,unsupportedBooks;
     mutable bool libraryDirty=true, libraryOrderDirty=true, libraryFilterDirty=true, syncDirty=true;
     bool libraryPending=false, syncPending=false, detailPending=false;
     QVariantList lastOperation;
     void invalidateLibrary(bool data=true);
     void invalidateSync();
+    void invalidateSyncBook(int bookId);
+    QVariantMap syncGroup(const QString &key) const;
     void publishDataChanges();
     void notifyOperation();
     void ensureLibrary() const;
+    void invalidateBook(int bookId,bool sync=true);
+    QJsonObject localBook(int bookId) const;
+    LibraryRow libraryRow(QJsonObject book) const;
+    bool libraryLess(const LibraryRow &left,const LibraryRow &right) const;
+    bool libraryMatches(const LibraryRow &row) const;
+    void indexLibrary() const;
+    void updateRecent() const;
     QVariantList buildSyncBooks() const;
     void storeRecord(const QString &id, const QJsonObject &record);
     void setSyncResult(const QString &id, const UiMessage &text);
@@ -211,8 +249,11 @@ private:
     UiMessage logError;
     QElapsedTimer diagnosticClock;
     qint64 diagnosticSequence=0;
-    QVariantMap syncFileStatus(const QString &id, const QString &profile) const;
-    void prepareConflict(const QString &id, const QString &local, const QJsonObject &remote, const QString &profile);
+    QVariantMap syncFileStatus(const QString &id, const QString &profile,LocalFiles *files=nullptr) const;
+    void prepareConflict(const QString &id, const QString &local, const QJsonObject &remote, const QString &profile,const QVariantList &prepared={},const FileStamp &proof={});
+    QVariantList conflictPreview;
+    FileStamp conflictStamp;
+    QString conflictDigest;
     QVariantList positionChoices;
     int positionRevision = 0;
     void syncBook(const QString &id, int choice = 0);
@@ -229,6 +270,10 @@ private:
     QString libraryQuery, librarySort="recent", committedQuery;
     ReaderRecents nativeRecents;
     bool recentsRequested=false, recentsScheduled=false;
+    bool recentsFull=false;
+    QSet<int> recentsBooks;
+    void refreshBookRecents(int bookId);
+    void runRecents();
     QJsonObject recentFile(QJsonObject book, LocalFiles *files=nullptr) const;
     bool syncingAll=false, syncStopRequested=false;
     int syncCompleted=0;
@@ -283,6 +328,9 @@ private:
     int activeCollection = 0, detailGeneration = 0;
     bool collectionList = false;
     QJsonObject downloads;
+    QHash<QString,FileStamp> savedRecordStamps;
+    QMap<int,QStringList> filesByBook;
+    void indexRecord(const QString &id, const QJsonObject &before, const QJsonObject &after);
     QJsonArray savedAccounts;
     QPointer<QNetworkReply> activeDownload, activeCover;
     QPointer<QNetworkReply> activeVerification;
