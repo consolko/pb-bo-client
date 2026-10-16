@@ -2,9 +2,11 @@
 #include "device.h"
 #include "ota.h"
 #include "update.h"
+#include "launcher.h"
 #include <QCoreApplication>
 #include <QFont>
 #include <QGuiApplication>
+#include <QIcon>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickWindow>
@@ -51,6 +53,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "bookorbit: screen %dx%d\n", screen.width(), screen.height());
         QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
         app = std::make_unique<QGuiApplication>(argc, argv);
+        QGuiApplication::setWindowIcon(QIcon(":/icons/bookorbit.png"));
         std::fprintf(stderr, "bookorbit: Qt ready\n");
         QGuiApplication::setFont(QFont(deviceFont()));
     }
@@ -73,6 +76,12 @@ int main(int argc, char **argv) {
     else applyLanguage({});
     Client client(QUrl(server), data, nullptr, !args.contains("--server"));
     client.logDiagnostic("app.start",{{"executable",QString::fromLocal8Bit(argv[0])},{"data",data}});
+#ifdef POCKETBOOK_DEVICE
+    if (!smoke && !offline) {
+        const QString error = installLauncher("/mnt/ext1");
+        if (!error.isEmpty()) client.logDiagnostic("launcher.install.failed", {{"error", error}});
+    }
+#endif
     QObject::connect(app.get(),&QCoreApplication::aboutToQuit,&client,[&] { client.logDiagnostic("app.exit"); });
     if (offline || smoke) {
         QEventLoop loading;
