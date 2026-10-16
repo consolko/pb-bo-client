@@ -372,7 +372,7 @@ ApplicationWindow {
             maximumLineCount: client.busy ? 2 : 3
             elide: Text.ElideRight
             objectName: "operationMessage"
-            text: window.messageVisible ? (window.uiMessage.text || "") : ""
+            text: client.libraryLoading ? qsTranslate("BookOrbit", "Loading downloaded books…") : window.messageVisible ? (window.uiMessage.text || "") : ""
             visible: text.length > 0
             font.pixelSize: 15 * window.u
             font.bold: client.busy
@@ -1083,7 +1083,7 @@ ApplicationWindow {
             Text { objectName: "catalogRange"; text: client.total === 0 ? qsTranslate("BookOrbit", "Books: 0") : (client.catalogQuery ? qsTranslate("BookOrbit", "Found: ") + client.total + qsTranslate("BookOrbit", " · showing ") : qsTranslate("BookOrbit", "Books ")) + (client.page*10+1) + "–" + Math.min((client.page+1)*10, client.total) + (client.catalogQuery ? "" : qsTranslate("BookOrbit", " of ") + client.total); Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; font.pixelSize: 14 * window.u }
             Action { objectName: "nextPage"; text: "›"; Layout.preferredWidth: 100 * window.u; Accessible.name: qsTranslate("BookOrbit", "Next page"); enabled: !client.busy && client.authenticated && ((client.page+1)*10 < client.total || activeCatalog.contentY < Math.max(0, activeCatalog.contentHeight-activeCatalog.height)-1); onClicked: window.pageContent(1) }
         }
-        Action { visible: client.downloading; text: qsTranslate("BookOrbit", "Cancel download"); Layout.fillWidth: true; onClicked: client.cancelDownload() }
+        Action { visible: client.downloading; text: qsTranslate("BookOrbit", "Cancel download"); enabled: client.downloadCancellable; Layout.fillWidth: true; onClicked: client.cancelDownload() }
         Action { objectName: "cancelVerificationButton"; visible: client.verifyingLibrary; text: qsTranslate("BookOrbit", "Cancel verification"); Layout.fillWidth: true; onClicked: client.cancelLibraryVerification() }
         Action { objectName: "retryOperation"; visible: client.canRetry && window.messageVisible; text: qsTranslate("BookOrbit", "Retry"); Layout.fillWidth: true; onClicked: client.retry() }
     }

@@ -53,7 +53,7 @@ int main(int argc, char **argv) {
     require(storage.isValid(), "isolated preferences");
     InterfaceTranslation translation;
     translation.apply("de_DE", "system");
-    Client client(QUrl("https://example.invalid"), storage.path());
+    Client client(QUrl("https://example.invalid"), storage.path()); require(waitForLibrary(client),"registry snapshot loaded");
     require(client.language() == "system", "first launch follows system without persisting a manual choice");
     const auto scope=ClientWorkerCheck::scope(client);
     const QByteArray content("language fixture");
@@ -75,7 +75,7 @@ int main(int argc, char **argv) {
         const auto bytes=QJsonDocument(record).toJson(QJsonDocument::Compact);
         require(metadata.write(bytes)==bytes.size(),"persist language record fixture");
     }
-    ClientWorkerCheck::reload(client);
+    ClientWorkerCheck::reload(client); require(waitForLibrary(client),"reloaded language fixtures");
     const auto http=uiMessage("server_http_error").arg(503);
     ClientWorkerCheck::saveSyncMessage(client,"1",http);
     QFile stored(scope+"/records/1.json"); require(stored.open(QIODevice::ReadOnly),"read status written by finish");
@@ -150,7 +150,7 @@ int main(int argc, char **argv) {
     require(summary.text().contains(QString::fromUtf8("Проверка отменена")) && UiMessage::fromJson(summary.toJson()).text()==summary.text(),"nested summary message and counters survive serialization");
     snapshot("settings-ru");
     {
-        Client restarted(QUrl("https://example.invalid"), storage.path());
+        Client restarted(QUrl("https://example.invalid"), storage.path()); require(waitForLibrary(restarted),"registry snapshot loaded");
         require(restarted.language() == "ru", "explicit choice survives restart");
         verifyStatuses(restarted,russianHttp,russianFallback,QString::fromUtf8("Прогресс синхронизирован"));
         require(restarted.setDiagnosticLogging(true), "other preference can be saved");
@@ -160,7 +160,7 @@ int main(int argc, char **argv) {
     settle();
     require(item("catalogTab")->property("text").toString() == "Catalog" && client.status() == "Language saved.", "English restored without restart");
     verifyStatuses(client,englishHttp,"Previous result details are unavailable. Retry the operation.","Progress synced");
-    { Client restarted(QUrl("https://example.invalid"),storage.path()); verifyStatuses(restarted,englishHttp,"Previous result details are unavailable. Retry the operation.","Progress synced"); }
+    { Client restarted(QUrl("https://example.invalid"),storage.path()); require(waitForLibrary(restarted),"registry snapshot loaded"); verifyStatuses(restarted,englishHttp,"Previous result details are unavailable. Retry the operation.","Progress synced"); }
     require(translatedText("Прогресс синхронизирован") == "Progress synced", "legacy Russian sync result translated to English");
     QFile preferences(storage.path()+"/preferences.json");
     require(preferences.open(QIODevice::ReadOnly), "saved preferences readable");

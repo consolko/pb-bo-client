@@ -19,6 +19,7 @@ build/
 !/tools/inspect_position.py
 !/tools/audit_check.cpp
 !/tools/audit_fixtures.py
+!/tools/check_epub_memory.py
 !/tools/run_desktop_checks.py
 !/tools/language_check.cpp
 !/tools/check_translations.py

@@ -23,20 +23,26 @@
 #include <QQuickItem>
 #include <cstdio>
 #include <cstdlib>
+#include <sys/resource.h>
 
 #ifdef BOOKORBIT_STORAGE_CHECK
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cerrno>
-enum class StorageFailure { None,JournalFile,JournalDirectory,BookFile,Rename,BookDirectory,RecordFile,RecordDirectory,OldUnlink,JournalUnlink };
+enum class StorageFailure { None,JournalFile,JournalDirectory,BookFile,Rename,BookDirectory,RecordFile,RecordDirectory,ProgressDirectory,OldUnlink,JournalUnlink };
 static StorageFailure storageFailure=StorageFailure::None;
 static QString storageScope,storageOld;
 static std::atomic<int> storageFaults{0};
+static std::atomic_bool holdRecord{false},recordEntered{false},releaseRecord{false};
 extern "C" int __real_fsync(int fd);
 extern "C" int __wrap_fsync(int fd) {
     const auto path=QFileInfo("/proc/self/fd/"+QString::number(fd)).symLinkTarget();
     struct stat info{}; if (::fstat(fd,&info)!=0) return -1;
     const bool directory=S_ISDIR(info.st_mode);
+    if (!directory && path.startsWith(storageScope+"/records/") && holdRecord.exchange(false)) {
+        recordEntered=true;
+        while (!releaseRecord.load()) QThread::msleep(1);
+    }
     const bool journalExists=!QDir(storageScope+"/transfers").entryList({"*.json"}).isEmpty();
     bool fail=(!directory && storageFailure==StorageFailure::JournalFile && path.startsWith(storageScope+"/transfers/")) ||
         (directory && storageFailure==StorageFailure::JournalDirectory && path==storageScope+"/transfers" && journalExists) ||
@@ -48,6 +54,7 @@ extern "C" int __wrap_fsync(int fd) {
         QFile record(storageScope+"/records/101.json");
         if (record.open(QIODevice::ReadOnly)) fail=QJsonDocument::fromJson(record.readAll()).object()["filename"].toString()!=QFileInfo(storageOld).fileName();
     }
+    if (directory && storageFailure==StorageFailure::ProgressDirectory && path==storageScope+"/records") fail=true;
     if (fail) { ++storageFaults; errno=EIO; return -1; }
     return __real_fsync(fd);
 }
@@ -125,7 +132,7 @@ void storageFailureChecks(const QUrl &endpoint,const QString &root,const QString
         StorageFailure::Rename,StorageFailure::BookDirectory,StorageFailure::RecordFile,StorageFailure::RecordDirectory,
         StorageFailure::OldUnlink,StorageFailure::JournalUnlink}) {
         const auto data=root+"/storage-failure-"+QString::number(++number);
-        Client client(endpoint,data,nullptr,false); mode(fault,"");
+        Client client(endpoint,data,nullptr,false); require(waitForLibrary(client),"registry snapshot loaded"); mode(fault,"");
         require(wait(client,[&] { client.login(endpoint.toString(),"demo","demo"); }),"login for isolated storage failure");
         wait(client,[&] { client.download(0); });
         require(waitForRecents(client) && waitForMaintenance(client),"initial download maintenance settles");
@@ -152,8 +159,8 @@ void storageFailureChecks(const QUrl &endpoint,const QString &root,const QString
             require(QDir(storageScope+"/transfers").entryList({"*.json"}).isEmpty(),
                 "successful retry retires earlier transfer journals before restart");
         }
-        Client restarted(endpoint,data,nullptr,false);
-        require(restarted.configure(endpoint.toString(),"demo") && waitForRecents(restarted) && waitForMaintenance(restarted),"restart rechecks and confirms transfer state");
+        Client restarted(endpoint,data,nullptr,false); require(waitForLibrary(restarted),"registry snapshot loaded");
+        require((restarted.configure(endpoint.toString(),"demo") && waitForLibrary(restarted)) && waitForRecents(restarted) && waitForMaintenance(restarted),"restart rechecks and confirms transfer state");
         const auto selected=restarted.localFile(0);
         require(!selected.isEmpty() && QFileInfo::exists(selected),"restart keeps the file selected by the persisted registry");
         if (failure==StorageFailure::RecordFile) {
@@ -187,8 +194,8 @@ void coverCancellationChecks(Client &client,const QString &fault) {
 
 void cleanupRaces(const QUrl &endpoint,const QString &root,const QByteArray &epub) {
     for(int race=0;race<4;++race) {
-        Client client(endpoint,root+"/cleanup-race-"+QString::number(race),nullptr,false);
-        require(client.configure(endpoint.toString(),"demo"),"configure cleanup race account");
+        Client client(endpoint,root+"/cleanup-race-"+QString::number(race),nullptr,false); require(waitForLibrary(client),"registry snapshot loaded");
+        require((client.configure(endpoint.toString(),"demo") && waitForLibrary(client)),"configure cleanup race account");
         require(waitForRecents(client),"cleanup race history settles");
         const auto scope=ClientWorkerCheck::scope(client);
         const auto stem="700-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -204,7 +211,7 @@ void cleanupRaces(const QUrl &endpoint,const QString &root,const QByteArray &epu
         auto &executor=ClientWorkerCheck::executor(client);
         WorkerGate first(executor,&client);
         require(until([&] { return first.entered->load(); }),"hold old cleanup");
-        ClientWorkerCheck::reload(client);
+        ClientWorkerCheck::store(client,"700",record); ClientWorkerCheck::cleanup(client);
         require(ClientWorkerCheck::cleanupRunning(client),"old cleanup is scheduled");
         const auto old=ClientWorkerCheck::cleanupId(client);
         WorkerGate next(executor,&client);
@@ -217,12 +224,12 @@ void cleanupRaces(const QUrl &endpoint,const QString &root,const QByteArray &epu
         if(race==0 || race==3) {
             client.logout();
             require(ClientWorkerCheck::cleanupCancelled(client),"logout explicitly cancels cleanup state");
-            require(wait(client,[&] { client.login(endpoint.toString(),"demo","demo"); }),"sign in again while old cleanup is pending");
+            ClientWorkerCheck::cleanup(client);
         } else if(race==1) {
             ClientWorkerCheck::invalidateSession(client);
             require(ClientWorkerCheck::cleanupCancelled(client),"session invalidation explicitly cancels cleanup state");
             ClientWorkerCheck::cleanup(client);
-        } else ClientWorkerCheck::reload(client);
+        } else { ClientWorkerCheck::cancelCleanup(client); ClientWorkerCheck::cleanup(client); }
         const auto fresh=ClientWorkerCheck::cleanupId(client);
         require(fresh>old && ClientWorkerCheck::cleanupRunning(client),"a fresh cleanup can be scheduled after cancellation");
         first.open(); require(until([&] { return next.entered->load(); }),"old cleanup drains before fresh work");
@@ -231,6 +238,57 @@ void cleanupRaces(const QUrl &endpoint,const QString &root,const QByteArray &epu
         next.open();
         require(waitForMaintenance(client) && !QFile::exists(journal) && bytes(path)==epub,"fresh cleanup finishes and preserves the registered book");
     }
+}
+
+void commitBoundaryChecks(const QUrl &endpoint,const QString &root,const QString &fault) {
+#ifdef BOOKORBIT_STORAGE_CHECK
+    const auto previousPosition=position;
+    const auto data=root+"/first-download-commit";
+    {
+        Client client(endpoint,data,nullptr,false); require(waitForLibrary(client),"empty registry loaded for commit race");
+        mode(fault,""); position.clear();
+        require(wait(client,[&] { client.login(endpoint.toString(),"demo","demo"); }),"commit race signs in");
+        storageScope=ClientWorkerCheck::scope(client); recordEntered=false; releaseRecord=false; holdRecord=true;
+        client.download(0);
+        require(until([&] { return recordEntered.load(); }),"worker stops inside records/101.json fsync before replacement");
+        ClientWorkerCheck::cleanup(client); client.cancelDownload();
+        int ticks=0; QTimer timer; QObject::connect(&timer,&QTimer::timeout,[&] { ++ticks; }); timer.start(5);
+        require(client.busy() && client.downloading() && !client.downloadCancellable() && until([&] { return ticks>=5; }),
+            "GUI cancel during commit keeps busy, blocks cleanup and still processes events");
+        require(wait(client,[&] { releaseRecord=true; }) && waitForMaintenance(client),"commit completes before cleanup can run");
+        client.showDownloaded(true);
+        require(!client.localFile(0).isEmpty(),"first committed file remains registered in memory");
+    }
+    Client restarted(endpoint,data); require(waitForLibrary(restarted) && waitForMaintenance(restarted),"restart after commit race");
+    require(!restarted.localFile(0).isEmpty() && QFile::exists(restarted.localFile(0)),"restart never sees a registry pointing to a deleted first download");
+
+    Client client(endpoint,root+"/progress-intents",nullptr,false); require(waitForLibrary(client),"progress intent fixture loaded");
+    mode(fault,""); position.clear();
+    require(wait(client,[&] { client.login(endpoint.toString(),"demo","demo"); }) && wait(client,[&] { client.download(0); }),"progress intent fixture downloads");
+    storageScope=ClientWorkerCheck::scope(client);
+    const QString base="epubcfi(/6/2!/4/62/1)";
+    for (bool incoming:{true,false}) for (const auto failure:{StorageFailure::RecordFile,StorageFailure::ProgressDirectory}) {
+        auto record=ClientWorkerCheck::record(client,"101");
+        record.remove("syncStatus");
+        record["progress"]=incoming ? QJsonObject{} : QJsonObject{{"profile",profile},{"localBase",base},
+            {"remoteBase",QJsonObject{{"cfi",base},{"pageNumber",QJsonValue::Null},{"percentage",40}}}};
+        require(ClientWorkerCheck::save(client,"101",record),"seed explicit baseline for intent fault");
+        position=incoming ? QString{} : "pbr:/webkit?##epubcfi(/6/2!/4/6/1)";
+        const auto beforePosition=position; const int before=posts(root);
+        mode(fault,"progress_remote"); storageFaults=0; storageFailure=failure;
+        require(!wait(client,[&] { client.syncFile(101); }) && storageFaults>0 && posts(root)==before && position==beforePosition,
+            "failed file or directory fsync blocks both native mutation and server POST");
+        storageFailure=StorageFailure::None;
+        const auto saved=QJsonDocument::fromJson(bytes(storageScope+"/records/101.json")).object()["progress"].toObject();
+        if (failure==StorageFailure::ProgressDirectory)
+            require(saved.contains(incoming ? "pending" : "outgoing"),"unconfirmed replacement retains the visible recovery intent");
+        Client recovery(endpoint,root+"/progress-intents"); require(waitForLibrary(recovery),"restart loads progress journal after storage fault");
+        require(ClientWorkerCheck::record(recovery,"101")["progress"]==saved,"disk and memory agree after restart of failed intent");
+    }
+    position=previousPosition; mode(fault,"");
+#else
+    Q_UNUSED(endpoint) Q_UNUSED(root) Q_UNUSED(fault)
+#endif
 }
 
 void workerRaces(Client &client,const QString &root,const QString &fault) {
@@ -343,6 +401,30 @@ void workerRaces(Client &client,const QString &root,const QString &fault) {
     }
 }
 
+void registryChecks(const QUrl &endpoint,const QString &root) {
+    Client client(endpoint,root+"/registry-race"); require(waitForLibrary(client),"registry race initial state");
+    auto &executor=ClientWorkerCheck::executor(client);
+    WorkerGate gate(executor,&client); require(until([&] { return gate.entered->load(); }),"hold registry worker");
+    ClientWorkerCheck::reload(client);
+    require(client.libraryLoading() && client.busy() && client.books().isEmpty(),"registry loading is visible before its scan starts");
+    QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty("client",&client);
+    engine.rootContext()->setContextProperty("screenWidth",600); engine.rootContext()->setContextProperty("screenHeight",800);
+    engine.load(QUrl("qrc:/Main.qml")); require(!engine.rootObjects().isEmpty(),"loading QML creates a window while worker waits");
+    auto window=qobject_cast<QQuickWindow *>(engine.rootObjects().first()); bool frame=false;
+    QObject::connect(window,&QQuickWindow::frameSwapped,&client,[&] { frame=true; }); window->show(); window->requestUpdate();
+    require(until([&] { return frame; }) && client.libraryLoading(),"first QML frame renders before full registry scan completes");
+    const auto message=window->findChild<QObject *>("operationMessage");
+    require(message && message->property("text").toString().contains("Загрузка"),"first frame displays downloaded-library loading state");
+    // A second generation must remain loading when the first cancelled callback arrives.
+    WorkerGate next(executor,&client); ClientWorkerCheck::reload(client); gate.open();
+    require(until([&] { return next.entered->load(); }),"old registry drains before newer generation");
+    QCoreApplication::processEvents(); require(client.libraryLoading(),"old account-generation callback cannot publish or clear loading");
+    next.open(); require(waitForLibrary(client) && waitForRecents(client),"new registry generation publishes successfully");
+    client.resetPresentationWork(); client.refreshRecents();
+    require(waitForRecents(client) && client.presentationWork().localFileChecks==0,"full recents preparation performs no GUI localFile checks");
+}
+
 void modelChecks() {
     for (int size:{100,1000,5000}) {
         LibraryModel model; QVariantList values;
@@ -361,7 +443,7 @@ void modelChecks() {
 void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &endpoint, const QString &root) {
     const QString data=root+"/presentation", source=root+"/plain.epub";
     QString scope;
-    { Client seed(endpoint,data); require(seed.configure(endpoint.toString(),"demo"),"configure presentation account"); scope=seed.downloadDirectory(); }
+    { Client seed(endpoint,data); require(waitForLibrary(seed),"registry snapshot loaded"); require((seed.configure(endpoint.toString(),"demo") && waitForLibrary(seed)),"configure presentation account"); scope=seed.downloadDirectory(); }
     const auto content=bytes(source);
     const QString digest=QString::fromLatin1(QCryptographicHash::hash(content,QCryptographicHash::Sha256).toHex());
     QJsonObject choices;
@@ -380,15 +462,15 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
     }
     mode(scope+"/file-choices.json",QJsonDocument(choices).toJson());
     history.available=true; history.files[scope+"/50007.epub"]={10007,100};
-    Client client(endpoint,data);
+    Client client(endpoint,data); require(waitForLibrary(client),"registry snapshot loaded");
     require(waitForRecents(client),"initial history snapshot completes");
     client.resetPresentationWork();
     QElapsedTimer clock; clock.start();
     const auto first=client.books();
     const auto elapsed=clock.nsecsElapsed();
     const auto initial=client.presentationWork();
-    require(first.size()==1000 && initial.libraryBuilds==1 && initial.librarySorts==1 && initial.localFileChecks==1000,
-        "1000-book snapshot checks each file once and groups/sorts once");
+    require(first.size()==1000 && initial.libraryBuilds==1 && initial.librarySorts==1 && initial.localFileChecks==0,
+        "1000-book GUI snapshot uses worker metadata and groups/sorts once");
     std::printf("MEASURE: books=1000 build_ms=%.3f file_checks=%llu builds=%llu sorts=%llu\n",
         elapsed/1000000.0,static_cast<unsigned long long>(initial.localFileChecks),
         static_cast<unsigned long long>(initial.libraryBuilds),static_cast<unsigned long long>(initial.librarySorts));
@@ -398,7 +480,7 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
     const auto summary=client.syncSummary();
     const auto syncWork=client.presentationWork();
     require(summary["total"].toInt()==1000 && syncWork.syncBuilds==1 && syncWork.syncSorts==1 &&
-            syncWork.localFileChecks==2000,"sync list and counters build one separate snapshot");
+            syncWork.localFileChecks==0,"sync list and counters build one separate snapshot");
     require(client.syncBooks().size()==1000 && !summary.contains("books") && client.syncSummary()==summary,"sync aggregates exclude snapshots and the explicit C++ snapshot remains available");
     client.searchDownloaded("КНИГА 0007");
     require(client.books().size()==1 && client.books().first().toMap()["bookId"].toInt()==10007 &&
@@ -482,8 +564,8 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
         const auto work=client.presentationWork();
         require(client.bookModel()==model && !resets && updates==1 && catalog->property("contentY")==oldY,
                 "single-book status retains model, other delegates and scroll position");
-        require(!work.libraryBuilds && !work.librarySorts && !work.syncBuilds && !work.syncSorts && work.localFileChecks==1 && work.bookUpdates==1 && work.syncUpdates==1,
-                "single-book completion updates one group and checks only its file among 1000 books");
+        require(!work.libraryBuilds && !work.librarySorts && !work.syncBuilds && !work.syncSorts && work.localFileChecks==0 && work.bookUpdates==1 && work.syncUpdates==1,
+                "single-book completion uses worker metadata and updates only its group among 1000 books");
         require(!work.indexBuilds && !work.indexVisits && !work.recentPasses && !work.recentVisits && !work.modelIndexVisits &&
             !work.modelSequenceVisits && !work.syncSnapshots && work.syncReconciliations==1,
             "status-only completion performs no whole-library index, recent, reconciliation or snapshot pass");
@@ -641,6 +723,28 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
 
 int main(int argc,char **argv) {
     QGuiApplication app(argc,argv);
+    if (argc==4 && QString::fromLocal8Bit(argv[1])=="--epub-memory") {
+        auto rss=[](const QByteArray &name) -> qint64 {
+#ifdef Q_OS_LINUX
+            QFile status("/proc/self/status"); if (!status.open(QIODevice::ReadOnly)) return -1;
+            for (const auto &line:status.readAll().split('\n'))
+                if (line.startsWith(name+':')) return line.simplified().split(' ')[1].toLongLong();
+            return -1;
+#else
+            Q_UNUSED(name)
+            struct rusage usage{}; getrusage(RUSAGE_SELF,&usage); return usage.ru_maxrss/1024;
+#endif
+        };
+        const auto before=rss("VmRSS");
+        const auto path=QString::fromLocal8Bit(argv[2]); double percent=0;
+        const bool ok=epubPosition(path,"epubcfi(/6/2!/4/2/1:3)",&percent);
+        const auto peak=rss("VmHWM");
+        std::printf("MEASURE: %s accepted=%d rss_start_kib=%lld peak_rss_kib=%lld delta_peak_kib=%lld\n",
+            qPrintable(QFileInfo(path).fileName()),ok,static_cast<long long>(before),static_cast<long long>(peak),static_cast<long long>(peak-before));
+        require(ok==(QString::fromLocal8Bit(argv[3])=="1"),"working budget result matches expected coordinate/estimate support");
+        require(before>0 && peak>=before && peak-before<64*1024,"transient RSS stays below the host regression ceiling");
+        return 0;
+    }
     QTranslator russian;
     require(russian.load(":/translations/bookorbit_ru.qm"), "Russian translation catalog loaded");
     app.installTranslator(&russian);
@@ -679,10 +783,10 @@ int main(int argc,char **argv) {
             "coordinate validation parses only the target chapter before choosing an action");
     require(positionEstimate(fixture("cache"),resolved,&percentage),"chosen action calculates chapter offsets once");
     const auto cacheWork=progressWork();
-    require(cacheWork.packages==1 && cacheWork.chapters==12 && cacheWork.lengthPasses==1,"first estimate builds one package and twelve chapter lengths");
+    require(cacheWork.packages==1 && cacheWork.chapters==1 && cacheWork.lengthReads==11 && cacheWork.lengthPasses==1,"first estimate builds one package and streams eleven remaining chapter lengths");
     require(epubPosition(fixture("cache"),"epubcfi(/6/24!/4/2/1:100)",&percentage) &&
-            progressWork().packages==1 && progressWork().lengthPasses==1 && progressWork().chapters==12,
-            "second position reuses the package, chapter DOM and all accumulated lengths");
+            progressWork().packages==1 && progressWork().lengthPasses==1 && progressWork().chapters==2,
+            "second position reuses the package and lengths, parsing only its target DOM");
     const auto cachePath=fixture("cache"); const auto cacheBytes=bytes(cachePath);
     mode(cachePath,cacheBytes);
     require(!positionEstimate(cachePath,resolved,&percentage),"same-size rewrite rejects coordinates resolved against an older identity");
@@ -712,26 +816,27 @@ int main(int argc,char **argv) {
     require(endpoint.isValid() && !endpoint.host().isEmpty(),"isolated endpoint provided");
     const QString firstRunRoot=root+"/first-install/applications/bookorbit";
     require(!QFileInfo::exists(firstRunRoot),"first-install data directory is absent");
-    Client firstRun(endpoint,firstRunRoot);
+    Client firstRun(endpoint,firstRunRoot); require(waitForLibrary(firstRun),"registry snapshot loaded");
     require(QFileInfo(firstRunRoot).isDir() &&
             QFileInfo(firstRun.downloadDirectory()+"/records").isDir() && firstRun.status().isEmpty(),
             "first launch creates data directory and account records recursively");
     require(firstRun.setDiagnosticLogging(true),"first launch can save preferences");
     const auto savedPreferences=bytes(firstRunRoot+"/preferences.json");
-    Client nextRun(endpoint,firstRunRoot);
+    Client nextRun(endpoint,firstRunRoot); require(waitForLibrary(nextRun),"registry snapshot loaded");
     require(nextRun.diagnosticLogging() && bytes(firstRunRoot+"/preferences.json")==savedPreferences &&
             nextRun.status().isEmpty(),"existing data directory and preferences survive restart");
     const QString blockedRoot=root+"/blocked-data";
     mode(blockedRoot,"keep existing file");
     for (const QString &path:QStringList{blockedRoot,blockedRoot+"/bookorbit"}) {
-        Client blocked(endpoint,path);
+        Client blocked(endpoint,path); require(waitForLibrary(blocked),"registry snapshot loaded");
         blocked.restoreSession();
         require(blocked.status().contains("Не удалось создать папку данных приложения") &&
                 blocked.status().contains(path) && blocked.feedback()["result"]=="error" &&
                 bytes(blockedRoot)=="keep existing file",
                 "failed directory creation reports its path and preserves blocking file");
     }
-    Client client(endpoint,root+"/client");
+    registryChecks(endpoint,root);
+    Client client(endpoint,root+"/client"); require(waitForLibrary(client),"registry snapshot loaded");
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("client",&client);
     engine.rootContext()->setContextProperty("screenWidth",600);
@@ -859,6 +964,7 @@ int main(int argc,char **argv) {
             bytes(replacement)==replacementBytes && bytes(recordPath)==recordBefore,
             "ordinary ZIP cannot replace a valid EPUB or its persisted record");
     storageFailureChecks(endpoint,root,fault);
+    commitBoundaryChecks(endpoint,root,fault);
     modelChecks();
     presentationChecks(app,russian,endpoint,root);
     std::puts("PASS: audit regressions");

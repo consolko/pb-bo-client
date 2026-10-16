@@ -7,8 +7,9 @@
 
 struct ClientWorkerCheck {
     static FileExecutor &executor(Client &client) { return client.files; }
-    static bool recentsIdle(const Client &client) { return !client.recentsScheduled && !client.recentsRequested; }
+    static bool recentsIdle(const Client &client) { return !client.registryLoading && !client.recentsScheduled && !client.recentsRequested; }
     static void changeAccount(Client &client) { ++client.accountGeneration; }
+    static bool receiving(const Client &client) { return client.activeDownload && !client.activeDownload->isFinished(); }
     static bool coverPending(const Client &client) { return bool(client.coverTask); }
     static void stopCovers(Client &client) { client.stopCovers(); }
     static FileCancellation task(const Client &client) { return client.fileTask; }
@@ -16,6 +17,7 @@ struct ClientWorkerCheck {
     static bool cleanupCancelled(const Client &client) { return client.cleanupState==Client::CleanupState::Cancelled; }
     static quint64 cleanupId(const Client &client) { return client.cleanupGeneration; }
     static QString scope(const Client &client) { return client.scopeDir; }
+    static void cancelCleanup(Client &client) { client.cancelCleanup(); }
     static void cleanup(Client &client) { client.cleanupBooks(); }
     static void invalidateSession(Client &client) { client.invalidateSession(); }
     static void reload(Client &client) { client.loadRecords(); }
@@ -43,6 +45,9 @@ inline bool waitUntil(const std::function<bool()> &predicate,int timeout=10000) 
     if (!predicate()) loop.exec();
     return predicate();
 }
+inline bool waitForLibrary(Client &client) {
+    return waitUntil([&] { return !client.libraryLoading(); });
+}
 inline bool waitForRecents(Client &client) {
     return waitUntil([&] { return ClientWorkerCheck::recentsIdle(client); });
 }
@@ -51,6 +56,7 @@ inline bool waitForMaintenance(Client &client) {
 }
 
 inline bool waitForClient(Client &client, const std::function<void()> &action, bool *completed = nullptr) {
+    if (!waitForLibrary(client)) return false;
     QEventLoop loop;
     bool done = false, ok = false;
     auto connection = QObject::connect(&client, &Client::completed, &loop, [&](const QString &operation, bool success) {

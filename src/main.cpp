@@ -10,6 +10,7 @@
 #include <QQuickWindow>
 #include <QStandardPaths>
 #include <QTimer>
+#include <QEventLoop>
 #include <cstdio>
 #include <memory>
 #include <QFile>
@@ -73,6 +74,11 @@ int main(int argc, char **argv) {
     Client client(QUrl(server), data, nullptr, !args.contains("--server"));
     client.logDiagnostic("app.start",{{"executable",QString::fromLocal8Bit(argv[0])},{"data",data}});
     QObject::connect(app.get(),&QCoreApplication::aboutToQuit,&client,[&] { client.logDiagnostic("app.exit"); });
+    if (offline || smoke) {
+        QEventLoop loading;
+        QObject::connect(&client,&Client::libraryLoadingChanged,&loading,[&] { if (!client.libraryLoading()) loading.quit(); });
+        if (client.libraryLoading()) loading.exec();
+    }
     if (offline) {
         const QString path = client.localFile(0);
         std::printf("cachedBooks=%lld localFile=%s\n", static_cast<long long>(client.books().size()), qPrintable(path));

@@ -42,6 +42,8 @@ int main(int argc,char **argv) {
         {"pbr:/word?page=2", "epubcfi(/6/8!/4/2/2/2/1:0)"},
         {"pbr:/word?page=3", "epubcfi(/6/8!/4/2/4/2/1:0)"}
     };
+    resetProgressWork();
+    const auto snapshot=fb2Index(path); require(bool(snapshot),"build immutable FB2 snapshot");
     for (const auto &[native,cfi]:cases) {
         require(bookCfi(path,native)==cfi,"native coordinate -> expected Foliate CFI");
         QString back,point; double percent=-1; QVariantMap context;
@@ -49,6 +51,12 @@ int main(int argc,char **argv) {
         require(back==(native.contains("offs=")?native:native+"&offs=0") && point==cfi,"exact reverse coordinate");
         require(percent>=0 && percent<=100 && context.contains("excerpt"),"display estimate and context");
     }
+    require(progressWork().fb2Parses==1,"all conversions share one cached FB2 parse");
+    clearEpubCache();
+    require(bookCfi(path,cases[0].first,snapshot)==cases[0].second &&
+        bookPosition(path,cases[4].second,nullptr,nullptr,nullptr,nullptr,nullptr,snapshot) &&
+        sameBookPosition(path,cases[4].second,cases[4].second,true,snapshot) && progressWork().fb2Parses==1,
+        "operation snapshot survives cache eviction across conversion and comparisons");
     const QString asserted="epubcfi(/6/6!/4/2[ch]/4[text]/2[b]/1:2)";
     require(sameBookPosition(path,asserted,cases[4].second),"ID assertions compare after validation");
     require(!bookPosition(path,QString(asserted).replace("[b]","[wrong]"),nullptr),"wrong ID rejected");
@@ -67,6 +75,7 @@ int main(int argc,char **argv) {
         require(bookCfi(path,"pbr:/word?page=0").isEmpty(),"uncalibrated structure blocked");
     }
     write(path,prefix+"<description><title-info><coverpage><image/></coverpage></title-info></description>"+body+"</FictionBook>");
+    require(bookCfi(path,cases[4].first,snapshot).isEmpty(),"old snapshot rejects a changed file");
     require(bookCfi(path,cases[4].first)==cases[4].second,"metadata cover does not shift native text or Foliate CFI");
     // U634 starts the next word page before the paragraph reaching 2048 UTF-16 units.
     QByteArray longBody="<body><section><p>"+QByteArray(1024,'a')+"</p><empty-line/><p>"+QByteArray(1023,'b')+"</p>";
@@ -87,6 +96,9 @@ int main(int argc,char **argv) {
     require(bookCfi(path,"pbr:/word?page=149&offs=1002")=="epubcfi(/6/2!/4/2/600/1:1)","long prose section spans native word pages");
     write(path,prefix+"<body><section><p>"+QByteArray(60001,'x')+"</p></section></body></FictionBook>");
     require(bookCfi(path,"pbr:/word?page=0").isEmpty(),"uncalibrated oversized paragraph blocked");
+    write(path,prefix+"<body><section><p id=\""+QByteArray(4*1024*1024,'a')+"\">Text</p></section></body></FictionBook>");
+    const auto large=fb2Index(path);
+    require(large && fb2Index(path)!=large,"large converted attributes do not enter the small FB2 cache");
     write(path,"<!DOCTYPE FictionBook [<!ENTITY x SYSTEM 'file:///etc/passwd'>]>"+prefix+body+"</FictionBook>");
     require(bookCfi(path,"pbr:/word?page=0").isEmpty(),"entity declaration blocked");
     std::puts("PASS: FB2 coordinates, ranges, UTF-16, notes and unsupported structures");

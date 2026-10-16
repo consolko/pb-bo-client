@@ -1704,5 +1704,6 @@ Download an EPUB or FB2 from the catalog.</source><translation>Пока нече
         <source>Update recovery files need attention. New downloads are blocked to preserve them.</source>
         <translation>Файлы восстановления обновления требуют проверки. Новые загрузки заблокированы для их сохранности.</translation>
     </message>
+<message><source>Loading downloaded books…</source><translation>Загрузка скачанных книг…</translation></message>
 </context>
 </TS>

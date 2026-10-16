@@ -61,18 +61,24 @@ struct Zip {
         const auto local=file.read(30);
         if (local.size()!=30 || u32(local,0)!=0x04034b50 || u16(local,8)!=method || (u16(local,6)&1)) return {};
         if (!file.seek(quint64(offset)+30+u16(local,26)+u16(local,28))) return {};
-        const auto data=file.read(compressed);
-        if (quint32(data.size())!=compressed) return {};
         QByteArray out;
-        if (method==0) out=data;
+        if (method==0) out=file.read(compressed);
         else {
             out.resize(size);
             z_stream z{};
-            z.next_in=reinterpret_cast<Bytef *>(const_cast<char *>(data.constData())); z.avail_in=data.size();
             z.next_out=reinterpret_cast<Bytef *>(out.data()); z.avail_out=out.size();
             if (inflateInit2(&z,-MAX_WBITS)!=Z_OK) return {};
-            const int rc=inflate(&z,Z_FINISH); inflateEnd(&z);
-            if (rc!=Z_STREAM_END || z.total_out!=size || z.total_in!=compressed) return {};
+            quint32 remaining=compressed; int rc=Z_OK;
+            while (remaining && rc==Z_OK && !fileTaskCancelled()) {
+                const auto input=file.read(qMin(remaining,quint32(65536)));
+                if (input.isEmpty()) break;
+                remaining-=input.size();
+                z.next_in=reinterpret_cast<Bytef *>(const_cast<char *>(input.constData())); z.avail_in=input.size();
+                rc=inflate(&z,remaining ? Z_NO_FLUSH : Z_FINISH);
+                if (z.avail_in) break;
+            }
+            inflateEnd(&z);
+            if (fileTaskCancelled() || rc!=Z_STREAM_END || z.total_out!=size || z.total_in!=compressed) return {};
         }
         if (quint32(out.size())!=size || crc32(0,reinterpret_cast<const Bytef *>(out.constData()),out.size())!=u32(h,16)) return {};
         budget-=size;

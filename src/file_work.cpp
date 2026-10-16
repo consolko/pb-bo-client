@@ -137,11 +137,11 @@ FileStamp fb2Calibration(const FileCancellation &cancel) {
     FileStamp result; result.valid=true; return result;
 #endif
 }
-PreparedReaderPosition prepareReaderPosition(const QString &path,const QString &cfi,const FileCancellation &cancel) {
+PreparedReaderPosition prepareReaderPosition(const QString &path,const QString &cfi,const FileCancellation &cancel,const std::shared_ptr<const Fb2Index> &fb) {
     PreparedReaderPosition result; result.cfi=cfi; result.file=fileStamp(path);
     if (fileCancelled(cancel)) return result;
     PositionInfo resolved;
-    result.coordinate=bookPosition(path,cfi,nullptr,nullptr,nullptr,&result.native,&resolved);
+    result.coordinate=bookPosition(path,cfi,nullptr,nullptr,nullptr,&result.native,&resolved,fb);
     if (result.coordinate && !fileCancelled(cancel)) result.estimate=positionEstimate(path,resolved,&result.percentage);
 #ifdef POCKETBOOK_DEVICE
     const QString framework=QFileInfo("/ebrmain/lib/libframework2.so").canonicalFilePath();

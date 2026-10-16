@@ -29,9 +29,12 @@ bool precedingHeading(const QDomNode &node, const QDomNode &target, QString &hea
         if (precedingHeading(child,target,heading)) return true;
     return false;
 }
-bool xml(const QByteArray &bytes, QDomDocument &doc,int *nodeCount=nullptr) {
+constexpr qint64 epubWorkBytes=32*1024*1024;
+// Includes input, UTF-16 conversion and conservative node overhead, before DOM allocation.
+bool scanXml(const QByteArray &bytes,int *nodeCount=nullptr,qint64 *text=nullptr,qint64 budget=0) {
     if (bytes.isEmpty()) return false;
-    QXmlStreamReader reader(bytes); int depth=0, nodes=0;
+    QXmlStreamReader reader(bytes); int depth=0, nodes=0; qint64 length=0;
+    if (budget && bytes.size()*6>budget) return false;
     while (!reader.atEnd()) {
         if (fileTaskCancelled()) return false;
         const auto token=reader.readNext();
@@ -44,12 +47,20 @@ bool xml(const QByteArray &bytes, QDomDocument &doc,int *nodeCount=nullptr) {
                 !reader.entityDeclarations().isEmpty() || !reader.notationDeclarations().isEmpty() ||
                 !simpleDoctype.match(reader.text().toString()).hasMatch()) return false;
         }
-        if (token==QXmlStreamReader::EntityReference || ++nodes>200000) return false;
+        if (reader.isStartElement()) nodes+=reader.attributes().size()*2;
+        if (token==QXmlStreamReader::EntityReference || ++nodes>200000 ||
+            (budget && bytes.size()*6+qint64(nodes)*256>budget)) return false;
+        if (reader.isCharacters()) length+=reader.text().size();
         if (reader.isStartElement() && ++depth>128) return false;
         if (reader.isEndElement()) --depth;
     }
     if (nodeCount) *nodeCount=nodes;
-    return !reader.hasError() && bool(doc.setContent(bytes, QDomDocument::ParseOption::PreserveSpacingOnlyNodes));
+    if (text) *text=length;
+    return !reader.hasError() && !fileTaskCancelled();
+}
+bool xml(const QByteArray &bytes, QDomDocument &doc,int *nodeCount=nullptr,qint64 budget=epubWorkBytes) {
+    return scanXml(bytes,nodeCount,nullptr,budget) &&
+        bool(doc.setContent(bytes,QDomDocument::ParseOption::PreserveSpacingOnlyNodes));
 }
 qint64 textSize(const QDomNode &node) {
     if (fileTaskCancelled()) return 0;
@@ -133,12 +144,12 @@ struct Package {
 
 bool loadPackage(Zip &zip, Package &package) {
     QDomDocument container;
-    if (!xml(zip.read("META-INF/container.xml"),container) || tag(container.documentElement())!="container") return false;
+    if (!xml(zip.read("META-INF/container.xml",1024*1024),container,nullptr,8*1024*1024) || tag(container.documentElement())!="container") return false;
     const auto roots=childElement(container.documentElement(),"rootfiles");
     // Standard CFIs address the default rendition: the first rootfile.
     const auto rootfile=childElement(roots,"rootfile");
     const QString opf=archivePath({},rootfile.attribute("full-path"));
-    if (opf.isEmpty() || !xml(zip.read(opf),package.document,&package.nodes)) return false;
+    if (opf.isEmpty() || !xml(zip.read(opf,2*1024*1024),package.document,&package.nodes,8*1024*1024)) return false;
     const auto root=package.document.documentElement();
     if (tag(root)!="package") return false;
     const auto manifest=childElement(root,"manifest");
@@ -186,6 +197,8 @@ constexpr int epubCacheNodes=100000;
 #ifdef BOOKORBIT_TEST_HTTP
 thread_local ProgressWork progressCounters;
 #endif
+struct EpubIndex;
+void reserveEpubWork(EpubIndex *index);
 struct EpubIndex {
     struct Chapter { QDomDocument document; qint64 cost=0,used=0; int nodes=0; };
     struct Length { qint64 text=0,bytes=0; };
@@ -221,13 +234,14 @@ struct EpubIndex {
         if (fileTaskCancelled() || resource.isEmpty()) return {};
         auto existing=chapters.find(resource);
         if (existing!=chapters.end()) { existing->used=++sequence; return existing->document; }
-        // Each fresh extraction is bounded; full-spine logical bytes are checked separately.
+        reserveEpubWork(this);
+        // Extraction and DOM have a separate working budget from retained cache storage.
         zip.budget=32*1024*1024;
         const auto bytes=zip.read(resource); QDomDocument document; int count=0;
 #ifdef BOOKORBIT_TEST_HTTP
         ++progressCounters.chapters;
 #endif
-        if (!xml(bytes,document,&count) || fileTaskCancelled()) return {};
+        if (!xml(bytes,document,&count,epubWorkBytes-baseCost) || fileTaskCancelled()) return {};
         const auto length=textSize(document.documentElement());
         if (fileTaskCancelled()) return {};
         lengths[resource]={length,bytes.size()};
@@ -251,7 +265,15 @@ struct EpubIndex {
         for (const auto &item:spine) {
             if (fileTaskCancelled()) return false;
             const auto resource=package.resources.value(item.attribute("idref"));
-            if (!lengths.contains(resource) && chapter(resource).isNull()) return false;
+            if (!lengths.contains(resource)) {
+                reserveEpubWork(this); zip.budget=32*1024*1024;
+                const auto bytes=zip.read(resource); qint64 text=0;
+#ifdef BOOKORBIT_TEST_HTTP
+                ++progressCounters.lengthReads;
+#endif
+                if (!scanXml(bytes,nullptr,&text)) return false;
+                lengths[resource]={text,bytes.size()};
+            }
             const auto length=lengths.value(resource); size+=length.bytes;
             if (size>32*1024*1024) return false;
             prefix.append(sum); sum+=length.text;
@@ -298,7 +320,11 @@ struct EpubCache {
             ++progressCounters.hits;
 #endif
         } else {
-            books.remove(key); result=std::make_shared<EpubIndex>(path,stamp);
+            // No caller retains a chapter DOM across another package construction.
+#ifdef BOOKORBIT_TEST_HTTP
+            progressCounters.evictions+=books.size();
+#endif
+            books.clear(); result=std::make_shared<EpubIndex>(path,stamp);
             if (!result->valid) return {};
             books[key]=result;
         }
@@ -306,8 +332,16 @@ struct EpubCache {
     }
 };
 thread_local EpubCache epubCache;
+void reserveEpubWork(EpubIndex *index) {
+    for (auto it=epubCache.books.begin();it!=epubCache.books.end();) {
+        if (it.value().get()!=index) it=epubCache.books.erase(it);
+        else ++it;
+    }
+    index->chapters.clear();
 }
-void clearEpubCache() { epubCache.books.clear(); epubCache.timer.stop(); }
+}
+void clearFb2Cache();
+void clearEpubCache() { epubCache.books.clear(); epubCache.timer.stop(); clearFb2Cache(); }
 #ifdef BOOKORBIT_TEST_HTTP
 ProgressWork progressWork() {
     auto result=progressCounters; result.cachedBooks=epubCache.books.size();
@@ -352,7 +386,7 @@ bool epubPosition(const QString &path, const QString &cfi, double *percentage, Q
     const int chapter=index->spine.indexOf(ref.toElement());
     if (chapter<0) return false;
     const auto resource=index->package.resources.value(ref.toElement().attribute("idref"));
-    const auto content=index->chapter(resource);
+    auto content=index->chapter(resource);
     if (content.isNull()) return false;
     QDomNode target; qint64 before=0;
     if (!resolve(content.documentElement(),start,target,before,offset)) return false;
@@ -366,6 +400,7 @@ bool epubPosition(const QString &path, const QString &cfi, double *percentage, Q
         QString heading; precedingHeading(content.documentElement(),target,heading);
         resolvedContext={{"chapter",heading},{"excerpt",content.documentElement().text().mid(before,160).simplified()}};
     }
+    target.clear(); content.clear();
     if (percentage) {
         if (!index->estimate()) return false;
         const qint64 position=index->offsets[chapter]+before;
@@ -493,7 +528,7 @@ QDomElement fbDocument(FbBook &book) {
 
 bool loadFb(const QString &path, FbBook &book) {
     QFile file(path); QDomDocument source;
-    if (!file.open(QIODevice::ReadOnly) || file.size()>16*1024*1024 || !xml(file.readAll(),source)) return false;
+    if (!file.open(QIODevice::ReadOnly) || file.size()>16*1024*1024 || !xml(file.readAll(),source,nullptr,0)) return false;
     const auto root=source.documentElement();
     if (tag(root)!="FictionBook" || root.tagName()!= "FictionBook" ||
         root.attribute("xmlns")!="http://www.gribuser.ru/xml/fictionbook/2.0") return false;
@@ -537,6 +572,60 @@ bool loadFb(const QString &path, FbBook &book) {
         pageText+=length;
     }
     return bodyIndex>0 && book.total>0;
+}
+
+}
+struct Fb2Index {
+    FbBook book;
+    FileStamp stamp;
+    int version=1;
+    qint64 cost=0;
+};
+namespace {
+constexpr int fb2ConverterVersion=1;
+struct Fb2Cache {
+    QString path;
+    Fb2Snapshot index;
+    QTimer timer;
+    Fb2Cache() {
+        timer.setSingleShot(true);
+        QObject::connect(&timer,&QTimer::timeout,[this] { index.reset(); path.clear(); });
+    }
+};
+thread_local Fb2Cache fb2Cache;
+}
+void clearFb2Cache() { fb2Cache.index.reset(); fb2Cache.path.clear(); fb2Cache.timer.stop(); }
+Fb2Snapshot fb2Index(const QString &path) {
+    if (!path.endsWith(".fb2",Qt::CaseInsensitive) || fileTaskCancelled()) return {};
+    const auto stamp=fileStamp(path); const auto key=QFileInfo(path).absoluteFilePath();
+    if (!stamp.valid) return {};
+    if (fb2Cache.path==key && fb2Cache.index && fb2Cache.index->stamp==stamp && fb2Cache.index->version==fb2ConverterVersion) {
+        fb2Cache.timer.start(120000); return fb2Cache.index;
+    }
+    fb2Cache.index.reset(); fb2Cache.path.clear(); fb2Cache.timer.stop();
+    auto index=std::make_shared<Fb2Index>(); index->stamp=stamp; index->version=fb2ConverterVersion;
+#ifdef BOOKORBIT_TEST_HTTP
+    ++progressCounters.fb2Parses;
+#endif
+    if (!loadFb(path,index->book) || fileTaskCancelled() || fileStamp(path)!=stamp) return {};
+    // Count converted DOM storage; the source DOM is already gone.
+    std::function<void(QDomNode)> charge=[&](QDomNode node) {
+        index->cost+=256+(node.nodeName().size()+node.nodeValue().size())*2;
+        const auto attributes=node.attributes();
+        for (int i=0;i<attributes.size();++i) {
+            const auto attribute=attributes.item(i);
+            index->cost+=256+(attribute.nodeName().size()+attribute.nodeValue().size())*2;
+        }
+        for (auto child=node.firstChild();!child.isNull();child=child.nextSibling()) charge(child);
+    };
+    for (const auto &doc:index->book.sections) charge(doc);
+    index->cost+=index->book.paragraphs.size()*sizeof(FbParagraph);
+    if (index->cost<=8*1024*1024) { fb2Cache.path=key; fb2Cache.index=index; fb2Cache.timer.start(120000); }
+    return index;
+}
+namespace {
+bool currentFb(const QString &path,const Fb2Snapshot &index) {
+    return index && !fileTaskCancelled() && index->version==fb2ConverterVersion && fileStamp(path)==index->stamp;
 }
 
 bool within(QDomNode node,const QDomNode &ancestor) {
@@ -602,7 +691,7 @@ bool fbResolve(const FbBook &book,int section,const QString &path,FbLocation &lo
     return false;
 }
 
-bool fbPosition(const QString &path,const QString &cfi,double *percentage,QString *point,QVariantMap *context,QString *native,PositionInfo *resolved=nullptr) {
+bool fbPosition(const QString &path,const QString &cfi,double *percentage,QString *point,QVariantMap *context,QString *native,PositionInfo *resolved,const Fb2Snapshot &snapshot) {
     if (context) context->clear();
     static const QRegularExpression base("^/6/([1-9][0-9]*)$");
     if (cfi.size()>4096 || !cfi.startsWith("epubcfi(") || !cfi.endsWith(')')) return false;
@@ -617,8 +706,10 @@ bool fbPosition(const QString &path,const QString &cfi,double *percentage,QStrin
             (!ranges[2].startsWith('/') && !ranges[2].startsWith(':'))) return false;
         start+=ranges[1]; end=parts[1]+ranges[2];
     }
-    FbBook book; FbLocation first,last;
-    if (!loadFb(path,book) || !fbResolve(book,index/2-1,start,first)) return false;
+    const auto fb=snapshot ? snapshot : fb2Index(path);
+    if (!currentFb(path,fb)) return false;
+    const auto &book=fb->book; FbLocation first,last;
+    if (!fbResolve(book,index/2-1,start,first)) return false;
     if (!end.isEmpty() && (!fbResolve(book,index/2-1,end,last) || last.paragraph<first.paragraph ||
         (last.paragraph==first.paragraph && last.offset<first.offset))) return false;
     if (!end.isEmpty()) {
@@ -638,18 +729,18 @@ bool fbPosition(const QString &path,const QString &cfi,double *percentage,QStrin
         QString heading; precedingHeading(book.sections[p.section].documentElement(),p.node,heading);
         *context={{"chapter",heading},{"excerpt",p.node.text().mid(first.offset,160).simplified()}};
     }
-    return true;
+    return currentFb(path,fb);
 }
 }
 
 bool syncFormat(const QString &format) { return format=="epub" || format=="fb2"; }
 
-bool bookPosition(const QString &path,const QString &cfi,double *percentage,QString *point,QVariantMap *context,QString *native,PositionInfo *resolved) {
+bool bookPosition(const QString &path,const QString &cfi,double *percentage,QString *point,QVariantMap *context,QString *native,PositionInfo *resolved,const Fb2Snapshot &fb) {
     if (resolved) *resolved={};
     if (path.endsWith(".fb2",Qt::CaseInsensitive)) {
         const auto stamp=fileStamp(path);
         QString location; QVariantMap preview;
-        if (!fbPosition(path,cfi,percentage,&location,context ? context : resolved ? &preview : nullptr,native,resolved) ||
+        if (!fbPosition(path,cfi,percentage,&location,context ? context : resolved ? &preview : nullptr,native,resolved,fb) ||
             (resolved && (!stamp.valid || fileStamp(path)!=stamp))) return false;
         if (point) *point=location;
         if (resolved) { resolved->point=location; resolved->context=context ? *context : preview; resolved->file=stamp; }
@@ -663,29 +754,33 @@ bool bookPosition(const QString &path,const QString &cfi,double *percentage,QStr
     return true;
 }
 
-QString bookCfi(const QString &path,const QString &position) {
+QString bookCfi(const QString &path,const QString &position,const Fb2Snapshot &snapshot) {
     if (!path.endsWith(".fb2",Qt::CaseInsensitive)) return nativeCfi(position);
     static const QRegularExpression pattern("^pbr:/word\\?page=([0-9]+)(?:&offs=([0-9]+))?$");
     auto match=pattern.match(position); bool ok=false;
     const int page=match.captured(1).toInt(&ok); if (!match.hasMatch() || !ok) return {};
     const qint64 offset=match.captured(2).isEmpty()?0:match.captured(2).toLongLong(&ok);
     if (!ok) return {};
-    FbBook book; if (fileTaskCancelled() || !loadFb(path,book)) return {};
-    for (const auto &p:book.paragraphs)
-        if (p.page==page && offset>=p.offset && offset<=p.offset+textSize(p.node)) return fbTextPoint(p,offset-p.offset);
+    const auto fb=snapshot ? snapshot : fb2Index(path);
+    if (!currentFb(path,fb)) return {};
+    for (const auto &p:fb->book.paragraphs)
+        if (p.page==page && offset>=p.offset && offset<=p.offset+textSize(p.node)) {
+            const auto point=fbTextPoint(p,offset-p.offset); return currentFb(path,fb) ? point : QString{};
+        }
     return {};
 }
 
-bool sameBookPosition(const QString &path,const QString &first,const QString &second,bool compareRange) {
+bool sameBookPosition(const QString &path,const QString &first,const QString &second,bool compareRange,const Fb2Snapshot &snapshot) {
     if (!path.endsWith(".fb2",Qt::CaseInsensitive)) return sameEpubPosition(path,first,second,compareRange);
     if (first.isEmpty() || second.isEmpty()) return first.isEmpty() && second.isEmpty();
+    const auto fb=snapshot ? snapshot : fb2Index(path);
     QString a,b;
-    if (!bookPosition(path,first,nullptr,nullptr,nullptr,&a) || !bookPosition(path,second,nullptr,nullptr,nullptr,&b) || a!=b) return false;
+    if (!bookPosition(path,first,nullptr,nullptr,nullptr,&a,nullptr,fb) || !bookPosition(path,second,nullptr,nullptr,nullptr,&b,nullptr,fb) || a!=b) return false;
     if (!compareRange) return true;
     const auto endpoint=[](const QString &cfi) {
         const auto range=cfi.mid(8,cfi.size()-9).split(',');
         return range.size()==3 ? "epubcfi("+range[0]+range[2]+")" : cfi;
     };
-    return bookPosition(path,endpoint(first),nullptr,nullptr,nullptr,&a) &&
-        bookPosition(path,endpoint(second),nullptr,nullptr,nullptr,&b) && a==b;
+    return bookPosition(path,endpoint(first),nullptr,nullptr,nullptr,&a,nullptr,fb) &&
+        bookPosition(path,endpoint(second),nullptr,nullptr,nullptr,&b,nullptr,fb) && a==b;
 }

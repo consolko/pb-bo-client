@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
     const QString root = QString::fromLocal8Bit(argv[1]);
     QFile fault(QString::fromLocal8Bit(argv[2]));
     require(fault.open(QIODevice::WriteOnly) && fault.write("features") == 8, "enable synthetic multi-format library"); fault.close();
-    Client client(QUrl("http://host.containers.internal:8766"), root, nullptr, false);
+    Client client(QUrl("http://host.containers.internal:8766"), root, nullptr, false); require(waitForLibrary(client),"registry snapshot loaded");
     const QString destination = "/mnt/ext1/books/BookOrbit/"+QFileInfo(root).fileName();
     require(QDir().mkpath(destination) && client.setDownloadDirectory(destination), "isolated native download destination");
     QQmlApplicationEngine engine; engine.addImportPath("/ebrmain/qml");
@@ -307,7 +307,7 @@ int main(int argc, char **argv) {
     record["progress"]=QJsonObject{{"profile",readerProfile()},{"conflictLocal","epubcfi(/6/2!/4/14/1:0)"},
         {"conflictRemote",QJsonObject{{"cfi","epubcfi(/6/2!/4/42/1:0)"},{"percentage",40},{"pageNumber",QJsonValue::Null}}}};
     require(recordFile.open(QIODevice::WriteOnly|QIODevice::Truncate) && recordFile.write(QJsonDocument(record).toJson())>0, "seed isolated conflict"); recordFile.close();
-    require(client.configure(client.server(),client.username()), "reload saved conflict without network authentication"); settle();
+    require((client.configure(client.server(),client.username()) && waitForLibrary(client)), "reload saved conflict without network authentication"); settle();
     tap("choosePosition-101"); settle();
     require(!item("conflictLoginButton")->isVisible() && !item("loginButton")->isVisible(),
             "saved session does not offer redundant login in conflict or screen header");
@@ -420,7 +420,7 @@ int main(int argc, char **argv) {
     record=QJsonDocument::fromJson(recordFile.readAll()).object(); recordFile.close();
     record["progress"]=QJsonObject{{"profile",readerProfile()},{"pending",QJsonObject{{"cfi","epubcfi(/6/2!/4/42/1:0)"},{"percentage",40}}}};
     require(recordFile.open(QIODevice::WriteOnly|QIODevice::Truncate) && recordFile.write(QJsonDocument(record).toJson())>0,"seed pending client journal"); recordFile.close();
-    require(client.configure(client.server(),client.username()),"reload pending state"); client.showSyncFile(101); settle();
+    require((client.configure(client.server(),client.username()) && waitForLibrary(client)),"reload pending state"); client.showSyncFile(101); settle();
     require(!item("loginButton")->isVisible() && !item("syncButton")->isEnabled(), "saved session in book details hides login while sync waits for authorization");
     capture("signed-out-details");
     require(item("downloadButton")->property("text").toString()=="Читать с позиции ридера" && item("reconcilePositions")->isVisible(),"pending card exposes local reading and a separate reconciliation action");
@@ -428,7 +428,7 @@ int main(int argc, char **argv) {
     record["progress"]=QJsonObject{{"profile",readerProfile()},{"conflictLocal","epubcfi(/6/2!/4/14/1:0)"},
         {"conflictRemote",QJsonObject{{"cfi","epubcfi(/6/2!/4/42/1:0)"},{"percentage",40}}}};
     require(recordFile.open(QIODevice::WriteOnly|QIODevice::Truncate) && recordFile.write(QJsonDocument(record).toJson())>0,"seed conflict card journal"); recordFile.close();
-    require(client.configure(client.server(),client.username()),"reload card conflict"); client.showSyncFile(101); settle();
+    require((client.configure(client.server(),client.username()) && waitForLibrary(client)),"reload card conflict"); client.showSyncFile(101); settle();
     require(item("downloadButton")->property("text").toString()=="Выбрать позицию" && item("readReaderPosition")->isVisible(),"conflict primary action and secondary local reading stay distinct");
     capture("card-conflict");
     detailFlick->setProperty("contentY",detailFlick->property("contentY").toDouble()+item("downloadButton")->mapToItem(detailFlick,QPointF()).y()-20); settle();

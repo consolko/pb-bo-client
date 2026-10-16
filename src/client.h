@@ -93,6 +93,7 @@ class Client : public QObject {
     Q_PROPERTY(bool historyAvailable READ historyAvailable NOTIFY libraryChanged)
     Q_PROPERTY(QString status READ status NOTIFY feedbackChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY operationChanged)
+    Q_PROPERTY(bool libraryLoading READ libraryLoading NOTIFY libraryLoadingChanged)
     Q_PROPERTY(bool authenticated READ authenticated NOTIFY connectionChanged)
     Q_PROPERTY(int page READ page NOTIFY catalogChanged)
     Q_PROPERTY(int total READ total NOTIFY catalogChanged)
@@ -102,6 +103,7 @@ class Client : public QObject {
     Q_PROPERTY(QStringList accounts READ accounts NOTIFY connectionChanged)
     Q_PROPERTY(bool offlineOnly READ offlineOnly NOTIFY catalogChanged)
     Q_PROPERTY(bool downloading READ downloading NOTIFY operationChanged)
+    Q_PROPERTY(bool downloadCancellable READ downloadCancellable NOTIFY operationChanged)
     Q_PROPERTY(bool verifyingLibrary READ verifyingLibrary NOTIFY operationChanged)
     Q_PROPERTY(bool canRetry READ canRetry NOTIFY operationChanged)
     Q_PROPERTY(QString downloadDirectory READ downloadDirectory NOTIFY settingsChanged)
@@ -171,7 +173,8 @@ public:
     bool historyAvailable() const { return nativeRecents.available; }
     Q_INVOKABLE void openFile(int fileId, bool applyIncoming=false);
     QString status() const { return message.text(); }
-    bool busy() const { return working || conflictPreparing; }
+    bool busy() const { return working || conflictPreparing || registryLoading; }
+    bool libraryLoading() const { return registryLoading; }
     bool authenticated() const { return !token.isEmpty(); }
     int page() const { return currentPage; }
     int total() const { return count; }
@@ -182,6 +185,7 @@ public:
     QStringList accounts() const;
     bool offlineOnly() const { return localView; }
     bool downloading() const { return fileDownloading || !activeDownload.isNull(); }
+    bool downloadCancellable() const { return downloading() && !committingDownload; }
     bool canRetry() const { return !busy() && authenticated() && retryKind != 0; }
     QString downloadDirectory() const;
     bool diagnosticLogging() const { return diagnostics; }
@@ -227,6 +231,7 @@ public:
 signals:
     void diagnosticsEnabled();
     void languageChanged();
+    void libraryLoadingChanged();
     void operationChanged();
     void feedbackChanged();
     void libraryChanged();
@@ -246,7 +251,10 @@ private:
     friend class UpdateManager;
     friend struct ClientWorkerCheck;
     FileExecutor files;
-    FileCancellation fileTask,recentsTask,conflictTask,cleanupTask,coverTask;
+    FileCancellation fileTask,recentsTask,conflictTask,cleanupTask,coverTask,registryTask;
+    bool registryLoading=false,committingDownload=false;
+    quint64 recordsRevision=0;
+    std::function<void()> recordsReady;
     quint64 fileGeneration=0,accountGeneration=0,recentsGeneration=0,conflictGeneration=0,cleanupGeneration=0;
     bool fileDownloading=false,conflictPreparing=false,cleanupPending=false;
     bool restoringDownload=false;
@@ -270,6 +278,7 @@ private:
     mutable QHash<int,int> libraryIndex;
     mutable QSet<int> changedBooks;
     mutable LocalFiles libraryFiles,syncFiles;
+    LocalFiles knownFiles;
     mutable QVariantMap libraryRecent, cachedSyncSummary;
     mutable SyncModel syncRows;
     mutable SyncProxy syncView;
@@ -342,10 +351,11 @@ private:
     void jsonRequest(const QString &path, const QJsonObject &payload, const Callback &callback, bool renew = true, bool get = false, bool arrayResponse = false);
     bool setCredentials(const QJsonObject &response);
     void renewSession(const std::function<void()> &resume);
-    void finish(UiMessage text, bool success, const QString &operation, const QString &syncState = {});
+    void finish(UiMessage text, bool success, const QString &operation, const QString &syncState = {},bool persistStatus=true);
     bool saveRecord(const QString &id, const QJsonObject &record);
+    void saveProgressIntent(const QString &id,const QJsonObject &record,const std::function<void()> &confirmed);
     QString recordFile(const QString &id, const QJsonObject &record) const;
-    void loadRecords();
+    void loadRecords(bool startup=false);
     void cleanupBooks(const QString &verifiedFile = {});
     void cleanupCovers();
     void removeCover(int bookId);

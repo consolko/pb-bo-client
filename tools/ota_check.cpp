@@ -213,7 +213,7 @@ static void recoveryMatrix(const QString &root,const QString &current,const QStr
     };
     {
         const auto base=root+"/matrix-versions",target=base+"/bookorbit.app";
-        Client subject(QUrl("https://example.test"),base,nullptr,false);
+        Client subject(QUrl("https://example.test"),base,nullptr,false); check(waitForLibrary(subject),"registry snapshot loaded");
         check(Ota::save(target,Zip(current).read("bookorbit.app",Ota::maxClient),&error),"installed current executable fixture");
         const auto proof=attempt(base,current,target),stale=attempt(base,old,target),lower=attempt(base,next,target),higher=attempt(base,newest,target);
         const auto incomplete=base+"/update/attempt-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -226,7 +226,7 @@ static void recoveryMatrix(const QString &root,const QString &current,const QStr
     }
     {
         const auto base=root+"/matrix-usb",target=base+"/bookorbit.app";
-        Client subject(QUrl("https://example.test"),base,nullptr,false);
+        Client subject(QUrl("https://example.test"),base,nullptr,false); check(waitForLibrary(subject),"registry snapshot loaded");
         check(Ota::save(target,Zip(newest).read("bookorbit.app",Ota::maxClient),&error),"USB installed a newer signed executable");
         const auto proof=attempt(base,newest,target),obsolete=attempt(base,next,target,true);
         UpdateManager manager(&subject,base,target);
@@ -235,7 +235,7 @@ static void recoveryMatrix(const QString &root,const QString &current,const QStr
     }
     {
         const auto base=root+"/matrix-priority",target=base+"/bookorbit.app";
-        Client subject(QUrl("https://example.test"),base,nullptr,false);
+        Client subject(QUrl("https://example.test"),base,nullptr,false); check(waitForLibrary(subject),"registry snapshot loaded");
         check(Ota::save(target,Zip(current).read("bookorbit.app",Ota::maxClient),&error),"unconfirmed current installation fixture");
         const auto future=attempt(base,newest,target),installed=attempt(base,current,target,true);
         UpdateManager manager(&subject,base,target);
@@ -245,7 +245,7 @@ static void recoveryMatrix(const QString &root,const QString &current,const QStr
     }
     for (bool byteLimit:{false,true}) {
         const auto base=root+(byteLimit ? "/matrix-bytes" : "/matrix-count"),target=base+"/bookorbit.app";
-        Client subject(QUrl("https://example.test"),base,nullptr,false);
+        Client subject(QUrl("https://example.test"),base,nullptr,false); check(waitForLibrary(subject),"registry snapshot loaded");
         check(Ota::save(target,"unknown installed executable",&error),"unverifiable destination fixture");
         QStringList retained;
         for (int i=0;i<(byteLimit ? 1 : 2);++i) {
@@ -357,7 +357,7 @@ int main(int argc,char **argv) {
     check(Ota::isRunningExecutable(QCoreApplication::applicationFilePath()),"running executable confirmed through procfs");
 #endif
     check(!Ota::isRunningExecutable(target) && !Ota::isRunningExecutable(root+"/link") && !Ota::isRunningExecutable({}),"unrelated, symlink and missing executable paths rejected");
-    Client client(QUrl("https://example.test"),root,nullptr,false);
+    Client client(QUrl("https://example.test"),root,nullptr,false); check(waitForLibrary(client),"registry snapshot loaded");
     check(client.prepareUpdate() && client.busy(),"installation locks client operations");
     client.cancelUpdate(); check(!client.busy(),"cancel releases installation lock");
     const auto abandoned=root+"/update/attempt-01234567-89ab-4cde-8abc-0123456789ab",unknown=root+"/update/attempt-foreign";

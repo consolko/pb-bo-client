@@ -91,7 +91,7 @@ int main(int argc, char **argv) {
     require(argc == 3, "data directory and fixture fault file supplied");
     const QString root = QString::fromLocal8Bit(argv[1]), fault = QString::fromLocal8Bit(argv[2]);
     const QUrl endpoint(qEnvironmentVariable("BOOKORBIT_TEST_ENDPOINT", "http://host.containers.internal:8766"));
-    Client c(endpoint, root);
+    Client c(endpoint, root); require(waitForLibrary(c),"registry snapshot loaded");
     write(fault, "");
     require(!c.configure("http://example.com", "demo"), "reject non-local HTTP");
     require(!c.configure("https://user:secret@example.com", "a"), "reject URL credentials");
@@ -105,7 +105,7 @@ int main(int argc, char **argv) {
     const QString sessionFile = root+"/"+QString::fromLatin1(QCryptographicHash::hash((endpoint.toString()+"\ndemo").toUtf8(), QCryptographicHash::Sha256).toHex().left(24))+"/session.json";
     require(c.hasSavedSession() && contents(sessionFile).contains("refreshToken") && !contents(sessionFile).contains("password"),
             "successful login saves refresh token without password");
-    Client resumed(endpoint, root);
+    Client resumed(endpoint, root); require(waitForLibrary(resumed),"registry snapshot loaded");
     int restoredSettings = 0;
     QObject::connect(&resumed, &Client::completed, &resumed, [&](const QString &operation, bool) {
         if (operation == "settings") ++restoredSettings;
@@ -113,7 +113,7 @@ int main(int argc, char **argv) {
     require(resumed.hasSavedSession() && wait(resumed, [&] { resumed.login(resumed.server()+"/", "demo", ""); }) &&
             resumed.authenticated() && restoredSettings == 0,
             "restart restores the session without entering a password");
-    Client pending(endpoint,root);
+    Client pending(endpoint,root); require(waitForLibrary(pending),"registry snapshot loaded");
     const int refreshBefore = requests(root,"POST /api/v1/auth/refresh");
     require(!wait(pending,[&] { pending.login("https://other.example.test","demo",""); }) &&
             !wait(pending,[&] { pending.login(pending.server(),"other-user",""); }) &&
@@ -126,14 +126,14 @@ int main(int argc, char **argv) {
     require(wait(pending,[&] { pending.restoreSession(); }) && pending.authenticated(), "saved session can be restored after transient refresh failure");
     write(sessionFile, QJsonDocument(QJsonObject{{"refreshToken", QString(64, '0')}, {"password", "legacy secret"}}).toJson());
     require(QFile::setPermissions(sessionFile, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ReadGroup | QFileDevice::ReadOther), "seed permissive legacy session");
-    Client migrated(endpoint, root);
+    Client migrated(endpoint, root); require(waitForLibrary(migrated),"registry snapshot loaded");
     require(migrated.hasSavedSession() && !contents(sessionFile).contains("password") &&
             !(QFileInfo(sessionFile).permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther)),
             "legacy password file is rewritten as private token-only session");
     const QString unprotectedRoot=root+"/session-storage-failure";
     const QString accountKey=QString::fromLatin1(QCryptographicHash::hash((endpoint.toString()+"\ndemo").toUtf8(),QCryptographicHash::Sha256).toHex().left(24));
     require(QDir().mkpath(unprotectedRoot+"/"+accountKey+"/session.json"), "inject session storage failure");
-    Client unprotected(endpoint,unprotectedRoot,nullptr,false);
+    Client unprotected(endpoint,unprotectedRoot,nullptr,false); require(waitForLibrary(unprotected),"registry snapshot loaded");
     require(wait(unprotected,[&] { unprotected.login(unprotected.server(), "demo","demo"); }) && unprotected.authenticated() &&
             !unprotected.hasSavedSession() && !unprotected.sessionWarning().isEmpty(),
             "unsafe session storage does not undo successful login");
@@ -147,7 +147,7 @@ int main(int argc, char **argv) {
     const QString catalogPath = QFileInfo(sessionFile).absolutePath()+"/catalog.json";
     require(!QFile::exists(catalogPath), "online catalog is never saved to disk");
     write(catalogPath, "{\"items\":[{\"id\":999,\"title\":\"stale\"}],\"page\":0,\"total\":1}");
-    Client noCache(endpoint, root);
+    Client noCache(endpoint, root); require(waitForLibrary(noCache),"registry snapshot loaded");
     require(noCache.books().isEmpty() && noCache.status().isEmpty() && !QFile::exists(catalogPath),
             "restart discards obsolete catalog and duplicate sign-in prompt");
     c.showDownloaded(true);
@@ -222,7 +222,7 @@ int main(int argc, char **argv) {
             "progress update notifies its model role without resetting the library");
     QObject::disconnect(progressConnection); QObject::disconnect(progressResetConnection);
     require(c.syncSummary()["synced"].toInt()==1, "only confirmed sync contributes to success count");
-    Client statusRestart(endpoint,root);
+    Client statusRestart(endpoint,root); require(waitForLibrary(statusRestart),"registry snapshot loaded");
     require(statusRestart.syncSummary()["synced"].toInt()==1, "confirmed status survives restart without a network session");
     require(statusRestart.books()[0].toMap().value("readingProgress",-1).toDouble()==uploadedPercentage,
             "synced percentage survives an offline restart");
@@ -260,7 +260,7 @@ int main(int argc, char **argv) {
             "incoming position prepares only the native action");
     require(c.books()[0].toMap()["readingProgress"]==beforeIncoming && c.detail()["readingProgress"]==beforeIncoming,
             "failed native apply does not publish incoming percentage as synced");
-    Client pendingRestart(endpoint,root);
+    Client pendingRestart(endpoint,root); require(waitForLibrary(pendingRestart),"registry snapshot loaded");
     pendingRestart.showDownloaded(true);
     require(pendingRestart.books()[0].toMap()["pendingProgress"].toBool(), "incoming position survives restart");
     fakeReader=ReaderFileState::Open;
@@ -409,7 +409,7 @@ int main(int argc, char **argv) {
             requests(root,"POST /api/v1/books/files/101/progress")==beforeChangedPosts,
             "verification preserves books and progress and never calls progress API");
     require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && c.status().contains("приостановлен"), "known mismatch blocks progress before network access");
-    Client mismatchRestart(endpoint,root);
+    Client mismatchRestart(endpoint,root); require(waitForLibrary(mismatchRestart),"registry snapshot loaded");
     require(mismatchRestart.books()[0].toMap()["remoteFileChanged"].toBool() &&
             wait(mismatchRestart,[&] { mismatchRestart.restoreSession(); }), "mismatch survives restart and login");
     opened=false;
@@ -561,7 +561,7 @@ int main(int argc, char **argv) {
             "failed changed-content record write keeps previous EPUB");
     require(QDir().rmdir(recordPath) && QFile::rename(recordPath+".saved",recordPath),
             "restore record before restart checkpoint");
-    Client beforeReplacement(endpoint,root);
+    Client beforeReplacement(endpoint,root); require(waitForLibrary(beforeReplacement),"registry snapshot loaded");
     require(waitForMaintenance(beforeReplacement),"failed replacement recovery settles before retry");
     require(QJsonDocument::fromJson(contents(recordPath)).object()["progress"].toObject()==progressBeforeRepair &&
             !beforeReplacement.localFile(0).isEmpty(),
@@ -575,7 +575,7 @@ int main(int argc, char **argv) {
     write(fault, "");
     require(!wait(c, [&] { c.download(0); }) && c.localFile(0) == changedFile, "failed metadata write preserves current EPUB");
     require(QDir().rmdir(recordPath) && QFile::rename(recordPath+".saved", recordPath), "restore metadata record");
-    Client afterFailure(endpoint, root);
+    Client afterFailure(endpoint, root); require(waitForLibrary(afterFailure),"registry snapshot loaded");
     require(waitForMaintenance(afterFailure),"metadata failure recovery settles");
     afterFailure.showDownloaded(true);
     require(!afterFailure.localFile(0).isEmpty(), "restart after metadata failure keeps previous book");
@@ -588,7 +588,7 @@ int main(int argc, char **argv) {
     const QString pdfOrphan = scope+"/998-"+QUuid::createUuid().toString(QUuid::WithoutBraces)+".pdf";
     const QString legacyOrphan = scope+"/997.epub";
     write(firstOrphan, "first interrupted download"); write(pdfOrphan, "%PDF-old"); write(legacyOrphan, "unproven legacy file");
-    Client afterCrash(endpoint, root);
+    Client afterCrash(endpoint, root); require(waitForLibrary(afterCrash),"registry snapshot loaded");
     require(waitForMaintenance(afterCrash),"restart transfer cleanup completes before checking orphans");
     require(!QFile::exists(orphan) && !QFile::exists(orphanPart) && !QFile::exists(orphanPart+".ABC123"),
             "restart removes only owned unreferenced versions and partial downloads");
@@ -596,12 +596,12 @@ int main(int argc, char **argv) {
             "cleanup removes first-download and non-EPUB UUID orphans but preserves unproven legacy files");
     require(QFile::rename(recordPath, recordPath+".saved"), "save record before corruption test");
     write(recordPath, "{");
-    Client badRecord(endpoint, root);
+    Client badRecord(endpoint, root); require(waitForLibrary(badRecord),"registry snapshot loaded");
     require(QFile::exists(changedFile), "invalid record never deletes an EPUB");
     auto incomplete = QJsonDocument::fromJson(contents(recordPath+".saved")).object();
     incomplete.remove("sha256");
     write(recordPath, QJsonDocument(incomplete).toJson());
-    Client incompleteRecord(endpoint, root);
+    Client incompleteRecord(endpoint, root); require(waitForLibrary(incompleteRecord),"registry snapshot loaded");
     require(QFile::exists(changedFile), "incomplete record never deletes an EPUB");
     require(QFile::remove(recordPath) && QFile::rename(recordPath+".saved", recordPath), "restore record after corruption test");
     const QString transfers = scope+"/transfers";
@@ -655,11 +655,11 @@ int main(int argc, char **argv) {
     write(fault, "error");
     require(!wait(c, [&] { c.logout(); }) && !c.authenticated() && c.status().contains("не подтверждён"), "failed server logout still clears local credentials");
     write(fault, "");
-    require(c.configure("https://books.example.test/", "alice"), "save non-demo account without network");
+    require((c.configure("https://books.example.test/", "alice") && waitForLibrary(c)), "save non-demo account without network");
     require(c.books().isEmpty() && c.coverUrl(1).isEmpty(), "account isolation includes covers");
-    Client restarted(endpoint, root);
+    Client restarted(endpoint, root); require(waitForLibrary(restarted),"registry snapshot loaded");
     require(restarted.username() == "alice" && restarted.server() == "https://books.example.test" && !restarted.authenticated(), "restart restores selected account without token");
-    restarted.selectAccount(0);
+    restarted.selectAccount(0); require(waitForLibrary(restarted),"selected account registry loaded");
     require(restarted.books().size() == 2 && !restarted.localFile(0).isEmpty() && !restarted.coverUrl(1).isEmpty(), "offline account selection restores books and covers");
     const auto settings = contents(root+"/accounts.json");
     require(!settings.contains("password") && !settings.contains("Token") && !settings.contains("local-development-only"), "settings contain no credentials");
@@ -679,21 +679,21 @@ int main(int argc, char **argv) {
     write(legacyScope+"/downloads.json", QJsonDocument(legacyRecords).toJson());
     require(QDir().mkdir(legacyScope+"/records/102.json"), "inject interrupted migration");
     write(legacyRoot+"/accounts.json", QJsonDocument(QJsonObject{{"accounts", QJsonArray{QJsonObject{{"server",endpoint.toString()},{"username","demo"}}}},{"selected",0}}).toJson());
-    Client partial(endpoint, legacyRoot);
+    Client partial(endpoint, legacyRoot); require(waitForLibrary(partial),"registry snapshot loaded");
     partial.showDownloaded(true);
     require(partial.books().size() == 2 && !partial.localFile(0).isEmpty() && QFile::exists(legacyScope+"/downloads.json"), "partial migration keeps legacy data");
     require(QDir().rmdir(legacyScope+"/records/102.json"), "clear migration fault");
     require(QDir().mkdir(legacyScope+"/downloads-v1.json"), "inject backup rename failure");
     const QString migrationOrphan = legacyScope+"/999-"+QUuid::createUuid().toString(QUuid::WithoutBraces)+".epub";
     write(migrationOrphan,"defer cleanup until migration backup succeeds");
-    Client beforeBackup(endpoint, legacyRoot);
+    Client beforeBackup(endpoint, legacyRoot); require(waitForLibrary(beforeBackup),"registry snapshot loaded");
     beforeBackup.showDownloaded(true);
     require(beforeBackup.books().size() == 2 && QFile::exists(legacyScope+"/records/101.json") &&
             QFile::exists(legacyScope+"/records/102.json") && QFile::exists(legacyScope+"/downloads.json"),
             "restart after all records written keeps old registry until backup succeeds");
     require(QFile::exists(migrationOrphan), "failed migration backup blocks cleanup");
     require(QDir().rmdir(legacyScope+"/downloads-v1.json"), "clear backup rename fault");
-    Client legacy(endpoint, legacyRoot);
+    Client legacy(endpoint, legacyRoot); require(waitForLibrary(legacy),"registry snapshot loaded");
     legacy.showDownloaded(true);
     require(legacy.books().size() == 2 && !legacy.localFile(0).isEmpty() &&
             QFile::exists(legacyScope+"/downloads-v1.json") && !QFile::exists(legacyScope+"/downloads.json"), "migration resumes and keeps backup");
@@ -718,7 +718,7 @@ int main(int argc, char **argv) {
     require(allWrote, "write large library records");
     require(aggregate > 2*1024*1024, "per-book records exceed old aggregate limit");
     write(manyRoot+"/accounts.json", QJsonDocument(QJsonObject{{"accounts", QJsonArray{QJsonObject{{"server",endpoint.toString()},{"username","demo"}}}},{"selected",0}}).toJson());
-    Client many(endpoint, manyRoot);
+    Client many(endpoint, manyRoot); require(waitForLibrary(many),"registry snapshot loaded");
     many.showDownloaded(true);
     require(many.books().size() == 1200, "large downloaded list remains available");
     const QString searchRoot=root+"/search-check",searchScope=searchRoot+"/"+QFileInfo(scope).fileName();
@@ -736,7 +736,7 @@ int main(int argc, char **argv) {
             {"bytes",QFileInfo(searchEpub).size()},{"sha256",searchDigest},{"book",book}}).toJson());
     }
     write(searchRoot+"/accounts.json",contents(root+"/accounts.json"));
-    Client searchClient(endpoint,searchRoot); searchClient.showDownloaded(true);
+    Client searchClient(endpoint,searchRoot); require(waitForLibrary(searchClient),"registry snapshot loaded"); searchClient.showDownloaded(true);
     const int beforeLocal=requests(root,"POST /api/v1/books/query");
     for (const auto &query:QStringList{"ёлКа","C++","%","?","é"}) {
         searchClient.searchDownloaded(query); require(searchClient.books().size()==1,"Unicode and literal punctuation search");
@@ -750,30 +750,30 @@ int main(int argc, char **argv) {
     require(wait(searchClient,[&] { searchClient.openFile(3001); }) && opened,"stable file ID opens after sorting without network");
     networkAvailable=true;
     searchClient.setDiagnosticLogging(true); searchClient.setLocalSort("title");
-    Client searchRestart(endpoint,searchRoot);
+    Client searchRestart(endpoint,searchRoot); require(waitForLibrary(searchRestart),"registry snapshot loaded");
     require(searchRestart.localSort()=="title" && searchRestart.diagnosticLogging(),"sort persists without overwriting other settings");
     searchClient.searchDownloaded("Ёлка"); searchClient.showDownloaded(true);
     require(searchClient.localQuery()=="Ёлка","query survives tab transitions within session");
-    searchClient.configure(endpoint.toString(),"other");
+    (searchClient.configure(endpoint.toString(),"other") && waitForLibrary(searchClient));
     require(searchClient.localQuery().isEmpty() && searchClient.recentBook().isEmpty() && searchClient.books().isEmpty(),"account switch resets query and native recents");
     const QString folderRoot = root+"/folder-check";
     const QString destination = "/mnt/ext1/books/folder-check-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
     const QString first = destination+"/Первая папка", second = destination+"/Вторая папка";
     require(QDir().mkpath(first) && QDir().mkpath(second), "create download destinations with Cyrillic and spaces");
     const QString publicRoot = "/mnt/ext1/books/default-check-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
-    Client defaultLocation(endpoint, publicRoot, nullptr, false);
+    Client defaultLocation(endpoint, publicRoot, nullptr, false); require(waitForLibrary(defaultLocation),"registry snapshot loaded");
     require(defaultLocation.downloadDirectory() == publicRoot, "device data folder is the readable default destination");
     const QString appRoot = "/mnt/ext1/applications/bookorbit-check-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
-    Client appLocation(endpoint, appRoot, nullptr, false);
+    Client appLocation(endpoint, appRoot, nullptr, false); require(waitForLibrary(appLocation),"registry snapshot loaded");
     require(appLocation.downloadDirectory() == "/mnt/ext1/books" &&
-            appLocation.configure("https://books.example.test", "demo") &&
+            (appLocation.configure("https://books.example.test", "demo") && waitForLibrary(appLocation)) &&
             appLocation.setDownloadDirectory(first) &&
             QFile::exists(appRoot+"/accounts.json") && QFile::exists(appRoot+"/preferences.json"),
             "application settings are saved outside the book directory");
-    Client reopenedApp(endpoint, appRoot);
+    Client reopenedApp(endpoint, appRoot); require(waitForLibrary(reopenedApp),"registry snapshot loaded");
     require(reopenedApp.downloadDirectory() == first && reopenedApp.accounts().size() == 1,
             "application settings survive restart");
-    Client folders(endpoint, folderRoot, nullptr, false);
+    Client folders(endpoint, folderRoot, nullptr, false); require(waitForLibrary(folders),"registry snapshot loaded");
     require(folders.setDiagnosticLogging(true) && folders.diagnosticLogging() &&
             contents(folders.diagnosticLogPath()).contains("diagnostics enabled"), "diagnostic logging is opt-in");
     require(wait(folders, [&] { folders.login(folders.server(), "demo", "demo"); }), "folder check login");
@@ -801,13 +801,13 @@ int main(int argc, char **argv) {
     write(fault, "changed");
     require(wait(folders, [&] { folders.download(0); }) && QFileInfo(folders.localFile(0)).absolutePath() == second, "changed EPUB uses new destination");
     write(fault, "");
-    Client savedFolders(endpoint, folderRoot);
+    Client savedFolders(endpoint, folderRoot); require(waitForLibrary(savedFolders),"registry snapshot loaded");
     savedFolders.showDownloaded(true);
     require(savedFolders.downloadDirectory() == second && savedFolders.books().size() == 2 &&
             !savedFolders.localFile(0).isEmpty() && !savedFolders.localFile(1).isEmpty(), "restart restores destination and books in different folders");
     require(QFile::exists(foreign), "shared download directory never swept for orphan names");
     require(QDir().rename(second, second+"-away"), "simulate missing destination");
-    Client missingFolder(endpoint, folderRoot);
+    Client missingFolder(endpoint, folderRoot); require(waitForLibrary(missingFolder),"registry snapshot loaded");
     missingFolder.showDownloaded(true);
     require(missingFolder.downloadDirectory() == second && missingFolder.books().size() == 2, "missing directory preserves settings and repair entries");
     require(!wait(folders, [&] { folders.download(1); }) && folders.status().contains("недоступна"), "unavailable destination blocks download without fallback");
@@ -824,15 +824,15 @@ int main(int argc, char **argv) {
     require(!folders.configure("https://books.example.test", "other") && folders.status().contains("код") &&
             folders.username() == "demo", "failed account save reports file error and preserves connection");
     require(QDir().rmdir(accountsFile) && QFile::rename(accountsFile+".saved", accountsFile), "restore account settings");
-    require(savedFolders.configure("https://books.example.test", "other") && savedFolders.books().isEmpty(), "shared folder does not expose another account's books");
+    require((savedFolders.configure("https://books.example.test", "other") && waitForLibrary(savedFolders)) && savedFolders.books().isEmpty(), "shared folder does not expose another account's books");
 
     const QByteArray recoveryEpub = contents(changedFile);
     for (const auto &format : {QString("epub"), QString("pdf")}) {
         for (bool shared : {false, true}) for (bool replacement : {false, true}) for (int phase = 0; phase < 3; ++phase) {
             const QString caseName = "bookorbit-check-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
             const QString caseRoot = root+"/"+caseName;
-            Client setup(endpoint, caseRoot, nullptr, false);
-            require(setup.configure(endpoint.toString(), "demo"), "prepare isolated transfer recovery account");
+            Client setup(endpoint, caseRoot, nullptr, false); require(waitForLibrary(setup),"registry snapshot loaded");
+            require((setup.configure(endpoint.toString(), "demo") && waitForLibrary(setup)), "prepare isolated transfer recovery account");
             const QString caseScope = caseRoot+"/"+accountKey;
             const QString directory = shared ? "/mnt/ext1/books/"+caseName : caseScope;
             require(QDir().mkpath(directory) && QDir().mkpath(caseScope+"/transfers"), "prepare recovery paths");
@@ -862,51 +862,51 @@ int main(int argc, char **argv) {
             if (phase == 2 && replacement) {
                 const auto savedJournal = contents(journal);
                 write(journal,"{");
-                Client malformedJournal(endpoint,caseRoot);
+                Client malformedJournal(endpoint,caseRoot); require(waitForLibrary(malformedJournal),"registry snapshot loaded");
                 require(QFile::exists(previousPath) && QFile::exists(nextPath), "malformed transfer journal blocks private fallback cleanup");
                 write(journal,savedJournal);
                 const QString transfers = caseScope+"/transfers";
                 require(QDir().rename(transfers,transfers+".saved"), "save journal directory before substitution");
                 write(transfers,"not a directory");
-                Client blockedJournals(endpoint,caseRoot);
+                Client blockedJournals(endpoint,caseRoot); require(waitForLibrary(blockedJournals),"registry snapshot loaded");
                 require(QFile::exists(previousPath) && QFile::exists(nextPath), "unreadable journal directory blocks private fallback cleanup");
                 require(QFile::remove(transfers) && QDir().rename(transfers+".saved",transfers), "restore journal directory");
                 for (auto state : {ReaderFileState::Open,ReaderFileState::Unknown}) {
                     fakeReader=state;
-                    Client deferred(endpoint,caseRoot);
+                    Client deferred(endpoint,caseRoot); require(waitForLibrary(deferred),"registry snapshot loaded");
                     require(waitForMaintenance(deferred),"deferred recovery validates the current file");
                     require(QFile::exists(previousPath) && QFile::exists(nextPath) && QFile::exists(journal),
                             "open or unknown reader retains transfer journal and both versions");
                 }
                 fakeReader=ReaderFileState::Closed;
                 write(nextPath,nextBytes+"damaged");
-                Client damaged(endpoint,caseRoot);
+                Client damaged(endpoint,caseRoot); require(waitForLibrary(damaged),"registry snapshot loaded");
                 require(waitForMaintenance(damaged),"damaged recovery validation settles before restoring its fixture");
                 require(QFile::exists(previousPath) && QFile::exists(journal), "unconfirmed current file preserves previous version");
                 write(nextPath,nextBytes);
                 const QString foreignPath=directory+"/foreign."+format;
                 write(foreignPath,previousBytes);
                 require(QFile::remove(previousPath) && QFile::link(foreignPath,previousPath), "inject symlink instead of retired version");
-                Client linked(endpoint,caseRoot);
+                Client linked(endpoint,caseRoot); require(waitForLibrary(linked),"registry snapshot loaded");
                 require(waitForMaintenance(linked),"symlink recovery validation completes");
                 require(QFileInfo(previousPath).isSymLink() && QFile::exists(journal) && contents(foreignPath)==previousBytes,
                         "recovery preserves symlinks and their unrelated targets");
                 require(QFile::remove(previousPath), "remove test symlink");
             }
             std::printf("RECOVERY: format=%s shared=%d replacement=%d phase=%d\n",qPrintable(format),shared,replacement,phase);
-            Client recovered(endpoint,caseRoot);
+            Client recovered(endpoint,caseRoot); require(waitForLibrary(recovered),"registry snapshot loaded");
             require(waitForMaintenance(recovered),"background recovery validation completes");
             require(!QFile::exists(journal) && !QFile::exists(part), "restart resolves durable transfer journal and staging file");
             require(phase == 2 ? QFile::exists(nextPath) && !QFile::exists(previousPath) && contents(nextPath)==nextBytes :
                     !QFile::exists(nextPath) && (!replacement || (QFile::exists(previousPath) && contents(previousPath)==previousBytes)),
                     "recovery follows committed record for initial and replacement downloads in every format and directory");
-            Client repeated(endpoint,caseRoot);
+            Client repeated(endpoint,caseRoot); require(waitForLibrary(repeated),"registry snapshot loaded");
             require(repeated.books().size() == ((phase == 2 || replacement) ? 1 : 0), "recovery is idempotent and preserves registered books");
         }
     }
     const QString guardedRoot=root+"/guarded-cleanup";
-    Client guarded(endpoint,guardedRoot,nullptr,false);
-    require(guarded.configure(endpoint.toString(),"demo"), "prepare cleanup guard account");
+    Client guarded(endpoint,guardedRoot,nullptr,false); require(waitForLibrary(guarded),"registry snapshot loaded");
+    require((guarded.configure(endpoint.toString(),"demo") && waitForLibrary(guarded)), "prepare cleanup guard account");
     const QString guardedScope=guardedRoot+"/"+accountKey;
     write(guardedScope+"/records/999.json","{");
     const QString guardedOrphan=guardedScope+"/999-"+QUuid::createUuid().toString(QUuid::WithoutBraces)+".pdf";
@@ -923,7 +923,7 @@ int main(int argc, char **argv) {
             guardedJournal["next"].toObject()["fileId"]==101, "transfer journal stores bounded file identity without duplicate book metadata");
     // New screens use the same downloader and durable records, with an isolated library.
     const QString featureRoot = root+"/features";
-    Client features(endpoint, featureRoot, nullptr, false);
+    Client features(endpoint, featureRoot, nullptr, false); require(waitForLibrary(features),"registry snapshot loaded");
     write(fault, "features");
     require(wait(features, [&] { features.login(features.server(), "demo", "demo"); }) && features.total() == 23, "multi-format paginated catalog");
     require(features.books()[0].toMap()["readStatus"].toMap()["status"] == "reading" &&
@@ -953,7 +953,15 @@ int main(int argc, char **argv) {
     fakePosition="pbr:/word?page=0&offs=20";
     const int epubPosts=requests(root,"POST /api/v1/books/files/101/progress");
     const auto originalFb2=contents(fb2Path);
+    bool resetDone=false;
+    ClientWorkerCheck::executor(features).submit(&features,[](const FileCancellation &) { resetProgressWork(); return true; },
+        [&](bool,bool) { resetDone=true; });
+    require(waitUntil([&] { return resetDone; }),"reset worker FB2 parse counter");
     require(wait(features,[&] { features.syncFile(202); }), "FB2 uploads its native position as CFI");
+    bool measured=false; ProgressWork fbWork;
+    ClientWorkerCheck::executor(features).submit(&features,[](const FileCancellation &) { return progressWork(); },
+        [&](const ProgressWork &work,bool) { fbWork=work; measured=true; });
+    require(waitUntil([&] { return measured; }) && fbWork.fb2Parses==1,"one FB2 parse covers the entire real Client upload operation");
     require(requests(root,"POST /api/v1/books/files/202/progress")==1 &&
             requests(root,"POST /api/v1/books/files/101/progress")==epubPosts, "FB2 progress uses its own file identity");
     require(wait(features,[&] { features.syncFile(202); }) &&
@@ -994,7 +1002,7 @@ int main(int argc, char **argv) {
     for (const auto &state:QStringList{"unknown","network","conflict","reader","reader_unknown","pending","uncertain","auth","file","position","error","synced"}) {
         categoryRecord["syncStatus"]=QJsonObject{{"state",state},{"profile",fakeProfile}};
         write(categoriesScope+"/records/101.json",QJsonDocument(categoryRecord).toJson());
-        Client category(endpoint,categoriesRoot);
+        Client category(endpoint,categoriesRoot); require(waitForLibrary(category),"registry snapshot loaded");
         const QString group=state=="synced" ? "synced" : (state=="unknown" || state=="network") ? "waiting" : "attention";
         require(!category.syncBooks().isEmpty() && category.syncBooks()[0].toMap()["group"]==group && category.syncSummary()["waiting"].toInt()+category.syncSummary()["attention"].toInt()+category.syncSummary()["synced"].toInt()==1,
             "every persisted sync state maps to one book category");
@@ -1032,7 +1040,7 @@ int main(int argc, char **argv) {
     require(!wait(features, [&] { features.openSelected(); }), "unsupported opener is explicit");
     features.showDownloaded(true);
     require(features.books().size() == 1, "downloaded variants share one book row");
-    Client featureRestart(endpoint, featureRoot);
+    Client featureRestart(endpoint, featureRoot); require(waitForLibrary(featureRestart),"registry snapshot loaded");
     require(featureRestart.books().size() == 1 && featureRestart.books()[0].toMap()["fileCount"].toInt() == 5,
             "all format records survive restart");
     featureRestart.showDetail(1);
@@ -1129,7 +1137,7 @@ int main(int argc, char **argv) {
     require(!wait(features, [&] { features.refreshDetail(); }) && features.detail()["description"].toString().contains("Аннотация"),
             "failed detail refresh preserves known metadata and downloaded actions");
     write(fault, "");
-    require(features.configure("https://books.example.test", "other") && !features.detailVisible() && features.collections().isEmpty() && features.books().isEmpty(),
+    require((features.configure("https://books.example.test", "other") && waitForLibrary(features)) && !features.detailVisible() && features.collections().isEmpty() && features.books().isEmpty(),
             "account change clears details, collections and file selection context");
     const QString coverRoot=root+"/cover-limit-check";
     const QString coverKey=QString::fromLatin1(QCryptographicHash::hash((endpoint.toString()+"\n").toUtf8(),QCryptographicHash::Sha256).toHex().left(24));
@@ -1141,12 +1149,12 @@ int main(int argc, char **argv) {
         manyVersions[QString::number(id)]="v1";
     }
     write(coverScope+"/cover-index.json",QJsonDocument(manyVersions).toJson());
-    Client boundedCache(endpoint,coverRoot,nullptr,false);
+    Client boundedCache(endpoint,coverRoot,nullptr,false); require(waitForLibrary(boundedCache),"registry snapshot loaded");
     require(QDir(coverScope).entryList({"cover-*.png"},QDir::Files).size()==64,
             "restart bounds transient cover cache to 64 files");
     // First-download restoration waits for native registration and never uploads.
     for (int scenario=0;scenario<6;++scenario) {
-        Client restore(endpoint,root+"/restore-"+QString::number(scenario));
+        Client restore(endpoint,root+"/restore-"+QString::number(scenario)); require(waitForLibrary(restore),"registry snapshot loaded");
         write(fault,"features");
         require(wait(restore,[&] { restore.login(restore.server(),"demo","demo"); }),"restore fixture signs in");
         require(wait(restore,[&] { restore.showDetail(1); }),"restore fixture selects FB2");

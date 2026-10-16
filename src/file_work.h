@@ -3,6 +3,7 @@
 #include <QString>
 #include <QByteArray>
 class QSaveFile;
+struct Fb2Index;
 
 enum class FileCommitState { FailedBeforeReplace, ReplacedUnconfirmed, Complete };
 struct FileCommitResult { FileCommitState state; QString detail; };
@@ -29,4 +30,4 @@ struct PreparedReaderPosition {
     FileStamp file,framework,fb2;
     bool coordinate=false,estimate=false;
 };
-PreparedReaderPosition prepareReaderPosition(const QString &path,const QString &cfi,const FileCancellation &cancel={});
+PreparedReaderPosition prepareReaderPosition(const QString &path,const QString &cfi,const FileCancellation &cancel={},const std::shared_ptr<const Fb2Index> &fb={});
