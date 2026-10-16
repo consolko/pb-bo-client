@@ -142,10 +142,26 @@ void storageFailureChecks(const QUrl &endpoint,const QString &root,const QString
         if (failure==StorageFailure::RecordDirectory)
             require(QDir(storageScope).entryList({"101-*.epub"}).size()>=2,"unconfirmed record replacement retains both book versions");
         storageFailure=StorageFailure::None;
+        QString retried;
+        QByteArray retriedBytes;
+        if (failure==StorageFailure::RecordFile) {
+            require(wait(client,[&] { client.download(0); }),"retry succeeds after the registry write error clears");
+            require(waitForRecents(client) && waitForMaintenance(client),"successful retry maintenance settles");
+            retried=client.localFile(0); retriedBytes=bytes(retried);
+            require(retried!=storageOld && retriedBytes!=original,"successful retry selects the replacement book");
+            require(QDir(storageScope+"/transfers").entryList({"*.json"}).isEmpty(),
+                "successful retry retires earlier transfer journals before restart");
+        }
         Client restarted(endpoint,data,nullptr,false);
         require(restarted.configure(endpoint.toString(),"demo") && waitForRecents(restarted) && waitForMaintenance(restarted),"restart rechecks and confirms transfer state");
         const auto selected=restarted.localFile(0);
         require(!selected.isEmpty() && QFileInfo::exists(selected),"restart keeps the file selected by the persisted registry");
+        if (failure==StorageFailure::RecordFile) {
+            require(selected==retried && bytes(selected)==retriedBytes,"restart preserves the successfully retried book and its bytes");
+            require(QDir(storageScope+"/transfers").entryList({"*.json"}).isEmpty() &&
+                QDir(storageScope).entryList({"101-*.epub"})==QStringList{QFileInfo(selected).fileName()},
+                "registry write failure, successful retry and restart leave no obsolete journal or book copy");
+        }
     }
     storageScope.clear(); storageOld.clear(); mode(fault,"");
 #else

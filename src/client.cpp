@@ -527,12 +527,13 @@ void Client::cleanupBooks(const QString &verifiedFile) {
         const bool registered = recordFile(id, current) == newFile;
         const auto recordPath=scopeDir+"/records/"+id+".json",journalPath=transfers+"/"+name;
         const auto selected=recordFile(id,current);
-        if (blockedTransfers.contains(journalPath) || (!previous.isEmpty() && selected!=newFile && selected!=oldFile)) {
+        const bool superseded=!selected.isEmpty() && selected!=newFile && selected!=oldFile;
+        if (blockedTransfers.contains(journalPath) || (!previous.isEmpty() && selected.isEmpty())) {
             retained.insert(newFile); retained.insert(oldFile); retained.insert(staging); continue;
         }
         if (!current.isEmpty()) {
             const auto expected=registered ? next : previous;
-            if (current["sha256"]!=expected["sha256"] || current["bytes"]!=expected["bytes"]) {
+            if (!superseded && (current["sha256"]!=expected["sha256"] || current["bytes"]!=expected["bytes"])) {
                 retained.insert(newFile); retained.insert(oldFile); retained.insert(staging); continue;
             }
             const auto proof=durableRecordStamps.value(recordPath);
@@ -541,7 +542,8 @@ void Client::cleanupBooks(const QString &verifiedFile) {
                 const auto task=++cleanupGeneration,account=accountGeneration;
                 cleanupTask=files.submit(this,[recordPath,selected,current](const FileCancellation &cancel) {
                     const auto registry=fileStamp(recordPath),file=fileStamp(selected);
-                    const bool valid=!fileCancelled(cancel) && readObject(recordPath)==current &&
+                    const bool valid=!fileCancelled(cancel) && !current["invalid"].toBool() &&
+                        file.bytes==current["bytes"].toDouble() && readObject(recordPath)==current &&
                         validContent(selected,current["format"].toString("epub"),cancel) &&
                         digestFile(selected,cancel)==current["sha256"].toString().toLatin1() &&
                         confirmFile(selected) && confirmFile(recordPath) && fileStamp(recordPath)==registry && fileStamp(selected)==file;
@@ -2001,6 +2003,9 @@ void Client::transferBook(const QJsonObject &book, bool renew) {
                         }
                         storeRecord(id,record); savedRecordStamps[id]=fileStamp(recordPath);
                         durableRecordStamps[recordPath]={fileStamp(recordPath),stamp};
+                        // A durable replacement makes earlier failed attempts safe to recheck.
+                        const auto prefix=scopeDir+"/transfers/"+id+"-";
+                        blockedTransfers.removeIf([&](const QString &path) { return path.startsWith(prefix); });
                         clearSyncResult(id); rememberFile(book); cleanupBooks(finalPath);
                         if (readableFormat(format)) scanBook(finalPath);
                         if (context.record.isEmpty() && syncFormat(format)) {
