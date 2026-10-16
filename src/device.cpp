@@ -6,6 +6,9 @@
 #include <QUrl>
 #include <QFileInfo>
 #ifdef POCKETBOOK_DEVICE
+#include <QImage>
+#include <cstdlib>
+#include <cstring>
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QVariant>
@@ -41,6 +44,34 @@ QSize setupDevice() {
     return {ScreenWidth(), ScreenHeight() - PanelHeight()};
 #else
     return {600, 800};
+#endif
+}
+
+void showStartupScreen(const QSize &screen) {
+#ifdef POCKETBOOK_DEVICE
+    // Paint before Qt/QML startup; the first QML frame replaces this image.
+    const double scale = screen.width() / 600.0;
+    const int size = qRound(240 * scale), gap = qRound(12 * scale), textHeight = qRound(40 * scale);
+    const int top = (screen.height() - size - gap - textHeight) / 2;
+    const auto image = QImage(":/icons/bookorbit.png").scaled(size, size, Qt::KeepAspectRatio, Qt::SmoothTransformation)
+                           .convertToFormat(QImage::Format_Grayscale8);
+    ClearScreen();
+    if (!image.isNull()) {
+        if (auto *bitmap = NewBitmap8(image.width(), image.height())) {
+            for (int y = 0; y < image.height(); ++y)
+                std::memcpy(bitmap->data + y * bitmap->scanline, image.constScanLine(y), image.width());
+            DrawBitmap((screen.width() - image.width()) / 2, top, bitmap);
+            std::free(bitmap);
+        }
+    }
+    if (auto *font = OpenFont(deviceFont().toUtf8().constData(), qRound(26 * scale), 1)) {
+        SetFont(font, BLACK);
+        DrawTextRect(0, top + size + gap, screen.width(), textHeight, "BookOrbit client", ALIGN_CENTER | VALIGN_MIDDLE);
+        CloseFont(font);
+    }
+    FullUpdate();
+#else
+    Q_UNUSED(screen)
 #endif
 }
 

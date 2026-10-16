@@ -10,6 +10,46 @@ ApplicationWindow {
     title: "BookOrbit"
     color: "white"
     property real u: width / 600
+    property bool startupLoading: true
+    Component.onCompleted: startupLoading = client.libraryLoading
+    Connections {
+        target: client
+        function onLibraryLoadingChanged() {
+            if (!client.libraryLoading) window.startupLoading = false
+        }
+    }
+    Rectangle {
+        objectName: "startupScreen"
+        parent: Overlay.overlay
+        anchors.fill: parent
+        z: 1000
+        visible: window.startupLoading
+        color: "white"
+        Column {
+            anchors.centerIn: parent
+            spacing: 12 * window.u
+            Image {
+                objectName: "startupIcon"
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: 240 * window.u
+                height: width
+                source: "qrc:/icons/bookorbit.png"
+                sourceSize: Qt.size(width, height)
+                fillMode: Image.PreserveAspectFit
+            }
+            Text {
+                objectName: "startupTitle"
+                width: 400 * window.u
+                height: 40 * window.u
+                text: "BookOrbit client"
+                color: "black"
+                font.pixelSize: 26 * window.u
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
+        }
+        MouseArea { anchors.fill: parent }
+    }
     property var libraryAnchor: null
     function captureLibraryAnchor() {
         if (libraryAnchor) return
@@ -302,7 +342,8 @@ ApplicationWindow {
         anchors.fill: parent
         anchors.margins: Math.round(20 * window.u)
         spacing: 12 * window.u
-        focus: true
+        enabled: !window.startupLoading
+        focus: !window.startupLoading
         Keys.onEscapePressed: window.back()
         Keys.onBackPressed: window.back()
         Keys.onPressed: event => {

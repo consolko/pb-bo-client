@@ -16,6 +16,7 @@ ReaderRecents readReaderRecents(const QString &database,const QStringList &paths
                               const FileCancellation &cancel={},int *batches=nullptr);
 
 QSize setupDevice();
+void showStartupScreen(const QSize &screen);
 QString deviceFont();
 QString deviceLanguage();
 bool openReader(const QString &path);

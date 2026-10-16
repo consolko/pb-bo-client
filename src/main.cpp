@@ -50,6 +50,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "bookorbit: initialize device\n");
         screen = setupDevice();
         if (screen.isEmpty()) return 0;
+        showStartupScreen(screen);
         std::fprintf(stderr, "bookorbit: screen %dx%d\n", screen.width(), screen.height());
         QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
         app = std::make_unique<QGuiApplication>(argc, argv);

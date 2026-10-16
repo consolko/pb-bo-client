@@ -414,6 +414,11 @@ void registryChecks(const QUrl &endpoint,const QString &root) {
     auto window=qobject_cast<QQuickWindow *>(engine.rootObjects().first()); bool frame=false;
     QObject::connect(window,&QQuickWindow::frameSwapped,&client,[&] { frame=true; }); window->show(); window->requestUpdate();
     require(until([&] { return frame; }) && client.libraryLoading(),"first QML frame renders before full registry scan completes");
+    const auto splash=window->findChild<QObject *>("startupScreen");
+    const auto splashIcon=window->findChild<QObject *>("startupIcon");
+    const auto splashTitle=window->findChild<QObject *>("startupTitle");
+    require(splash && splash->property("visible").toBool() && splashIcon && splashIcon->property("status").toInt()==1
+            && splashTitle && splashTitle->property("text").toString()=="BookOrbit client", "first frame shows startup icon and title while registry waits");
     const auto message=window->findChild<QObject *>("operationMessage");
     require(message && message->property("text").toString().contains("Загрузка"),"first frame displays downloaded-library loading state");
     // A second generation must remain loading when the first cancelled callback arrives.
@@ -421,6 +426,11 @@ void registryChecks(const QUrl &endpoint,const QString &root) {
     require(until([&] { return next.entered->load(); }),"old registry drains before newer generation");
     QCoreApplication::processEvents(); require(client.libraryLoading(),"old account-generation callback cannot publish or clear loading");
     next.open(); require(waitForLibrary(client) && waitForRecents(client),"new registry generation publishes successfully");
+    require(!splash->property("visible").toBool(),"startup screen disappears when local library is ready");
+    WorkerGate reload(executor,&client); require(until([&] { return reload.entered->load(); }),"hold later registry reload");
+    ClientWorkerCheck::reload(client);
+    require(client.libraryLoading() && !splash->property("visible").toBool(),"later registry reload does not reopen startup screen");
+    reload.open(); require(waitForLibrary(client) && waitForRecents(client),"later registry reload completes");
     client.resetPresentationWork(); client.refreshRecents();
     require(waitForRecents(client) && client.presentationWork().localFileChecks==0,"full recents preparation performs no GUI localFile checks");
 }
