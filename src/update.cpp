@@ -33,6 +33,98 @@ static QJsonObject storageDetails(const QString &path) {
 constexpr qint64 maxUpdateSettings=64*1024,maxReleaseCache=128*1024,maxReleaseResponse=1024*1024,maxLegacySettings=2*1024*1024;
 constexpr qint64 maxInstallIntent=128*1024;
 static UiMessage trUpdate(const char *text) { return messageForSource(text); }
+
+namespace {
+constexpr int maxRetainedAttempts=2;
+constexpr qint64 maxRetainedBytes=64*1024*1024;
+struct SavedAttempt {
+    QString directory;
+    QJsonObject manifest,marker;
+    bool metadata=false,intent=false,staged=false,unknown=false,verified=false,installed=false,keep=false;
+    qint64 bytes=0;
+};
+struct AttemptScan {
+    QString directory;
+    QJsonObject manifest;
+    bool installed=false,blocked=false;
+    int retained=0;
+    qint64 bytes=0;
+};
+bool removeAttempt(const SavedAttempt &attempt) {
+    if (attempt.unknown) return false;
+    for (const auto *name:{"archive.zip","bookorbit.next","release.json","release.sig","install.json"}) {
+        const auto path=attempt.directory+"/"+name;
+        if (QFileInfo::exists(path) && ::unlink(QFile::encodeName(path))!=0) return false;
+    }
+    if (!syncDirectory(attempt.directory) || ::rmdir(QFile::encodeName(attempt.directory))!=0) return false;
+    return syncDirectory(QFileInfo(attempt.directory).absolutePath());
+}
+AttemptScan scanAttempts(const QString &root,const QString &destination,const FileCancellation &cancel) {
+    AttemptScan result; QList<SavedAttempt> attempts;
+    const auto targetStamp=fileStamp(destination);
+    const auto targetHash=Ota::hashFile(destination);
+    bool targetVerified=Ota::isRunningExecutable(destination);
+    QString installedVersion=targetVerified ? Ota::version() : QString{};
+    const QSet<QString> owned{"archive.zip","bookorbit.next","release.json","release.sig","install.json"};
+    for (const auto &entry:QDir(root+"/update").entryInfoList({"attempt-*"},QDir::Dirs|QDir::NoDotAndDotDot)) {
+        if (fileCancelled(cancel)) return result;
+        if (QUuid::fromString(entry.fileName().mid(8)).isNull() || !Ota::safeDirectory(entry.absoluteFilePath())) continue;
+        SavedAttempt attempt; attempt.directory=entry.absoluteFilePath();
+        for (const auto &file:QDir(attempt.directory).entryInfoList(QDir::AllEntries|QDir::Hidden|QDir::System|QDir::NoDotAndDotDot)) {
+            if (!owned.contains(file.fileName()) || !file.isFile() || file.isSymLink()) attempt.unknown=true;
+        }
+        attempt.intent=QFileInfo::exists(attempt.directory+"/install.json");
+        attempt.marker=QJsonDocument::fromJson(Ota::read(attempt.directory+"/install.json",maxInstallIntent)).object();
+        QString error;
+        attempt.metadata=Ota::verifyManifest(Ota::read(attempt.directory+"/release.json",65536),
+            Ota::read(attempt.directory+"/release.sig",64),&attempt.manifest,&error) ||
+            Ota::verifyManifest(QByteArray::fromBase64(attempt.marker["manifest"].toString().toLatin1()),
+                QByteArray::fromBase64(attempt.marker["signature"].toString().toLatin1()),&attempt.manifest,&error);
+        const QFileInfo staged(attempt.directory+"/bookorbit.next");
+        attempt.staged=staged.exists(); attempt.bytes=attempt.staged ? staged.size() : 0;
+        attempt.verified=attempt.metadata && staged.isFile() && !staged.isSymLink() &&
+            staged.size()==attempt.manifest["bytes"].toInteger() && Ota::hashFile(staged.absoluteFilePath())==attempt.manifest["sha256"].toString();
+        const bool matches=attempt.metadata && !targetHash.isEmpty() && targetHash==attempt.manifest["sha256"].toString() &&
+            targetStamp.bytes==attempt.manifest["bytes"].toInteger();
+        if (matches && (!targetVerified || Ota::newer(attempt.manifest["version"].toString(),installedVersion))) {
+            targetVerified=true; installedVersion=attempt.manifest["version"].toString();
+        }
+        attempt.installed=matches && attempt.marker["destination"]==destination;
+        attempts.append(std::move(attempt));
+    }
+    targetVerified=targetVerified && targetStamp.valid && fileStamp(destination)==targetStamp && confirmFile(destination);
+    std::sort(attempts.begin(),attempts.end(),[](const SavedAttempt &a,const SavedAttempt &b) {
+        if (a.installed!=b.installed) return a.installed;
+        const auto av=a.manifest["version"].toString(),bv=b.manifest["version"].toString();
+        if (Ota::validVersion(av)!=Ota::validVersion(bv)) return Ota::validVersion(av);
+        return av==bv || !Ota::validVersion(av) ? a.directory<b.directory : Ota::newer(av,bv);
+    });
+    bool keptReady=false,keptInstalled=false,cleanupFailed=false;
+    for (auto &attempt:attempts) {
+        if (fileCancelled(cancel)) return result;
+        targetVerified=targetVerified && fileStamp(destination)==targetStamp;
+        const bool invalidIntent=attempt.intent && (!attempt.metadata || attempt.marker["destination"]!=destination);
+        const bool ready=attempt.verified && Ota::newer(attempt.manifest["version"].toString(),Ota::version()) &&
+            (!targetVerified || Ota::newer(attempt.manifest["version"].toString(),installedVersion));
+        const bool obsolete=targetVerified && attempt.metadata &&
+            !Ota::newer(attempt.manifest["version"].toString(),installedVersion);
+        if (attempt.unknown || invalidIntent) attempt.keep=true;
+        else if (attempt.installed && !keptInstalled) { attempt.keep=true; keptInstalled=true; }
+        else if (ready && !keptReady) { attempt.keep=true; keptReady=true; }
+        else if (attempt.intent && !obsolete) attempt.keep=true;
+        else if (attempt.staged && !targetVerified) attempt.keep=true;
+        if (!attempt.keep && !removeAttempt(attempt)) { attempt.keep=true; cleanupFailed=true; }
+        if (!attempt.keep) continue;
+        ++result.retained; result.bytes+=attempt.bytes;
+        if (result.directory.isEmpty() && !invalidIntent && (attempt.installed || ready)) {
+            result.directory=attempt.directory; result.manifest=attempt.manifest; result.installed=attempt.installed;
+        }
+    }
+    result.blocked=cleanupFailed || result.retained>=maxRetainedAttempts || result.bytes>maxRetainedBytes-Ota::maxClient;
+    return result;
+}
+}
+
 UpdateManager::UpdateManager(Client *c,QString data,QString path,QObject *parent)
     : QObject(parent),client(c),root(std::move(data)),executable(std::move(path)),apiBase("https://api.github.com") {
     network.setTransferTimeout(30000);
@@ -46,20 +138,6 @@ UpdateManager::UpdateManager(Client *c,QString data,QString path,QObject *parent
     cache=normalizeCache(QJsonDocument::fromJson(Ota::read(root+"/update/release-cache.json",maxReleaseCache)).object());
     if(preferences.contains("release") && cache.isEmpty()) cache=normalizeCache(preferences);
     if(!preferences.isEmpty() && preferences!=settings && persist()) persistCache();
-    const auto abandoned=QDir(root+"/update").entryInfoList({"attempt-*"},QDir::Dirs|QDir::NoDotAndDotDot);
-    client->files.submit(this,[abandoned](const FileCancellation &cancel) {
-        for(const auto &entry:abandoned) {
-            if(fileCancelled(cancel)) break;
-            if(entry.isSymLink() || QUuid::fromString(entry.fileName().mid(8)).isNull()) continue;
-            // A staged file may be the only remaining copy after a replacement.
-            if(QFileInfo::exists(entry.absoluteFilePath()+"/bookorbit.next") ||
-               QFileInfo::exists(entry.absoluteFilePath()+"/release.json") ||
-               QFileInfo::exists(entry.absoluteFilePath()+"/install.json")) continue;
-            QFile::remove(entry.absoluteFilePath()+"/archive.zip");
-            QDir().rmdir(entry.absoluteFilePath());
-        }
-        return true;
-    },[](bool,bool) {});
     recoverAttempts();
     traceContext();
     if(!directoryReady) trace("directory.failed",{{"path",root+"/update"}});
@@ -73,14 +151,14 @@ UpdateManager::~UpdateManager() {
     discardAttempt();
 }
 void UpdateManager::discardAttempt() {
-    if(attemptDir.isEmpty()) return;
-    const auto directory=std::exchange(attemptDir,{});
-    client->files.submit(this,[directory](const FileCancellation &) {
-        if(QFileInfo::exists(directory+"/release.json") || QFileInfo::exists(directory+"/install.json")) return false;
-        QFile::remove(directory+"/archive.zip"); QFile::remove(directory+"/bookorbit.next");
-        return QDir().rmdir(directory);
-    },[](bool,bool) {});
+    if (attemptDir.isEmpty()) return;
+    attemptDir.clear();
+    const auto data=root,destination=executable;
+    client->files.submit(this,[data,destination](const FileCancellation &cancel) {
+        return scanAttempts(data,destination,cancel);
+    },[](const AttemptScan &,bool) {});
 }
+
 QString UpdateManager::version() const { return Ota::version(); }
 bool UpdateManager::canInstall() const {
 #ifdef POCKETBOOK_DEVICE
@@ -260,7 +338,18 @@ void UpdateManager::cancel() {
     phase=candidateVersion.isEmpty()?"idle":"available"; notice=trUpdate("Update download cancelled."); emit changed();
 }
 void UpdateManager::download() {
-    if(phase!="available" || active) { trace("download.ignored"); return; }
+    if (phase!="available" || active) { trace("download.ignored"); return; }
+    const auto run=++generation; const auto data=root,destination=executable;
+    phase="verifying"; emit changed();
+    fileTask=client->files.submit(this,[data,destination](const FileCancellation &cancel) { return scanAttempts(data,destination,cancel); },
+        [this,run](const AttemptScan &result,bool cancelled) {
+            if (cancelled || run!=generation) return;
+            fileTask.reset();
+            if (result.blocked) { fail(trUpdate("Update recovery files need attention. New downloads are blocked to preserve them.")); return; }
+            beginDownload();
+        });
+}
+void UpdateManager::beginDownload() {
     trace("download.requested",{{"storage",storageDetails(root)}});
     const QStorageInfo storage(root);
     if(!storage.isValid()||storage.isReadOnly()||storage.bytesAvailable()<archiveSize+2*Ota::maxClient+8*1024*1024) { fail(trUpdate("Not enough writable space for the update.")); return; }
@@ -360,40 +449,24 @@ void UpdateManager::install() {
 }
 void UpdateManager::recoverAttempts() {
     phase="recovering";
-    const auto run=generation;
-    const auto destination=executable;
-    const auto entries=QDir(root+"/update").entryInfoList({"attempt-*"},QDir::Dirs|QDir::NoDotAndDotDot);
-    client->files.submit(this,[entries,destination](const FileCancellation &cancel) {
-        for(const auto &entry:entries) {
-            if(fileCancelled(cancel)) break;
-            const auto directory=entry.absoluteFilePath();
-            if(QUuid::fromString(entry.fileName().mid(8)).isNull() || !Ota::safeDirectory(directory)) continue;
-            QJsonObject manifest; QString error;
-            const auto marker=QJsonDocument::fromJson(Ota::read(directory+"/install.json",maxInstallIntent)).object();
-            if(!Ota::verifyManifest(Ota::read(directory+"/release.json",65536),Ota::read(directory+"/release.sig",64),&manifest,&error) &&
-               !Ota::verifyManifest(QByteArray::fromBase64(marker["manifest"].toString().toLatin1()),
-                                    QByteArray::fromBase64(marker["signature"].toString().toLatin1()),&manifest,&error)) continue;
-            const bool installed=marker["destination"]==destination && Ota::hashFile(destination)==manifest["sha256"].toString();
-            const QFileInfo staged(directory+"/bookorbit.next");
-            const bool verified=staged.isFile() && !staged.isSymLink() && staged.size()==manifest["bytes"].toInteger() &&
-                Ota::hashFile(staged.absoluteFilePath())==manifest["sha256"].toString();
-            if(installed || (verified && Ota::newer(manifest["version"].toString(),Ota::version())))
-                return std::make_tuple(directory,manifest,installed);
-        }
-        return std::make_tuple(QString{},QJsonObject{},false);
-    },[this,run](const auto &result,bool cancelled) {
-        if(cancelled || run!=generation) return;
-        const auto &[directory,manifest,installed]=result;
-        if(!directory.isEmpty()) {
-            attemptDir=directory; prepared=manifest; candidateVersion=manifest["version"].toString();
-            phase=installed ? "unconfirmed" : "ready";
-            notice=installed ? trUpdate("The application was replaced. Confirm saving the update before removing the prepared file.") :
+    const auto run=generation; const auto data=root,destination=executable;
+    fileTask=client->files.submit(this,[data,destination](const FileCancellation &cancel) {
+        return scanAttempts(data,destination,cancel);
+    },[this,run](const AttemptScan &result,bool cancelled) {
+        if (cancelled || run!=generation) return;
+        fileTask.reset();
+        if (!result.directory.isEmpty()) {
+            attemptDir=result.directory; prepared=result.manifest; candidateVersion=prepared["version"].toString();
+            phase=result.installed ? "unconfirmed" : "ready";
+            notice=result.installed ? trUpdate("The application was replaced. Confirm saving the update before removing the prepared file.") :
                               trUpdate("A verified update was retained. Retry installation when ready.");
-        } else phase="idle";
+        } else { phase="idle"; if (result.blocked) notice=trUpdate("Update recovery files need attention. New downloads are blocked to preserve them."); }
+        trace("recovery.finished",{{"retained",result.retained},{"stagedBytes",result.bytes},{"blocked",result.blocked}});
         emit changed();
-        if(std::exchange(automaticDeferred,false) && phase=="idle") QTimer::singleShot(0,this,&UpdateManager::automaticCheck);
+        if (std::exchange(automaticDeferred,false) && phase=="idle") QTimer::singleShot(0,this,&UpdateManager::automaticCheck);
     });
 }
+
 void UpdateManager::installPrepared(bool confirmOnly) {
     phase="installing"; notice=trUpdate("Installing the update…"); trace("install.started"); emit changed();
     const auto directory=attemptDir,destination=executable; const auto manifest=prepared;

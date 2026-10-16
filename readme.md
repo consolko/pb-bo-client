@@ -4,7 +4,7 @@
 
 <p align="center"><img src="assets/readme/status-en.svg" alt="Status: in development"> <img src="assets/readme/languages-en.svg" alt="Languages: EN / RU"></p>
 
-An app for PocketBook 634. Connect to your BookOrbit server, download books and open them in the built-in reader. EPUB and supported FB2 reading positions can be sent to the server or retrieved manually.
+An app for PocketBook 634. Connect to your BookOrbit server, download books and open them in the built-in reader. EPUB and supported FB2 reading positions are restored after the first download and can also be synchronized manually.
 
 [Features](#features) · [Screenshots](#screenshots) · [Installation](#install) · [Getting started](#start) · [Position sync](#sync) · [Building](#development)
 
@@ -31,7 +31,7 @@ Captured in pbemu with firmware U634.6.10.3425, using test books and the Russian
 - **Book details.** Description, edition information, reading status, rating, personal note and collections, when supplied by the server. These details are read-only for now.
 - **Downloads.** Choose a file, format and folder; cancel, retry and check SHA-256 integrity. Keep several formats of the same book. Maximum file size: 100 MiB.
 - **Offline reading.** The Downloads tab works without signing in. Book metadata and covers are cached on the device. EPUB, FB2, PDF, TXT and DJVU open in the built-in reader. Other formats can be downloaded, but cannot be opened from the client yet.
-- **Reading position.** Manually exchange EPUB and supported FB2 progress with the server for one file or all downloaded syncable files belonging to the current connection. Conflicts require an explicit choice.
+- **Reading position.** Manually exchange EPUB and supported FB2 progress with the server for one file or all downloaded syncable files belonging to the current connection. A first download waits briefly for native library registration and restores an exact server position when no local position conflicts. Conflicts require an explicit choice.
 - **Connections and settings.** Multiple saved servers, HTTPS sign-in, session renewal and sign-out. Switch between English and Russian without restarting. Enable the operation log in Settings.
 
 <a id="install"></a>
@@ -66,7 +66,7 @@ When positions conflict, choose **Use reader position** or **Use BookOrbit posit
 Limitations:
 
 - Position sync supports EPUB and experimental direct FB2. It uses **CFI** coordinates; percentages are approximate. Neither percentages nor device timestamps decide which position wins a conflict.
-- **Experimental FB2:** the original file stays unchanged and no auxiliary EPUB is created. The adapter supports prose, nested chapters, inline formatting, empty lines and notes. Images (including cover images), tables, poems and native sections over 60,000 UTF-16 units including paragraph separators stop sync without changing progress. Files over 16 MiB and unrecognized structures/coordinates are also rejected. The native model is pinned to U634.6.10.3425 and its reader library hash; the Foliate conversion was checked against BookOrbit source `55110d5b449db7e471d2a8e1ba370c15fb3cb018`. This is not general FB2 compatibility.
+- **Experimental FB2:** the original file stays unchanged and no auxiliary EPUB is created. The adapter supports prose, nested chapters, inline formatting, empty lines and notes. Metadata covers and long prose sections are supported. Images inside the reading body, tables, poems and individual paragraphs over 60,000 UTF-16 units stop sync without changing progress. Files over 16 MiB and unrecognized structures/coordinates are also rejected. The native model is pinned to U634.6.10.3425 and its reader library hash; the Foliate conversion was checked against BookOrbit source `55110d5b449db7e471d2a8e1ba370c15fb3cb018`. This is not general FB2 compatibility.
 - Regular sync checks the local SHA-256 and exchanges progress without downloading the book again. **Verify library files** in Settings separately downloads and compares all downloaded formats for the current account, sequentially and with cancellation support. It does not replace books or sync progress. A detected mismatch is saved and blocks position sync while keeping local reading available. A matching verification or an explicit **Download again** clears the block. Until verification runs, the app assumes the server has not replaced content under the same file ID.
 - Incoming positions use the built-in library's internal API, only on U634.6.10.3425 with a verified `libframework2.so` hash and closed books. Other firmware/library versions block position application.
 - If server progress includes a page number or other coordinates the client cannot preserve, uploading a position is blocked.

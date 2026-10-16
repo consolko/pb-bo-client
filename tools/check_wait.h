@@ -9,6 +9,8 @@ struct ClientWorkerCheck {
     static FileExecutor &executor(Client &client) { return client.files; }
     static bool recentsIdle(const Client &client) { return !client.recentsScheduled && !client.recentsRequested; }
     static void changeAccount(Client &client) { ++client.accountGeneration; }
+    static bool coverPending(const Client &client) { return bool(client.coverTask); }
+    static void stopCovers(Client &client) { client.stopCovers(); }
     static FileCancellation task(const Client &client) { return client.fileTask; }
     static bool cleanupRunning(const Client &client) { return client.cleanupState==Client::CleanupState::Running; }
     static bool cleanupCancelled(const Client &client) { return client.cleanupState==Client::CleanupState::Cancelled; }

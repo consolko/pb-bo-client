@@ -99,7 +99,7 @@ int main(int argc, char **argv) {
                 int selected = bookId == 0 ? 0 : -1;
                 const auto books = client.books();
                 for (int i=0; i<books.size(); ++i)
-                    if (books[i].toMap()["bookId"].toInt() == bookId) selected = i;
+                    if (books[i].toMap().value("bookId").toInt() == bookId) selected = i;
                 if (selected < 0) { std::fprintf(stderr, "Selected book is absent from first catalog page\n"); app->exit(3); return; }
                 QTimer::singleShot(0, &client, [&client, selected] { client.download(selected); });
             }

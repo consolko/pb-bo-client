@@ -29,11 +29,13 @@
 #include <QTextDocument>
 #include <memory>
 #include <utility>
+#include <unistd.h>
 
 namespace {
 constexpr qint64 maxBook = 100 * 1024 * 1024;
 constexpr qint64 maxJson = 2 * 1024 * 1024;
 constexpr int pageSize = 10;
+struct TransferStage { bool journal=false,valid=false; FileStamp stamp; QString error; };
 QJsonObject readObject(const QString &path) {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly) || file.size() > maxJson) return {};
@@ -153,13 +155,7 @@ QString syncGroupKey(const QString &id,const QJsonObject &record) {
     return positiveId(book["id"]) ? "book:"+QString::number(book["id"].toInt()) : "file:"+id;
 }
 const QStringList syncPriority{"conflict","file","position","reader","reader_unknown","error","auth","pending","uncertain","network","unknown","synced"};
-bool syncLess(const QVariant &a,const QVariant &b) {
-    const auto left=a.toMap(),right=b.toMap();
-    const int l=syncPriority.indexOf(left["state"].toString()),r=syncPriority.indexOf(right["state"].toString());
-    if (l!=r) return l<r;
-    const int title=QString::localeAwareCompare(left["title"].toString(),right["title"].toString());
-    return title ? title<0 : left["key"].toString()<right["key"].toString();
-}
+
 }
 QHash<int,QByteArray> LibraryModel::roleNames() const {
     QHash<int,QByteArray> result;
@@ -169,40 +165,128 @@ QHash<int,QByteArray> LibraryModel::roleNames() const {
 QVariant LibraryModel::data(const QModelIndex &index,int role) const {
     const int name=role-Qt::UserRole-1;
     if (!index.isValid() || index.row()<0 || index.row()>=rows.size() || name<0 || name>=libraryRoles.size()) return {};
-    return rows[index.row()].toMap().value(libraryRoles[name]);
+    return rows[index.row()].value.value(libraryRoles[name]);
+}
+QVariantList LibraryModel::snapshot() const {
+    if (snapshotDirty) {
+#ifdef BOOKORBIT_TEST_HTTP
+        ++snapshots;
+#endif
+        cachedSnapshot.clear(); cachedSnapshot.reserve(rows.size());
+        for (const auto &row:rows) cachedSnapshot.append(row.value);
+        snapshotDirty=false;
+    }
+    return cachedSnapshot;
+}
+
+void LibraryModel::indexRows(int first,int last) {
+    for (int i=first;i<=last;++i) {
+#ifdef BOOKORBIT_TEST_HTTP
+        ++indexVisits;
+#endif
+        positions[rows[i].id]=i;
+    }
 }
 int LibraryModel::rowFor(int bookId) const {
-    for (int i=0;i<rows.size();++i) if (rows[i].toMap()["bookId"].toInt()==bookId) return i;
-    return -1;
+#ifdef BOOKORBIT_TEST_HTTP
+    ++lookups;
+#endif
+    return positions.value(bookId,-1);
 }
 void LibraryModel::update(int row,const QVariantMap &value) {
-    const auto before=rows[row].toMap(); QList<int> roles;
+    const auto &before=rows[row].value; QList<int> roles;
+    Q_ASSERT(rows[row].id==value.value("bookId").toInt());
     for (int i=0;i<libraryRoles.size();++i) if (before.value(libraryRoles[i])!=value.value(libraryRoles[i])) roles.append(Qt::UserRole+1+i);
     if (roles.isEmpty()) return;
-    rows[row]=value; emit dataChanged(index(row),index(row),roles);
+    snapshotDirty=true; rows[row].value=value; emit dataChanged(index(row),index(row),roles);
 }
 void LibraryModel::insert(int row,const QVariantMap &value) {
-    beginInsertRows({},row,row); rows.insert(row,value); endInsertRows();
+    snapshotDirty=true; beginInsertRows({},row,row); rows.insert(row,{value.value("bookId").toInt(),value});
+    indexRows(row,rows.size()-1); endInsertRows();
 }
 void LibraryModel::remove(int row) {
-    beginRemoveRows({},row,row); rows.removeAt(row); endRemoveRows();
+    snapshotDirty=true; beginRemoveRows({},row,row); positions.remove(rows[row].id); rows.removeAt(row);
+    indexRows(row,rows.size()-1); endRemoveRows();
 }
 void LibraryModel::move(int from,int to) {
     if (from==to) return;
-    beginMoveRows({},from,from,{},to>from ? to+1 : to); rows.move(from,to); endMoveRows();
+    snapshotDirty=true; beginMoveRows({},from,from,{},to>from ? to+1 : to); rows.move(from,to);
+    indexRows(std::min(from,to),std::max(from,to)); endMoveRows();
 }
 void LibraryModel::replace(const QVariantList &values,bool reset) {
-    if (reset) { beginResetModel(); rows=values; endResetModel(); return; }
-    QSet<int> ids; for (const auto &row:values) ids.insert(row.toMap()["bookId"].toInt());
-    for (int i=rows.size()-1;i>=0;--i) if (!ids.contains(rows[i].toMap()["bookId"].toInt())) remove(i);
-    for (int i=0;i<values.size();++i) {
-        const auto value=values[i].toMap(); const int old=rowFor(value["bookId"].toInt());
-        if (old<0) insert(i,value); else { move(old,i); update(i,value); }
+    bool same=rows.size()==values.size();
+    if (same) for (int i=0;i<values.size();++i) {
+#ifdef BOOKORBIT_TEST_HTTP
+        ++sequenceVisits;
+#endif
+        if (rows[i].id!=values[i].toMap().value("bookId").toInt()) { same=false; break; }
     }
+    if (same && !reset) {
+        for (int i=0;i<values.size();++i) update(i,values[i].toMap());
+        return;
+    }
+    snapshotDirty=true; beginResetModel(); rows.clear(); positions.clear(); rows.reserve(values.size());
+    for (const auto &value:values) { const auto map=value.toMap(); rows.append({map.value("bookId").toInt(),map}); }
+    indexRows(0,rows.size()-1); endResetModel();
+}
+
+QHash<int,QByteArray> SyncModel::roleNames() const {
+    static const QHash<int,QByteArray> names{{Key,"key"},{Title,"title"},{Author,"author"},{State,"state"},{Label,"label"},{Group,"group"},{Files,"files"},{SortKey,"sortKey"},{Data,"modelData"}};
+    return names;
+}
+QVariant SyncModel::data(const QModelIndex &index,int role) const {
+    if (!index.isValid() || index.row()<0 || index.row()>=rows.size()) return {};
+    const auto &row=rows[index.row()];
+    if (role==Data) return row;
+    if (role==SortKey) return QVariantList{row.value("state"),row.value("title"),row.value("key")};
+    return row.value(QString::fromLatin1(roleNames().value(role)));
+}
+QVariantMap SyncModel::get(const QString &key) const {
+    const int row=positions.value(key,-1); return row<0 ? QVariantMap{} : rows[row];
+}
+void SyncModel::put(const QString &key,const QVariantMap &value) {
+    int row=positions.value(key,-1);
+    if (row<0) {
+        if (value.isEmpty()) return;
+        row=rows.size(); beginInsertRows({},row,row); rows.append(value); positions[key]=row; endInsertRows(); return;
+    }
+    if (value.isEmpty()) {
+        beginRemoveRows({},row,row); positions.remove(key); rows.removeAt(row);
+        for (int i=row;i<rows.size();++i) positions[rows[i].value("key").toString()]=i;
+        endRemoveRows(); return;
+    }
+    const auto before=rows[row]; if (before==value) return;
+    QList<int> roles;
+    const auto names=roleNames();
+    for (auto it=names.begin();it!=names.end();++it)
+        if (it.key()!=SortKey && it.key()!=Data && before.value(QString::fromLatin1(it.value()))!=value.value(QString::fromLatin1(it.value()))) roles.append(it.key());
+    if (before.value("state")!=value.value("state") || before.value("title")!=value.value("title")) roles.append(SortKey);
+    roles.append(Data); rows[row]=value; emit dataChanged(index(row),index(row),roles);
+}
+void SyncModel::replace(const QList<QVariantMap> &values) {
+    beginResetModel(); rows=values; positions.clear();
+    for (int i=0;i<rows.size();++i) positions[rows[i].value("key").toString()]=i;
+    endResetModel();
+}
+SyncProxy::SyncProxy(QObject *parent):QSortFilterProxyModel(parent) {
+    setSortRole(SyncModel::SortKey); setFilterRole(SyncModel::Group); setFilterKeyColumn(0); sort(0);
+}
+bool SyncProxy::lessThan(const QModelIndex &a,const QModelIndex &b) const {
+    const auto left=sourceModel()->data(a,SyncModel::SortKey).toList(),right=sourceModel()->data(b,SyncModel::SortKey).toList();
+    const int l=syncPriority.indexOf(left[0].toString()),r=syncPriority.indexOf(right[0].toString());
+    if (l!=r) return l<r;
+    const int title=QString::localeAwareCompare(left[1].toString(),right[1].toString());
+    return title ? title<0 : left[2].toString()<right[2].toString();
+}
+void SyncProxy::setFilter(const QString &value) {
+    group=value; setFilterFixedString(value=="all" ? QString{} : value);
 }
 
 Client::Client(QUrl server, QString root, QObject *parent, bool restoreAccount)
-    : QObject(parent), libraryModel(this), endpoint(server), rootDir(root) {
+    : QObject(parent), libraryModel(this), syncRows(this), syncView(this), endpoint(server), rootDir(root) {
+    syncView.setSourceModel(&syncRows);
+    connect(&libraryModel,&QAbstractItemModel::modelAboutToBeReset,this,[this] { if (preservingLibraryAnchor) emit libraryAboutToReset(); });
+    connect(&libraryModel,&QAbstractItemModel::modelReset,this,[this] { if (preservingLibraryAnchor) emit libraryReset(); });
     diagnosticClock.start();
     network.setTransferTimeout(15000);
     const bool dataDirectoryCreated = QDir().mkpath(rootDir);
@@ -328,7 +412,7 @@ void Client::loadRecords() {
     coverVersions = readObject(scopeDir+"/cover-index.json");
     count = currentPage = 0;
     downloads = {};
-    savedRecordStamps.clear(); filesByBook.clear();
+    savedRecordStamps.clear(); durableRecordStamps.clear(); blockedTransfers.clear(); filesByBook.clear();
     syncResults = {};
     bool recordsReadable = true;
     const QString recordsDir = scopeDir+"/records";
@@ -419,7 +503,7 @@ void Client::cleanupBooks(const QString &verifiedFile) {
         if (!info.exists() && !info.isSymLink()) return true;
         if (!info.isFile() || info.isSymLink() || info.canonicalPath() != info.absolutePath()) return false;
         if (referenced.contains(path)) return false;
-        return readerFileState(path) == ReaderFileState::Closed && QFile::remove(path);
+        return readerFileState(path) == ReaderFileState::Closed && ::unlink(QFile::encodeName(path))==0;
     };
     QSet<QString> retained;
     const QString transfers = scopeDir+"/transfers";
@@ -441,6 +525,39 @@ void Client::cleanupBooks(const QString &verifiedFile) {
         const QString staging = scopeDir+"/"+stem+".part";
         const auto current = downloads.value(id).toObject();
         const bool registered = recordFile(id, current) == newFile;
+        const auto recordPath=scopeDir+"/records/"+id+".json",journalPath=transfers+"/"+name;
+        const auto selected=recordFile(id,current);
+        if (blockedTransfers.contains(journalPath) || (!previous.isEmpty() && selected!=newFile && selected!=oldFile)) {
+            retained.insert(newFile); retained.insert(oldFile); retained.insert(staging); continue;
+        }
+        if (!current.isEmpty()) {
+            const auto expected=registered ? next : previous;
+            if (current["sha256"]!=expected["sha256"] || current["bytes"]!=expected["bytes"]) {
+                retained.insert(newFile); retained.insert(oldFile); retained.insert(staging); continue;
+            }
+            const auto proof=durableRecordStamps.value(recordPath);
+            if (!proof.first.valid || proof.first!=fileStamp(recordPath) || proof.second!=fileStamp(selected)) {
+                cleanupState=CleanupState::Running;
+                const auto task=++cleanupGeneration,account=accountGeneration;
+                cleanupTask=files.submit(this,[recordPath,selected,current](const FileCancellation &cancel) {
+                    const auto registry=fileStamp(recordPath),file=fileStamp(selected);
+                    const bool valid=!fileCancelled(cancel) && readObject(recordPath)==current &&
+                        validContent(selected,current["format"].toString("epub"),cancel) &&
+                        digestFile(selected,cancel)==current["sha256"].toString().toLatin1() &&
+                        confirmFile(selected) && confirmFile(recordPath) && fileStamp(recordPath)==registry && fileStamp(selected)==file;
+                    return std::make_pair(valid,std::make_pair(registry,file));
+                },[this,recordPath,journalPath,selected,account,task](const auto &result,bool cancelled) {
+                    if (task!=cleanupGeneration) return;
+                    cleanupTask.reset(); cleanupState=CleanupState::Completed;
+                    if (cancelled || account!=accountGeneration) return;
+                    if (result.first && fileStamp(recordPath)==result.second.first && fileStamp(selected)==result.second.second)
+                        durableRecordStamps[recordPath]=result.second;
+                    else blockedTransfers.insert(journalPath);
+                    cleanupBooks();
+                });
+                return;
+            }
+        }
         const QFileInfo info(newFile);
         const bool candidate=registered && current["sha256"]==next["sha256"] && current["bytes"]==next["bytes"] &&
             !current["invalid"].toBool() && info.isFile() && !info.isSymLink() &&
@@ -471,7 +588,24 @@ void Client::cleanupBooks(const QString &verifiedFile) {
             const bool newRemoved = registered || removeUnused(newFile);
             const bool oldRemoved = recordFile(id, current) == oldFile || removeUnused(oldFile);
             const bool partRemoved = removeUnused(staging);
-            removed = newRemoved && oldRemoved && partRemoved && QFile::remove(transfers+"/"+name);
+            if (newRemoved && oldRemoved && partRemoved) {
+                cleanupState=CleanupState::Running;
+                const auto task=++cleanupGeneration,account=accountGeneration;
+                cleanupTask=files.submit(this,[newFile,oldFile,staging,journalPath,transfers](const FileCancellation &cancel) {
+                    QSet<QString> directories;
+                    for (const auto &path:{newFile,oldFile,staging}) if (!path.isEmpty()) directories.insert(QFileInfo(path).absolutePath());
+                    for (const auto &directory:directories) if (fileCancelled(cancel) || !syncDirectory(directory)) return false;
+                    if (fileCancelled(cancel) || ::unlink(QFile::encodeName(journalPath))!=0) return false;
+                    return syncDirectory(transfers);
+                },[this,journalPath,task,account](bool ok,bool cancelled) {
+                    if (task!=cleanupGeneration) return;
+                    cleanupTask.reset(); cleanupState=CleanupState::Completed;
+                    if (cancelled || account!=accountGeneration) return;
+                    if (!ok) blockedTransfers.insert(journalPath);
+                    cleanupBooks();
+                });
+                return;
+            }
         }
         if (!removed) { retained.insert(newFile); retained.insert(oldFile); retained.insert(staging); }
     }
@@ -544,7 +678,7 @@ void Client::invalidateSync() {
 void Client::publishDataChanges() {
     // Reading a dirty snapshot must not consume the notification still owed to QML.
     if (libraryPending) { libraryPending=false; if (modelObserved) ensureLibrary(); emit libraryChanged(); }
-    if (syncPending) { syncPending=false; emit syncSummaryChanged(); }
+    if (syncPending) { syncPending=false; if (syncObserved) syncSummary(); emit syncSummaryChanged(); }
     if (detailPending) { detailPending=false; emit detailChanged(); }
 }
 
@@ -559,6 +693,7 @@ void Client::storeRecord(const QString &id, const QJsonObject &record) {
     const auto before=downloads.value(id).toObject();
     if (before == record) return;
     savedRecordStamps.remove(id);
+    durableRecordStamps.remove(scopeDir+"/records/"+id+".json");
     indexRecord(id,before,record);
     downloads[id] = record;
     for (const auto key:{"filename","directory","bytes","sha256","invalid"}) if (before[key]!=record[key]) {
@@ -592,6 +727,7 @@ bool Client::saveRecord(const QString &id, const QJsonObject &record) {
     const auto saved=savedRecordStamps.value(id);
     if (saved.valid && downloads.value(id).toObject()==record && fileStamp(path)==saved) return true;
     savedRecordStamps.remove(id);
+    durableRecordStamps.remove(scopeDir+"/records/"+id+".json");
 #ifdef BOOKORBIT_TEST_HTTP
     ++presentationCounters.recordWrites;
 #endif
@@ -829,19 +965,17 @@ void Client::runRecents() {
         if (generation!=recentsGeneration) return;
         recentsScheduled=false;
         if (!cancelled && account==accountGeneration && profile==readerProfile() && !busy()) {
-            const auto before=nativeRecents;
-            if (full || !result.available || before.available!=result.available) nativeRecents=std::move(result);
-            else {
-                for (const auto &path:affectedPaths) {
-                    nativeRecents.files.remove(path);
-                    if (result.files.contains(path)) nativeRecents.files[path]=result.files[path];
-                }
+            const bool availabilityChanged=nativeRecents.available!=result.available;
+            for (const auto &path:affectedPaths) {
+                const auto a=nativeRecents.files.value(path),b=result.files.value(path);
+                if (a.bookId!=b.bookId || a.openTime!=b.openTime || nativeRecents.files.contains(path)!=result.files.contains(path)) invalidateBook(owners.value(path),false);
             }
-            if (before.available!=nativeRecents.available) { invalidateLibrary(); invalidateSync(); }
+            if (full || !result.available || availabilityChanged) nativeRecents=std::move(result);
             else for (const auto &path:affectedPaths) {
-                const auto a=before.files.value(path),b=nativeRecents.files.value(path);
-                if (a.bookId!=b.bookId || a.openTime!=b.openTime || before.files.contains(path)!=nativeRecents.files.contains(path)) invalidateBook(owners.value(path),false);
+                nativeRecents.files.remove(path);
+                if (result.files.contains(path)) nativeRecents.files[path]=result.files.value(path);
             }
+            if (availabilityChanged) { invalidateLibrary(); invalidateSync(); }
             if (detailVisible() && changedBooks.contains(detailBook["id"].toInt())) detailPending=true;
             publishDataChanges();
         } else {
@@ -918,8 +1052,20 @@ QVariantMap Client::syncFileStatus(const QString &id, const QString &profile,Loc
 }
 
 QVariantList Client::syncBooks() const {
-    return syncSummary()["books"].toList();
+    syncSummary();
+#ifdef BOOKORBIT_TEST_HTTP
+    ++presentationCounters.syncSnapshots;
+#endif
+    SyncProxy all; all.setSourceModel(&syncRows); QVariantList result;
+    for (int i=0;i<all.rowCount();++i) result.append(syncRows.get(all.index(i,0).data(SyncModel::Key).toString()));
+    return result;
 }
+QAbstractItemModel *Client::syncModel() const { syncObserved=true; syncSummary(); return &syncView; }
+void Client::setSyncFilter(const QString &value) {
+    if (value==syncFilter() || !QStringList{"all","waiting","attention","synced"}.contains(value)) return;
+    syncView.setFilter(value); emit syncFilterChanged();
+}
+QVariantMap Client::syncBookDetails(const QString &key) const { syncSummary(); return syncRows.get(key); }
 
 void Client::invalidateSyncBook(int bookId) {
     if (bookId>0) changedSyncGroups.insert("book:"+QString::number(bookId));
@@ -946,50 +1092,42 @@ QVariantMap Client::syncGroup(const QString &key) const {
     }
     return entry;
 }
-QVariantList Client::buildSyncBooks() const {
-#ifdef BOOKORBIT_TEST_HTTP
-    ++presentationCounters.syncBuilds; ++presentationCounters.syncSorts;
-#endif
-    syncGroups.clear(); syncFiles.clear(); QSet<QString> keys;
-    for (auto it=downloads.begin();it!=downloads.end();++it) keys.insert(syncGroupKey(it.key(),it.value().toObject()));
-    QVariantList result;
-    for (const auto &key:keys) {
-        const auto group=syncGroup(key);
-        if (!group.isEmpty()) { syncGroups[key]=group; result.append(group); }
-    }
-    std::sort(result.begin(),result.end(),syncLess);
-    return result;
-}
 QVariantMap Client::syncSummary() const {
     if (syncDirty) {
-        syncOrder=buildSyncBooks();
-        int synced=0,waiting=0,attention=0;
-        for (const auto &book:syncOrder) {
-            const auto group=book.toMap()["group"];
-            if (group=="synced") ++synced; else if (group=="waiting") ++waiting; else ++attention;
+#ifdef BOOKORBIT_TEST_HTTP
+        ++presentationCounters.syncBuilds; ++presentationCounters.syncSorts;
+#endif
+        QList<QVariantMap> groups; syncFiles.clear(); QSet<QString> keys;
+        for (auto it=downloads.begin();it!=downloads.end();++it) keys.insert(syncGroupKey(it.key(),it.value().toObject()));
+        cachedSyncSummary={{"total",0},{"synced",0},{"waiting",0},{"attention",0},{"unsupported",0}};
+        for (const auto &key:keys) {
+            const auto group=syncGroup(key); if (group.isEmpty()) continue;
+            groups.append(group); const auto name=group.value("group").toString();
+            cachedSyncSummary[name]=cachedSyncSummary.value(name).toInt()+1;
         }
+        syncRows.replace(groups);
         QSet<int> supported; unsupportedBooks.clear();
         for (const auto value:downloads) {
             const auto record=value.toObject(); const int id=record["book"].toObject()["id"].toInt();
             if (syncFormat(record["format"].toString("epub"))) supported.insert(id); else unsupportedBooks.insert(id);
         }
         unsupportedBooks.subtract(supported);
-        cachedSyncSummary={{"books",syncOrder},{"total",syncOrder.size()},{"synced",synced},{"waiting",waiting},{"attention",attention},{"unsupported",unsupportedBooks.size()}};
         syncDirty=false; changedSyncGroups.clear(); changedUnsupported.clear();
     } else if (!changedSyncGroups.isEmpty() || !changedUnsupported.isEmpty()) {
         for (const auto &key:std::exchange(changedSyncGroups,{})) {
-            const auto old=syncGroups.take(key),next=syncGroup(key);
-            if (old==next) { if (!next.isEmpty()) syncGroups[key]=next; continue; }
+#ifdef BOOKORBIT_TEST_HTTP
+            ++presentationCounters.syncReconciliations;
+#endif
+            const auto old=syncRows.get(key),next=syncGroup(key);
+            if (old==next) continue;
 #ifdef BOOKORBIT_TEST_HTTP
             ++presentationCounters.syncUpdates;
 #endif
             auto count=[this](const QVariantMap &group,int delta) {
                 if (group.isEmpty()) return;
-                const auto name=group["group"].toString(); cachedSyncSummary[name]=cachedSyncSummary[name].toInt()+delta;
+                const auto name=group.value("group").toString(); cachedSyncSummary[name]=cachedSyncSummary.value(name).toInt()+delta;
             };
-            count(old,-1); count(next,1);
-            for (int i=0;i<syncOrder.size();++i) if (syncOrder[i].toMap()["key"]==key) { syncOrder.removeAt(i); break; }
-            if (!next.isEmpty()) { syncGroups[key]=next; syncOrder.insert(std::lower_bound(syncOrder.begin(),syncOrder.end(),QVariant(next),syncLess),next); }
+            count(old,-1); count(next,1); syncRows.put(key,next);
         }
         for (int bookId:std::exchange(changedUnsupported,{})) {
             bool supported=false,unsupported=false;
@@ -1000,8 +1138,8 @@ QVariantMap Client::syncSummary() const {
             }
             if (unsupported && !supported) unsupportedBooks.insert(bookId); else unsupportedBooks.remove(bookId);
         }
-        cachedSyncSummary["books"]=syncOrder; cachedSyncSummary["total"]=syncOrder.size(); cachedSyncSummary["unsupported"]=unsupportedBooks.size();
     }
+    cachedSyncSummary["total"]=syncRows.rowCount(); cachedSyncSummary["unsupported"]=unsupportedBooks.size();
     return cachedSyncSummary;
 }
 
@@ -1290,6 +1428,9 @@ QVariantMap Client::backFromCollection() {
 }
 
 void Client::finish(UiMessage text, bool success, const QString &operation, const QString &syncState) {
+    const bool downloaded=restoringDownload;
+    restoringDownload=false;
+    if (downloaded && operation!="download") text=uiMessage("book_downloaded_progress_result").arg(text);
     const int finishedBook=syncingId.isEmpty() ? feedbackBookId : libraryBookId(downloads.value(syncingId).toObject());
     struct Maintenance {
         Client *client;
@@ -1386,7 +1527,8 @@ void Client::finish(UiMessage text, bool success, const QString &operation, cons
     if (operation=="progress" || operation=="download" || operation=="open") refreshBookRecents(finishedBook);
     else if (recentsRequested) runRecents();
     publish();
-    emit completed(operation, success);
+    // A failed restore retains the downloaded file and its separate sync error.
+    emit completed(downloaded ? "download" : operation, downloaded || success);
 }
 
 QNetworkRequest Client::request(const QString &path) const {
@@ -1795,46 +1937,101 @@ void Client::transferBook(const QJsonObject &book, bool renew) {
                     if (saved.contains(key)) result[key] = saved[key];
                 return result;
             };
-            const QString transfers = scopeDir+"/transfers";
-            if (!QDir().mkpath(transfers) || !accessibleDirectory(transfers) ||
-                !writeObject(transfers+"/"+stem+".json", {{"fileId", file["id"]}, {"previous", identity(previous)}, {"next", identity(record)}})) {
-                output->cancelWriting();
-                finish(uiMessage("could_not_save_the_download_journal_the_previous_book_is_still_available"), false, "download"); return;
+            const QString transfers=scopeDir+"/transfers",journal=transfers+"/"+stem+".json",recordPath=scopeDir+"/records/"+id+".json";
+            const auto journalBytes=QJsonDocument(QJsonObject{{"fileId",file["id"]},{"previous",identity(previous)},{"next",identity(record)}}).toJson();
+            if (!accessibleDirectory(directory) || !sameStorage(scopeDir,directory)) {
+                output->cancelWriting(); finish(uiMessage("could_not_save_the_book"),false,"download"); return;
             }
-            if (!accessibleDirectory(directory) || !sameStorage(scopeDir,directory) || !output->commit()) {
-                cleanupBooks(); finish(uiMessage("could_not_save_the_book"),false,"download"); return;
-            }
-            fileTask=files.submit(this,[staging,format](const FileCancellation &cancel) {
-                const auto before=fileStamp(staging);
-                return std::make_pair(validContent(staging,format,cancel),before);
-            },[this,context,oldStamp,oldFile,staging,finalPath,directory,id,record,book,newHash,format](const auto &validation,bool wasCancelled) {
-                if (!acceptFileContext(context,oldStamp) || wasCancelled) { cleanupBooks(); return; }
-                if (!validation.first || !validation.second.valid || fileStamp(staging)!=validation.second ||
-                    !accessibleDirectory(directory) || !sameStorage(scopeDir,directory) ||
-                    ((QFile::exists(oldFile) || !context.record.isEmpty()) && readerFileState(oldFile)!=ReaderFileState::Closed) ||
-                    !QFile::rename(staging,finalPath)) {
-                    cleanupBooks(); finish(uiMessage("could_not_save_the_book"),false,"download"); return;
+            fileTask=files.submit(this,[output,journal,journalBytes,recordPath,staging,format](const FileCancellation &cancel) {
+                TransferStage result;
+                if (fileCancelled(cancel) || !makeDurableDirectory(QFileInfo(journal).absolutePath(),&result.error) ||
+                    !makeDurableDirectory(QFileInfo(recordPath).absolutePath(),&result.error)) return result;
+                const auto saved=saveDurable(journal,journalBytes); result.error=saved.detail;
+                result.journal=saved.state==FileCommitState::Complete;
+                if (!result.journal || fileCancelled(cancel)) return result;
+                const auto staged=commitFile(*output); result.error=staged.detail;
+                if (staged.state!=FileCommitState::Complete || fileCancelled(cancel)) return result;
+                result.stamp=fileStamp(staging);
+                result.valid=validContent(staging,format,cancel) && result.stamp.valid && fileStamp(staging)==result.stamp;
+                return result;
+            },[this,context,output,oldStamp,oldFile,staging,finalPath,directory,id,record,recordPath,journal,book,newHash,format](const TransferStage &result,bool wasCancelled) {
+                if (!acceptFileContext(context,oldStamp) || wasCancelled || !result.valid) {
+                    if (output->isOpen()) output->cancelWriting();
+                    blockedTransfers.insert(journal);
+                    logDiagnostic("transfer.persistence_failed",{{"stage","journal_or_staging"},{"detail",result.error}});
+                    if (!wasCancelled && context.generation==fileGeneration)
+                        finish(uiMessage(result.journal ? "could_not_save_the_book" : "could_not_save_the_download_journal_the_previous_book_is_still_available"),false,"download");
+                    return;
                 }
-                fileTask=files.submit(this,[finalPath](const FileCancellation &cancel) {
-                    const auto before=fileStamp(finalPath); return std::make_pair(digestFile(finalPath,cancel),before);
-                },[this,context,oldStamp,oldFile,finalPath,id,record,book,newHash,format](const auto &validation,bool wasCancelled) {
-                    if (!acceptFileContext(context,oldStamp) || wasCancelled) { cleanupBooks(); return; }
-                    if (validation.first!=newHash.toLatin1() || !validation.second.valid || fileStamp(finalPath)!=validation.second ||
+                if (fileStamp(staging)!=result.stamp || !accessibleDirectory(directory) || !sameStorage(scopeDir,directory) ||
+                    ((QFile::exists(oldFile) || !context.record.isEmpty()) && readerFileState(oldFile)!=ReaderFileState::Closed)) {
+                    blockedTransfers.insert(journal); finish(uiMessage("could_not_save_the_book"),false,"download"); return;
+                }
+                fileTask=files.submit(this,[staging,finalPath,newHash](const FileCancellation &cancel) {
+                    TransferStage result; result.journal=true;
+                    if (fileCancelled(cancel)) return result;
+                    const auto moved=moveDurable(staging,finalPath); result.error=moved.detail;
+                    if (moved.state!=FileCommitState::Complete) return result;
+                    result.stamp=fileStamp(finalPath);
+                    result.valid=result.stamp.valid && digestFile(finalPath,cancel)==newHash.toLatin1() && fileStamp(finalPath)==result.stamp;
+                    return result;
+                },[this,context,oldStamp,oldFile,finalPath,id,record,recordPath,journal,book,format](const TransferStage &result,bool wasCancelled) {
+                    if (!acceptFileContext(context,oldStamp) || wasCancelled || !result.valid || fileStamp(finalPath)!=result.stamp ||
                         ((QFile::exists(oldFile) || !context.record.isEmpty()) && readerFileState(oldFile)!=ReaderFileState::Closed)) {
-                        cleanupBooks(); finish(uiMessage("the_saved_book_is_damaged_the_previous_book_is_still_available"),false,"download"); return;
+                        blockedTransfers.insert(journal);
+                        if (!wasCancelled && context.generation==fileGeneration) finish(uiMessage("the_saved_book_is_damaged_the_previous_book_is_still_available"),false,"download");
+                        return;
                     }
-                    if (!saveRecord(id, record)) {
-                        cleanupBooks();
-                        finish(uiMessage("download_record_not_saved_the_previous_book_is_still_available"), false, "download"); return;
-                    }
-                    clearSyncResult(id);
-                    rememberFile(book);
-                    cleanupBooks(finalPath); // Its digest was verified immediately before saveRecord().
-                    if (readableFormat(format)) scanBook(finalPath);
-                    finish(uiMessage("book_downloaded_and_available_offline"), true, "download");
+                    const auto stamp=result.stamp;
+#ifdef BOOKORBIT_TEST_HTTP
+                    ++presentationCounters.recordWrites;
+#endif
+                    fileTask=files.submit(this,[recordPath,record,finalPath,stamp](const FileCancellation &cancel) {
+                        if (fileCancelled(cancel) || fileStamp(finalPath)!=stamp)
+                            return FileCommitResult{FileCommitState::FailedBeforeReplace,"file changed"};
+                        const auto bytes=QJsonDocument(record).toJson();
+                        if (bytes.size()>maxJson) return FileCommitResult{FileCommitState::FailedBeforeReplace,"record too large"};
+                        return saveDurable(recordPath,bytes);
+                    },[this,context,oldStamp,finalPath,id,record,recordPath,journal,book,format,stamp](const FileCommitResult &result,bool wasCancelled) {
+                        if (!acceptFileContext(context,oldStamp) || wasCancelled || result.state!=FileCommitState::Complete || fileStamp(finalPath)!=stamp) {
+                            blockedTransfers.insert(journal);
+                            logDiagnostic("transfer.persistence_failed",{{"stage","registry"},{"detail",result.detail}});
+                            if (!wasCancelled && context.generation==fileGeneration) finish(uiMessage("download_record_not_saved_the_previous_book_is_still_available"),false,"download");
+                            return;
+                        }
+                        storeRecord(id,record); savedRecordStamps[id]=fileStamp(recordPath);
+                        durableRecordStamps[recordPath]={fileStamp(recordPath),stamp};
+                        clearSyncResult(id); rememberFile(book); cleanupBooks(finalPath);
+                        if (readableFormat(format)) scanBook(finalPath);
+                        if (context.record.isEmpty() && syncFormat(format)) {
+                            restoringDownload=true; fileDownloading=false; retryKind=0;
+                            restoreDownloadedProgress(id); return;
+                        }
+                        finish(uiMessage("book_downloaded_and_available_offline"),true,"download");
+                    });
                 });
             });
         });
+    });
+}
+
+void Client::restoreDownloadedProgress(const QString &id, int attempts) {
+    const auto record=downloads.value(id).toObject();
+    const auto path=recordFile(id,record);
+    if (readerBookIndexed(path)) {
+        working=false;
+        syncBook(id);
+        return;
+    }
+    if (!attempts) {
+        syncingId=id;
+        finish(uiMessage("book_registration_pending_sync_later"),false,"progress","reader_unknown");
+        return;
+    }
+    message=uiMessage("waiting_for_book_registration"); notifyOperation(); emit feedbackChanged();
+    const auto context=fileContext(id,path);
+    QTimer::singleShot(250,this,[this,id,attempts,context] {
+        if (acceptFileContext(context)) restoreDownloadedProgress(id,attempts-1);
     });
 }
 
@@ -2111,10 +2308,16 @@ bool Client::libraryMatches(const LibraryRow &row) const {
     return !localView || libraryQuery.isEmpty() || row.search.contains(libraryQuery.normalized(QString::NormalizationForm_KC).toCaseFolded());
 }
 void Client::indexLibrary() const {
+#ifdef BOOKORBIT_TEST_HTTP
+    ++presentationCounters.indexBuilds; presentationCounters.indexVisits+=libraryRows.size();
+#endif
     libraryIndex.clear();
     for (int i=0;i<libraryRows.size();++i) libraryIndex[libraryRows[i].book["id"].toInt()]=i;
 }
 void Client::updateRecent() const {
+#ifdef BOOKORBIT_TEST_HTTP
+    ++presentationCounters.recentPasses; presentationCounters.recentVisits+=libraryRows.size();
+#endif
     int latest=-1;
     for (int i=0;i<libraryRows.size();++i) {
         if (libraryRows[i].recent.isEmpty()) continue;
@@ -2153,60 +2356,81 @@ void Client::ensureLibrary() const {
         indexLibrary(); libraryOrderDirty=false; libraryFilterDirty=true;
     }
     const auto changed=std::exchange(changedBooks,{});
+    QHash<int,LibraryRow> replacements;
+    QSet<int> structural,removed;
+    bool recentDirty=reset;
     for (int id:changed) {
         QJsonObject book;
         if (localView) book=localBook(id);
         else for (const auto &value:items) if (value.toObject()["id"].toInt()==id) { book=value.toObject(); break; }
-        int old=libraryIndex.value(id,-1);
+        const int old=libraryIndex.value(id,-1);
         if (book.isEmpty()) {
-            if (old>=0) libraryRows.removeAt(old);
-        } else {
-            auto row=libraryRow(book);
+            if (old>=0) { structural.insert(id); removed.insert(id); recentDirty=recentDirty || !libraryRows[old].recent.isEmpty(); }
+            continue;
+        }
+        auto row=libraryRow(book);
 #ifdef BOOKORBIT_TEST_HTTP
-            ++presentationCounters.bookUpdates;
+        ++presentationCounters.bookUpdates;
 #endif
-            if (old>=0 && (!localView || (!libraryLess(row,libraryRows[old]) && !libraryLess(libraryRows[old],row)))) libraryRows[old]=row;
-            else {
-                if (old>=0) libraryRows.removeAt(old);
-                if (localView) libraryRows.insert(std::lower_bound(libraryRows.begin(),libraryRows.end(),row,[this](const LibraryRow &a,const LibraryRow &b) { return libraryLess(a,b); }),row);
-                else libraryRows.append(row);
-            }
+        const bool moved=old<0 || (localView && (libraryLess(row,libraryRows[old]) || libraryLess(libraryRows[old],row)));
+        const bool history=old<0 || row.book["nativeOpenTime"]!=libraryRows[old].book["nativeOpenTime"] ||
+            row.book["title"]!=libraryRows[old].book["title"] || row.recent.isEmpty()!=libraryRows[old].recent.isEmpty();
+        recentDirty=recentDirty || history;
+        if (!history && libraryRecent.value("bookId").toInt()==id) libraryRecent=row.recent;
+        if (moved || (old>=0 && libraryMatches(row)!=libraryMatches(libraryRows[old]))) structural.insert(id);
+        if (moved) replacements.insert(id,std::move(row));
+        else libraryRows[old]=std::move(row);
+    }
+    if (!replacements.isEmpty() || !removed.isEmpty()) {
+        QList<LibraryRow> kept,added;
+        kept.reserve(libraryRows.size());
+        for (const auto &row:libraryRows) {
+            const int id=row.book["id"].toInt();
+            if (!replacements.contains(id) && !removed.contains(id)) kept.append(row);
+        }
+        for (auto it=replacements.cbegin();it!=replacements.cend();++it) added.append(it.value());
+        if (localView) {
+            std::sort(added.begin(),added.end(),[this](const LibraryRow &a,const LibraryRow &b) { return libraryLess(a,b); });
+            libraryRows.clear(); libraryRows.reserve(kept.size()+added.size());
+            std::merge(kept.begin(),kept.end(),added.begin(),added.end(),std::back_inserter(libraryRows),
+                [this](const LibraryRow &a,const LibraryRow &b) { return libraryLess(a,b); });
+        } else {
+            libraryRows=std::move(kept); libraryRows.append(added);
         }
         indexLibrary();
     }
-    if (!libraryFilterDirty) {
-        // Remove vanished matches before placing survivors; a file can change two book groups.
+    if (!libraryFilterDirty && structural.isEmpty()) {
         for (int id:changed) {
             const int at=libraryIndex.value(id,-1),visible=libraryModel.rowFor(id);
-            if ((at<0 || !libraryMatches(libraryRows[at])) && visible>=0) libraryModel.remove(visible);
+            if (at>=0 && visible>=0) libraryModel.update(visible,libraryRows[at].summary);
         }
-        for (int id:changed) {
-            int visible=libraryModel.rowFor(id),at=libraryIndex.value(id,-1);
-            if (at>=0 && libraryMatches(libraryRows[at])) {
-                int target=0;
-                for (const auto &value:libraryModel.snapshot()) {
-                    const int other=value.toMap()["bookId"].toInt();
-                    const int position=libraryIndex.value(other,-1);
-                    if (other!=id && position>=0 && position<at) ++target;
-                }
-                if (visible<0) libraryModel.insert(target,libraryRows[at].summary);
-                else { libraryModel.move(visible,target); libraryModel.update(target,libraryRows[at].summary); }
-            }
+    } else if (!libraryFilterDirty && structural.size()==1) {
+        const int id=*structural.begin(),at=libraryIndex.value(id,-1),visible=libraryModel.rowFor(id);
+        if (at<0 || !libraryMatches(libraryRows[at])) { if (visible>=0) libraryModel.remove(visible); }
+        else {
+            int target=0;
+            for (int i=0;i<at;++i) if (libraryMatches(libraryRows[i])) ++target;
+            if (visible<0) libraryModel.insert(target,libraryRows[at].summary);
+            else { libraryModel.move(visible,target); libraryModel.update(target,libraryRows[at].summary); }
         }
-    }
-    if (libraryFilterDirty) {
+        for (int other:changed-structural) {
+            const int row=libraryModel.rowFor(other),source=libraryIndex.value(other,-1);
+            if (row>=0 && source>=0) libraryModel.update(row,libraryRows[source].summary);
+        }
+    } else {
         QVariantList visible;
         for (const auto &row:libraryRows) if (libraryMatches(row)) visible.append(row.summary);
-        libraryModel.replace(visible,reset); libraryFilterDirty=false;
+        libraryFilterDirty=false; preservingLibraryAnchor=localView && !reset;
+        libraryModel.replace(visible,reset); preservingLibraryAnchor=false;
     }
-    if (reset || !changed.isEmpty()) updateRecent();
+    if (recentDirty) updateRecent();
 }
 
 QJsonArray Client::visibleItems(bool applyQuery) const {
     ensureLibrary(); QJsonArray result;
     if (!applyQuery) for (const auto &row:libraryRows) result.append(row.book);
     else for (const auto &value:libraryModel.snapshot()) {
-        const int row=libraryIndex.value(value.toMap()["bookId"].toInt(),-1);
+        const int row=libraryIndex.value(value.toMap().value("bookId").toInt(),-1);
         if (row>=0) result.append(libraryRows[row].book);
     }
     return result;
@@ -2236,6 +2460,8 @@ QString Client::coverUrl(int bookId) const {
 }
 
 void Client::stopCovers() {
+    if (coverTask) coverTask->store(true);
+    coverTask.reset();
     ++coverGeneration;
     coverQueue.clear();
     if (activeCover) activeCover->abort();
@@ -2284,19 +2510,31 @@ void Client::fetchNextCover() {
         if (reply->error() == QNetworkReply::NoError && bytes->size() <= maxJson &&
             reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200) {
             const auto account=accountGeneration;
-            files.submit(this,[data=*bytes](const FileCancellation &cancel) {
+            coverTask=files.submit(this,[data=*bytes
+#ifdef BOOKORBIT_TEST_HTTP
+                ,counter=coverDecodeCount
+#endif
+            ](const FileCancellation &cancel) {
+                if (fileCancelled(cancel)) return QByteArray{};
                 QByteArray source=data,encoded;
                 QBuffer buffer(&source); buffer.open(QIODevice::ReadOnly); QImageReader reader(&buffer);
                 const auto format=reader.format(); const auto size=reader.size();
                 if (!fileCancelled(cancel) && (format=="png" || format=="jpeg" || format=="webp") &&
                     size.width()>0 && size.height()>0 && size.width()<=2048 && size.height()<=2048) {
-                    reader.setScaledSize(size.scaled(240,320,Qt::KeepAspectRatio)); const auto cover=reader.read();
+                    reader.setScaledSize(size.scaled(240,320,Qt::KeepAspectRatio));
+                    if (fileCancelled(cancel)) return QByteArray{};
+#ifdef BOOKORBIT_TEST_HTTP
+                    ++*counter;
+#endif
+                    const auto cover=reader.read();
+                    if (fileCancelled(cancel) || cover.isNull()) return QByteArray{};
                     QBuffer output(&encoded); output.open(QIODevice::WriteOnly);
-                    if (fileCancelled(cancel) || cover.isNull() || !cover.save(&output,"PNG")) encoded.clear();
+                    if (!cover.save(&output,"PNG")) encoded.clear();
                 }
                 return encoded;
             },[this,path,id,version,generation,account](const QByteArray &encoded,bool cancelled) {
                 if (generation!=coverGeneration || account!=accountGeneration) return;
+                coverTask.reset();
                 QSaveFile file(path);
                 if (!cancelled && !encoded.isEmpty() && file.open(QIODevice::WriteOnly) && file.write(encoded)==encoded.size() && file.commit()) {
                     if (version.isEmpty()) coverVersions.remove(QString::number(id)); else coverVersions[QString::number(id)]=version;
@@ -2452,6 +2690,47 @@ void Client::verifyRemoteFile(const QString &id, bool renew) {
     });
 }
 
+void Client::finishProgress(const QString &id, const QJsonObject &remote, const UiMessage &text) {
+    const auto record=downloads.value(id).toObject();
+    const int bookId=libraryBookId(record);
+    const auto context=fileContext(id,recordFile(id,record));
+    jsonRequest("/api/v1/books/"+QString::number(bookId),{},[this,id,bookId,remote,text,context](const QJsonObject &book) {
+        if (!acceptFileContext(context)) return;
+        const auto variants=bookFiles(book);
+        if (book["id"].toInt()!=bookId || variants.isEmpty() ||
+            (!book["readStatus"].isNull() && !book["readStatus"].isUndefined() && !book["readStatus"].isObject())) {
+            finish(uiMessage("the_server_returned_invalid_book_details"),false,"progress"); return;
+        }
+        auto primary=variants.first().toObject();
+        for (const auto &value:variants) if (value.toObject()["role"]=="primary") { primary=value.toObject(); break; }
+        auto publish=[this,bookId,readStatus=book["readStatus"],text,context](const QJsonObject &progress) {
+            if (!acceptFileContext(context)) return;
+            const auto percentage=progress["percentage"];
+            if (!percentage.isDouble() || percentage.toDouble()<0 || percentage.toDouble()>100) {
+                finish(uiMessage("the_server_returned_invalid_data"),false,"progress"); return;
+            }
+            auto update=[&](QJsonObject metadata) {
+                metadata["readingProgress"]=percentage; metadata["readStatus"]=readStatus;
+                return metadata;
+            };
+            bool saved=true;
+            for (const auto &fileId:filesByBook.value(bookId)) {
+                auto record=downloads.value(fileId).toObject();
+                record["book"]=update(record["book"].toObject());
+                if (!saveRecord(fileId,record)) saved=false;
+            }
+            for (int i=0;i<items.size();++i) if (items[i].toObject()["id"].toInt()==bookId) items[i]=update(items[i].toObject());
+            if (detailBook["id"].toInt()==bookId) { detailBook=update(detailBook); detailPending=true; }
+            invalidateBook(bookId,false);
+            dismissConflict();
+            finish(saved ? text : uiMessage("details_received_but_not_saved_for_offline_use"),saved,"progress");
+        };
+        // The library percentage belongs to the primary file, even when another format was synced.
+        if (primary["id"].toInt()==id.toInt()) publish(remote);
+        else jsonRequest("/api/v1/books/files/"+QString::number(primary["id"].toInt())+"/progress",{},publish,true,true);
+    },true,true);
+}
+
 void Client::syncBook(const QString &id, int choice) {
     if (busy()) return;
     if (!syncingAll) beginFeedback(detailVisible() ? "book" : "sync", downloads.value(id).toObject()["bookId"].toInt(),id.toInt());
@@ -2483,12 +2762,14 @@ void Client::syncBook(const QString &id, int choice) {
     }
     struct LocalCheck { QByteArray digest; FileStamp stamp; QString local; PositionInfo info; bool supported=true,valid=false; };
     const auto context=fileContext(id,path);
-    fileTask=files.submit(this,[path,position,format=record["format"].toString()](const FileCancellation &cancel) {
+    // The scanner seeds a first download with this placeholder before any reader session.
+    const bool initialPosition=restoringDownload && position=="pbr:/page?page=0";
+    fileTask=files.submit(this,[path,position,initialPosition,format=record["format"].toString()](const FileCancellation &cancel) {
         LocalCheck result; result.stamp=fileStamp(path);
         if (format=="fb2") result.supported=fb2Calibration(cancel).valid && !bookCfi(path,"pbr:/word?page=0").isEmpty();
         if (result.supported && !fileCancelled(cancel)) {
             result.local=bookCfi(path,position);
-            result.valid=(position.isEmpty() || !result.local.isEmpty()) &&
+            result.valid=(position.isEmpty() || initialPosition || !result.local.isEmpty()) &&
                 (result.local.isEmpty() || bookPosition(path,result.local,nullptr,nullptr,nullptr,nullptr,&result.info));
         }
         result.digest=digestFile(path,cancel);
@@ -2562,6 +2843,11 @@ void Client::syncBook(const QString &id, int choice) {
                     if (remote.contains(key) && !remote[key].isNull()) other=true;
                 const bool hasPage=remote.contains("pageNumber") && !remote["pageNumber"].isNull();
                 const bool remoteEmpty=cfi.isEmpty() && percent.toDouble()==0 && !hasPage && !other;
+                // A first download only restores incoming progress; it must never upload local state.
+                if (restoringDownload && remoteEmpty) {
+                    syncingId.clear();
+                    finish(uiMessage("book_downloaded_and_available_offline"),true,"download"); return;
+                }
                 if (cfi.isEmpty() && !remoteEmpty) {
                     finish(uiMessage("the_server_has_progress_without_an_exact_cfi_automatic_sync_is_n_df1162"),false,"progress","position"); return;
                 }
@@ -2576,7 +2862,7 @@ void Client::syncBook(const QString &id, int choice) {
                 };
                 auto acknowledge=[&] {
                     state={{"localBase",local},{"remoteBase",remote}};
-                    if (persist()) { dismissConflict(); finish(uiMessage("progress_synced"),true,"progress"); }
+                    if (persist()) finishProgress(id,remote,uiMessage("progress_synced"));
                 };
                 if (analysis.equal) { acknowledge(); return; }
                 const bool known=state.contains("profile") && state["profile"].toString()==profile &&
@@ -2593,7 +2879,7 @@ void Client::syncBook(const QString &id, int choice) {
                     case SyncDecision::Upload: action=1; break;
                     case SyncDecision::ApplyRemote: action=2; break;
                     case SyncDecision::Unchanged:
-                        if (persist()) finish(uiMessage("progress_unchanged"),true,"progress");
+                        if (persist()) finishProgress(id,remote,uiMessage("progress_unchanged"));
                         return;
                     case SyncDecision::Conflict: break;
                     }
@@ -2661,7 +2947,7 @@ void Client::syncBook(const QString &id, int choice) {
                             finish(error,false,"progress","pending"); return;
                         }
                         state={{"localBase",cfi},{"remoteBase",remote}};
-                        if (persist()) { dismissConflict(); finish(uiMessage("position_saved_open_the_book_from_the_built_in_library"),true,"progress"); }
+                        if (persist()) finishProgress(id,remote,uiMessage("position_saved_open_the_book_from_the_built_in_library"));
                         return;
                     }
                     const double percentage=prepared.percentage;
@@ -2684,7 +2970,7 @@ void Client::syncBook(const QString &id, int choice) {
                             auto record=downloads.value(id).toObject();
                             record["progress"]=QJsonObject{{"localBase",local},{"remoteBase",confirmed},{"profile",profile}};
                             if (!saveRecord(id,record)) { finish(uiMessage("uploaded_but_the_result_could_not_be_saved_check_again"),false,"progress"); return; }
-                            dismissConflict(); finish(uiMessage("progress_sent_to_bookorbit"),true,"progress");
+                            finishProgress(id,confirmed,uiMessage("progress_sent_to_bookorbit"));
                         },true,true);
                     });
                 });

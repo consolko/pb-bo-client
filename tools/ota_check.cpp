@@ -8,6 +8,7 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickWindow>
+#include <QQuickItem>
 #include <QDir>
 #include <QJsonDocument>
 #include <QTemporaryDir>
@@ -22,6 +23,11 @@
 #include <sys/stat.h>
 
 struct UpdateManagerCheck {
+    static void ui(UpdateManager &updater, const QString &phase) {
+        updater.phase=phase; updater.candidateVersion="9.9.9";
+        updater.releaseNotes=QString("Release notes line\n").repeated(100);
+        emit updater.changed();
+    }
     static void ready(UpdateManager &updater, const QJsonObject &manifest) {
         updater.prepared=manifest; updater.phase="ready";
     }
@@ -191,13 +197,81 @@ static void cacheRegressions(Client &client,const QString &root) {
     check(!migratedAgain.automatic(),"migrated preference survives another restart");
 }
 
+static void recoveryMatrix(const QString &root,const QString &current,const QString &next,const QString &old,const QString &newest) {
+    QString error;
+    auto attempt=[&](const QString &base,const QString &package,const QString &target,bool intent=false) {
+        const auto directory=base+"/update/attempt-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
+        check(QDir().mkpath(directory),"create signed recovery matrix attempt");
+        Zip archive(package); const auto bytes=archive.read("release.json",65536);
+        QJsonObject manifest;
+        check(Ota::verifyManifest(bytes,archive.read("release.sig",64),&manifest,&error) &&
+            Ota::stageArchive(package,directory+"/bookorbit.next",manifest["version"].toString(),&manifest,&error) &&
+            Ota::save(directory+"/release.json",bytes,&error) && Ota::save(directory+"/release.sig",archive.read("release.sig",64),&error),
+            "persist independently signed recovery matrix package");
+        if (intent) check(Ota::saveJson(directory+"/install.json",{{"destination",target}},&error),"persist legacy installation intent");
+        return std::make_pair(directory,manifest);
+    };
+    {
+        const auto base=root+"/matrix-versions",target=base+"/bookorbit.app";
+        Client subject(QUrl("https://example.test"),base,nullptr,false);
+        check(Ota::save(target,Zip(current).read("bookorbit.app",Ota::maxClient),&error),"installed current executable fixture");
+        const auto proof=attempt(base,current,target),stale=attempt(base,old,target),lower=attempt(base,next,target),higher=attempt(base,newest,target);
+        const auto incomplete=base+"/update/attempt-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
+        check(QDir().mkpath(incomplete) && Ota::save(incomplete+"/bookorbit.next","unverified executable",&error),"interruption after staging but before signed metadata");
+        UpdateManager manager(&subject,base,target);
+        check(waitUntil([&] { return manager.state()!="recovering"; }) && manager.state()=="ready" &&
+            manager.availableVersion()==higher.second["version"].toString(),"highest verified version wins independently of directory names");
+        check(!QFile::exists(stale.first) && !QFile::exists(incomplete) && !QFile::exists(lower.first) && !QFile::exists(proof.first) && QFile::exists(higher.first+"/bookorbit.next"),
+            "startup removes obsolete, incomplete and duplicate ready packages after confirming the installed application");
+    }
+    {
+        const auto base=root+"/matrix-usb",target=base+"/bookorbit.app";
+        Client subject(QUrl("https://example.test"),base,nullptr,false);
+        check(Ota::save(target,Zip(newest).read("bookorbit.app",Ota::maxClient),&error),"USB installed a newer signed executable");
+        const auto proof=attempt(base,newest,target),obsolete=attempt(base,next,target,true);
+        UpdateManager manager(&subject,base,target);
+        check(waitUntil([&] { return manager.state()!="recovering"; }) && manager.state()=="idle" && !QFile::exists(obsolete.first) && !QFile::exists(proof.first),
+            "a newer confirmed USB installation retires older signed attempts and installation intents");
+    }
+    {
+        const auto base=root+"/matrix-priority",target=base+"/bookorbit.app";
+        Client subject(QUrl("https://example.test"),base,nullptr,false);
+        check(Ota::save(target,Zip(current).read("bookorbit.app",Ota::maxClient),&error),"unconfirmed current installation fixture");
+        const auto future=attempt(base,newest,target),installed=attempt(base,current,target,true);
+        UpdateManager manager(&subject,base,target);
+        check(waitUntil([&] { return manager.state()!="recovering"; }) && manager.state()=="unconfirmed" &&
+            manager.availableVersion()==installed.second["version"].toString() && QFile::exists(future.first+"/bookorbit.next"),
+            "confirmation takes priority over a newer ready package and retains both recovery copies");
+    }
+    for (bool byteLimit:{false,true}) {
+        const auto base=root+(byteLimit ? "/matrix-bytes" : "/matrix-count"),target=base+"/bookorbit.app";
+        Client subject(QUrl("https://example.test"),base,nullptr,false);
+        check(Ota::save(target,"unknown installed executable",&error),"unverifiable destination fixture");
+        QStringList retained;
+        for (int i=0;i<(byteLimit ? 1 : 2);++i) {
+            const auto directory=base+"/update/attempt-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
+            check(QDir().mkpath(directory) && Ota::saveJson(directory+"/install.json",{{"destination",target}},&error) &&
+                Ota::save(directory+"/unknown.txt","keep",&error),"preserve ambiguous installation and unknown content");
+            QFile staged(directory+"/bookorbit.next"); check(staged.open(QIODevice::WriteOnly) && staged.resize(byteLimit ? 33*1024*1024 : 52),"bounded sparse recovery fixture");
+            retained.append(directory);
+        }
+        UpdateManager manager(&subject,base,target);
+        check(waitUntil([&] { return manager.state()!="recovering"; }),"protected recovery inventory completes");
+        UpdateManagerCheck::ui(manager,"available"); manager.download();
+        check(waitUntil([&] { return manager.state()!="verifying"; }) && manager.state()=="error" && manager.message().contains("blocked"),
+            "count and byte limits block new downloads before creating another attempt");
+        check(QDir(base+"/update").entryList({"attempt-*"},QDir::Dirs|QDir::NoDotAndDotDot).size()==retained.size(),"admission limit never deletes a protected attempt");
+        for (const auto &directory:retained) check(Ota::read(directory+"/unknown.txt",100)=="keep" && QFile::exists(directory+"/bookorbit.next"),"ambiguous recovery and unknown files remain intact");
+    }
+}
+
 int main(int argc,char **argv) {
     if(qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) qputenv("QT_QPA_PLATFORM","offscreen");
     QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
     QGuiApplication app(argc,argv); QTemporaryDir temp; check(temp.isValid(),"temporary root");
     const auto root=temp.path(); QString error;
     // Optionally validate a release artifact using the compiled production trust key.
-    if(argc==2) {
+    if(argc>=2) {
         const QString path=QString::fromLocal8Bit(argv[1]);
         QJsonObject release;
         check(Ota::stageArchive(path,root+"/release.next",Ota::version(),&release,&error),"signed release stages with the compiled key");
@@ -359,13 +433,13 @@ int main(int argc,char **argv) {
         check(waitUntil([&] { return drained; }) && QFile::exists(directory+"/bookorbit.next"),"intent failure remains non-destructive after manager destruction");
     }
 #endif
-    if(argc==2) {
+    if(argc>=2) {
         const auto directory=root+"/update/attempt-"+QUuid::createUuid().toString(QUuid::WithoutBraces);
         check(QDir().mkpath(directory),"recovery attempt directory");
         QJsonObject release; Zip archive(QString::fromLocal8Bit(argv[1]));
         check(Ota::stageArchive(QString::fromLocal8Bit(argv[1]),directory+"/bookorbit.next",Ota::version(),&release,&error) &&
               Ota::save(directory+"/release.json",archive.read("release.json",65536),&error) &&
-              Ota::save(directory+"/release.sig",archive.read("release.sig",64),&error),"persist production-signed recovery metadata");
+              Ota::save(directory+"/release.sig",archive.read("release.sig",64),&error),"persist test-signed recovery metadata");
 #ifdef BOOKORBIT_FSYNC_CHECK
         {
             UpdateManager manager(&client,root,target);
@@ -388,6 +462,7 @@ int main(int argc,char **argv) {
             check(QDir().mkpath(retry) && Ota::stageArchive(QString::fromLocal8Bit(argv[1]),retry+"/bookorbit.next",Ota::version(),&release,&error) &&
                   Ota::save(retry+"/release.json",archive.read("release.json",65536),&error) && Ota::save(retry+"/release.sig",archive.read("release.sig",64),&error),
                   "signed metadata cleanup fixture");
+            check(Ota::save(target,"old version",&error),"prepare a destination that still needs replacement");
             if(QString(failure)=="unknown") check(Ota::save(retry+"/unknown.txt","keep",&error),"unknown content prevents directory cleanup");
             else if(QString(failure)=="directory") rmdirFailurePath=retry;
             else unlinkFailurePath=retry+"/"+failure;
@@ -427,7 +502,7 @@ int main(int argc,char **argv) {
         }
 #endif
     }
-    const auto package=argc==2 ? QString::fromLocal8Bit(argv[1]) : root+"/valid.zip";
+    const auto package=argc>=2 ? QString::fromLocal8Bit(argv[1]) : root+"/valid.zip";
     const auto attempt=[&](const QString &name) {
         const auto directory=root+"/update/attempt-"+name;
         check(QDir().mkpath(directory) && QFile::copy(package,directory+"/archive.zip"),"create isolated verification attempt");
@@ -448,7 +523,7 @@ int main(int argc,char **argv) {
         check(updater.state()=="verifying" && !QFile::exists(old+"/bookorbit.next") && QFile::exists(fresh+"/archive.zip"),
               "cancelled verification cannot mark a new candidate ready or remove its files");
         next.open(); check(waitUntil([&] { return updater.state()!="verifying"; }),"fresh OTA verification completes");
-        check(updater.state()==(argc==2 ? "ready" : "error"),"only the current verified signed package becomes ready");
+        check(updater.state()==(argc>=2 ? "ready" : "error"),"only the current verified signed package becomes ready");
     }
     {
         auto &executor=ClientWorkerCheck::executor(client);
@@ -461,6 +536,7 @@ int main(int argc,char **argv) {
         gate.open(); check(waitUntil([&] { return drained; }) && updater.state()=="error" && !QFile::exists(expired+"/bookorbit.next"),
                            "late verification after timeout never publishes ready and removes its own files");
     }
+    if (argc>=5) recoveryMatrix(root,QString::fromLocal8Bit(argv[1]),QString::fromLocal8Bit(argv[2]),QString::fromLocal8Bit(argv[3]),QString::fromLocal8Bit(argv[4]));
     cacheRegressions(client,root);
     check(!updateDeviceError().isEmpty(),"real desktop backend disallows PocketBook installation");
     check(QDir().mkpath(root+"/update") && Ota::save(root+"/update/bookorbit.next",executable,&error),"verified PocketBook executable staged for desktop guard");
@@ -480,6 +556,26 @@ int main(int argc,char **argv) {
         auto *window=engine.rootObjects().first(); window->setProperty("settings",true);
         auto *button=window->findChild<QObject*>("installUpdateButton");
         check(button && !button->property("visible").toBool(),"install action hidden for ready package on desktop");
+        UpdateManagerCheck::ui(updater,"available");
+        QEventLoop availableLayout; QTimer::singleShot(100,&availableLayout,&QEventLoop::quit); availableLayout.exec();
+        check(QMetaObject::invokeMethod(window,"showUpdates"),"open update actions above long release notes");
+        QEventLoop layout; QTimer::singleShot(100,&layout,&QEventLoop::quit); layout.exec();
+        auto *checkButton=window->findChild<QQuickItem*>("checkUpdateButton");
+        auto *downloadButton=window->findChild<QQuickItem*>("downloadUpdateButton");
+        auto *notes=window->findChild<QQuickItem*>("updateNotes");
+        check(checkButton && downloadButton && notes && downloadButton->isVisible(),"download action appears for available update");
+        check(checkButton->y()+checkButton->height() <= downloadButton->y() && downloadButton->y()+downloadButton->height() <= notes->y(),
+            "download action follows update check above long notes");
+        check(downloadButton->mapToScene(QPointF()).y() >= 0 && downloadButton->mapToScene(QPointF(0,downloadButton->height())).y() < 800,
+            "update notification scrolls download action into viewport");
+        UpdateManagerCheck::ui(updater,"ready");
+        button->setProperty("visible",true);
+        QEventLoop readyLayout; QTimer::singleShot(100,&readyLayout,&QEventLoop::quit); readyLayout.exec();
+        auto *installButton=qobject_cast<QQuickItem*>(button);
+        check(checkButton->y()+checkButton->height() <= installButton->y() && installButton->y()+installButton->height() <= notes->y(),
+            "install action follows update check above release notes");
+        check(checkButton->mapToScene(QPointF()).y() >= 0 && checkButton->mapToScene(QPointF(0,checkButton->height())).y() < 800,
+            "ready state scrolls to update controls instead of the end of release notes");
     }
     check(!QFile::exists(client.diagnosticLogPath()),"diagnostics off writes no log");
     check(client.setDiagnosticLogging(true),"enable diagnostics");

@@ -204,6 +204,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, {"items": books[page*size:(page+1)*size], "total": len(books), "page": page, "size": size})
         detail = re.fullmatch(r"/api/v1/books/(\d+)", path)
         if detail and self.command == "GET":
+            if mode == "detail_error":
+                return self.send(503, {})
             books = [book for book in library_books() if book["id"] == int(detail[1])]
             if not books:
                 return self.send(404, {})
@@ -217,7 +219,7 @@ class Handler(BaseHTTPRequestHandler):
             # The basic catalog exposes EPUB 102, whereas the richer fixture
             # has PDF 204. Keep detail metadata consistent for basic repair tests.
             if book["id"] == 2 and mode != "features":
-                book["files"] = list(book["files"]) + list(BOOKS[1]["files"])
+                book["files"] = list(BOOKS[1]["files"]) + [dict(entry, role="content") for entry in book["files"]]
             if mode == "long_ui":
                 book.update(title="Очень длинное название книги "*20, authors=[{"name":"Автор с длинным именем "+str(i)} for i in range(8)],
                             genres=["Жанр "+str(i) for i in range(50)], publisher="Длинное издательство "*20)
@@ -226,6 +228,8 @@ class Handler(BaseHTTPRequestHandler):
                 raw = changed_epub() if mode == "audit_new_file" else ordinary_zip()
                 book["files"] = [dict(entry, sizeBytes=len(raw)) if entry["id"] == 101 else entry for entry in book["files"]]
             book.pop("readingProgress", None)  # Real detail API has no book-level percentage.
+            if any(str(entry["id"]) in self.server.progress for entry in book["files"]):
+                book["readStatus"] = {"status": "reading"}
             if mode == "bad_files":
                 book["files"] = [{"id": 201, "format": "../pdf", "role": "primary", "sizeBytes": 1}]
             return self.send(200, book)
@@ -255,7 +259,7 @@ class Handler(BaseHTTPRequestHandler):
                     if book["id"] == 1:
                         book.pop("coverVersion", None)
             return self.send(200, {"items": items[page*size:(page+1)*size], "total": len(items), "page": page, "size": size})
-        match = re.fullmatch(r"/api/v1/books/files/(10[1-3]|202)/(download|progress)", path)
+        match = re.fullmatch(r"/api/v1/books/files/(10[1-3]|202|203)/(download|progress)", path)
         if match and match[2] == "progress":
             file_id = match[1]
             if mode == "slow_progress" and self.command == "GET": time.sleep(0.4)
@@ -273,8 +277,14 @@ class Handler(BaseHTTPRequestHandler):
             if mode == "progress_metadata":
                 self.server.progress[file_id]["updatedAt"] = "2030-01-01T00:00:00Z"
                 fault.write_text("")
+            if mode == "progress_percentage_zero":
+                self.server.progress[file_id]["percentage"] = 0
+                fault.write_text("")
             if mode == "fb2_remote" and file_id == "202":
                 self.server.progress[file_id] = {"cfi": "epubcfi(/6/2!/4/2/2/2/1:0)", "pageNumber": None, "percentage": 0}
+                self.server.progress["101"] = {"cfi": "epubcfi(/6/2!/4/62/1)", "pageNumber": None, "percentage": 63}
+            if mode == "fb2_restore" and file_id == "202":
+                self.server.progress[file_id] = {"cfi": "epubcfi(/6/2!/4/2/4/1:4)", "pageNumber": None, "percentage": 45}
             if mode == "progress_range":
                 self.server.progress[file_id] = {"cfi": "epubcfi(/6/2!/4,/42/1:0,/48/1:20)", "pageNumber": None, "percentage": 25}
                 fault.write_text("")

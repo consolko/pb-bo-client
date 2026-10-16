@@ -2,6 +2,16 @@
 #include "file_executor.h"
 #include <QString>
 #include <QByteArray>
+class QSaveFile;
+
+enum class FileCommitState { FailedBeforeReplace, ReplacedUnconfirmed, Complete };
+struct FileCommitResult { FileCommitState state; QString detail; };
+FileCommitResult commitFile(QSaveFile &file);
+FileCommitResult saveDurable(const QString &path,const QByteArray &data);
+FileCommitResult moveDurable(const QString &source,const QString &destination);
+bool syncDirectory(const QString &path,QString *error=nullptr);
+bool confirmFile(const QString &path,QString *error=nullptr);
+bool makeDurableDirectory(const QString &path,QString *error=nullptr);
 
 struct FileStamp {
     quint64 device=0,inode=0;

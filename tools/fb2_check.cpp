@@ -66,8 +66,27 @@ int main(int argc,char **argv) {
         write(path,prefix+"<body><section><p>Text</p>"+extra+"</section></body></FictionBook>");
         require(bookCfi(path,"pbr:/word?page=0").isEmpty(),"uncalibrated structure blocked");
     }
-    write(path,prefix+"<body><section><p>"+QByteArray(60000,'x')+"</p></section></body></FictionBook>");
-    require(bookCfi(path,"pbr:/word?page=0").isEmpty(),"long native section blocked");
+    write(path,prefix+"<description><title-info><coverpage><image/></coverpage></title-info></description>"+body+"</FictionBook>");
+    require(bookCfi(path,cases[4].first)==cases[4].second,"metadata cover does not shift native text or Foliate CFI");
+    // U634 starts the next word page before the paragraph reaching 2048 UTF-16 units.
+    QByteArray longBody="<body><section><p>"+QByteArray(1024,'a')+"</p><empty-line/><p>"+QByteArray(1023,'b')+"</p>";
+    longBody+="<p>c</p><p>"+QByteArray(2047,'d')+"</p><p>e</p></section><section><p>Tail</p></section></body>";
+    write(path,prefix+longBody+"</FictionBook>");
+    for (const auto &[native,cfi]:QList<QPair<QString,QString>>{
+        {"pbr:/word?page=0&offs=1026","epubcfi(/6/2!/4/2/6/1:0)"},
+        {"pbr:/word?page=1&offs=0","epubcfi(/6/2!/4/2/8/1:0)"},
+        {"pbr:/word?page=2&offs=2046","epubcfi(/6/2!/4/2/10/1:2046)"},
+        {"pbr:/word?page=3&offs=0","epubcfi(/6/2!/4/2/12/1:0)"},
+        {"pbr:/word?page=4&offs=0","epubcfi(/6/4!/4/2/2/1:0)"}}) {
+        require(bookCfi(path,native)==cfi,"word-page boundary matches native calibration");
+        QString back; require(bookPosition(path,cfi,nullptr,nullptr,nullptr,&back) && back==native,"word-page boundary restores exactly");
+    }
+    QByteArray paragraphs;
+    for (int i=0;i<300;++i) paragraphs+="<p>"+QByteArray(1000,'x')+"</p>";
+    write(path,prefix+"<body><section>"+paragraphs+"</section></body></FictionBook>");
+    require(bookCfi(path,"pbr:/word?page=149&offs=1002")=="epubcfi(/6/2!/4/2/600/1:1)","long prose section spans native word pages");
+    write(path,prefix+"<body><section><p>"+QByteArray(60001,'x')+"</p></section></body></FictionBook>");
+    require(bookCfi(path,"pbr:/word?page=0").isEmpty(),"uncalibrated oversized paragraph blocked");
     write(path,"<!DOCTYPE FictionBook [<!ENTITY x SYSTEM 'file:///etc/passwd'>]>"+prefix+body+"</FictionBook>");
     require(bookCfi(path,"pbr:/word?page=0").isEmpty(),"entity declaration blocked");
     std::puts("PASS: FB2 coordinates, ranges, UTF-16, notes and unsupported structures");

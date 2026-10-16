@@ -437,8 +437,7 @@ namespace {
 struct FbParagraph { QDomElement node; int section, page; qint64 offset; };
 struct FbBook { QList<QDomDocument> sections; QList<FbParagraph> paragraphs; qint64 total=0; };
 
-// ponytail: PB634 prose only. Images, tables, poetry and long native sections
-// need separate native-model calibration before their positions can be written.
+// shortcut: PB634 prose only; body images, tables and poetry need native-model calibration.
 bool fbConvert(const QDomElement &source, QDomElement parent, FbBook &book,
                int section, int page, qint64 &offset, bool top=false, bool inlineText=false) {
     const QString name=tag(source);
@@ -476,8 +475,8 @@ bool fbConvert(const QDomElement &source, QDomElement parent, FbBook &book,
     if (paragraph) {
         offset+=textSize(node)+1;
         book.total+=textSize(node)+1;
-        // Below the firmware's 63000 UTF-16 split threshold, including delimiters.
-        if (offset>60000) return false;
+        // shortcut: keep oversized paragraphs blocked until native paragraph splitting is calibrated.
+        if (textSize(node)>60000) return false;
     }
     return true;
 }
@@ -497,8 +496,7 @@ bool loadFb(const QString &path, FbBook &book) {
     if (!file.open(QIODevice::ReadOnly) || file.size()>16*1024*1024 || !xml(file.readAll(),source)) return false;
     const auto root=source.documentElement();
     if (tag(root)!="FictionBook" || root.tagName()!= "FictionBook" ||
-        root.attribute("xmlns")!="http://www.gribuser.ru/xml/fictionbook/2.0" ||
-        !root.elementsByTagName("image").isEmpty()) return false;
+        root.attribute("xmlns")!="http://www.gribuser.ru/xml/fictionbook/2.0") return false;
     int bodyIndex=0,page=-1; qint64 offset=0;
     for (auto body=root.firstChildElement();!body.isNull();body=body.nextSiblingElement()) {
         if (tag(body)!="body") continue;
@@ -522,6 +520,21 @@ bool loadFb(const QString &path, FbBook &book) {
         }
         if (!started) return false;
         ++bodyIndex;
+    }
+    // U634 word pages split before the paragraph that reaches 2048 text units.
+    // Paragraph delimiters affect offsets, but do not count toward the split.
+    int storage=-1,nativePage=-1;
+    qint64 pageText=0,pageStart=0;
+    for (auto &paragraph:book.paragraphs) {
+        const auto length=textSize(paragraph.node);
+        if (paragraph.page!=storage) {
+            storage=paragraph.page; ++nativePage; pageText=0; pageStart=paragraph.offset;
+        } else if (pageText+length>=2048) {
+            ++nativePage; pageText=0; pageStart=paragraph.offset;
+        }
+        paragraph.page=nativePage;
+        paragraph.offset-=pageStart;
+        pageText+=length;
     }
     return bodyIndex>0 && book.total>0;
 }

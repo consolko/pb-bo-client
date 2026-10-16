@@ -25,6 +25,9 @@ inline QString interfaceLanguage(QString systemLanguage, const QString &preferen
 
 inline const QMap<QString, const char *> &messageSources() {
     static const QMap<QString, const char *> sources{
+        {"book_downloaded_progress_result", QT_TRANSLATE_NOOP("BookOrbit", "Book downloaded. %1")},
+        {"book_registration_pending_sync_later", QT_TRANSLATE_NOOP("BookOrbit", "The library has not registered the book yet. Sync its position after registration.")},
+        {"waiting_for_book_registration", QT_TRANSLATE_NOOP("BookOrbit", "Waiting for the library to register the book…")},
         {"1_files_2_matching_3_different_4_errors_5_unchecked_6_see_book_d_4bf1b3", QT_TRANSLATE_NOOP("BookOrbit", "%1. Files: %2; matching: %3; different: %4; errors: %5; unchecked: %6. See book details for results.")},
         {"1_files_completed_2_of_3_books_synced_4_of_5_needs_attention_6_waiting_7", QT_TRANSLATE_NOOP("BookOrbit", "%1. Files completed: %2 of %3. Books synced: %4 of %5; needs attention: %6; waiting: %7.")},
         {"a_verified_update_was_retained_retry_installation_when_ready", QT_TRANSLATE_NOOP("BookOrbit", "A verified update was retained. Retry installation when ready.")},
@@ -190,8 +193,9 @@ inline const QMap<QString, const char *> &messageSources() {
         {"the_update_response_is_too_large", QT_TRANSLATE_NOOP("BookOrbit", "The update response is too large.")},
         {"the_update_server_asked_to_wait_try_again_later", QT_TRANSLATE_NOOP("BookOrbit", "The update server asked to wait. Try again later.")},
         {"the_update_server_returned_an_unsafe_download_address", QT_TRANSLATE_NOOP("BookOrbit", "The update server returned an unsafe download address.")},
-        {"this_fb2_structure_is_not_supported_for_sync_yet_images_tables_p_e1f2b9", QT_TRANSLATE_NOOP("BookOrbit", "This FB2 structure is not supported for sync yet. Images, tables, poetry and long sections require additional validation. You can still read the original file.")},
+        {"this_fb2_structure_is_not_supported_for_sync_yet_images_tables_p_e1f2b9", QT_TRANSLATE_NOOP("BookOrbit", "This FB2 structure is not supported for sync yet. Body images, tables, poetry and oversized paragraphs require additional validation. You can still read the original file.")},
         {"this_file_is_already_linked_to_another_book_refresh_the_details", QT_TRANSLATE_NOOP("BookOrbit", "This file is already linked to another book. Refresh the details.")},
+        {"update_recovery_files_need_attention", QT_TRANSLATE_NOOP("BookOrbit", "Update recovery files need attention. New downloads are blocked to preserve them.")},
         {"update_download_cancelled", QT_TRANSLATE_NOOP("BookOrbit", "Update download cancelled.")},
         {"update_installed_but_temporary_files_could_not_be_removed_retry_cleanup", QT_TRANSLATE_NOOP("BookOrbit", "Update installed, but temporary files could not be removed. Retry cleanup.")},
         {"update_installed_open_bookorbit_again_from_the_applications_menu", QT_TRANSLATE_NOOP("BookOrbit", "Update installed. Open BookOrbit again from the applications menu.")},

@@ -53,6 +53,7 @@ private:
     bool allowed(const QUrl &url) const;
     void fetch(QUrl url,qint64 limit,std::function<void(QByteArray,int,QString)> done,int redirects=5,bool conditional=true);
     void downloadZip(QUrl url,int redirects=5);
+    void beginDownload();
     void verifyArchive();
     void discardAttempt();
     void recoverAttempts();

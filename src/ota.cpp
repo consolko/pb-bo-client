@@ -62,18 +62,12 @@ bool isRunningExecutable(const QString &path) {
 #endif
 }
 static InstallResult commit(QSaveFile &file) {
-    auto failed=[](const QString &detail) { return InstallResult{InstallState::FailedBeforeReplace,detail}; };
-    if(!file.flush()) return failed("flush: "+file.errorString());
-    // QSaveFile::commit() ignores syncToDisk() failures; check before the rename.
-    if(::fsync(file.handle())!=0) return failed("sync_file: "+QString::fromLocal8Bit(std::strerror(errno)));
-    const int dir=::open(QFile::encodeName(QFileInfo(file.fileName()).absolutePath()),O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-    if(dir<0) return failed("open_directory: "+QString::fromLocal8Bit(std::strerror(errno)));
-    if(!file.commit()) { ::close(dir); return failed("commit: "+file.errorString()); }
-    const bool ok=::fsync(dir)==0;
-    const QString detail=ok ? QString{} : "sync_directory: "+QString::fromLocal8Bit(std::strerror(errno));
-    ::close(dir);
-    return {ok ? InstallState::Complete : InstallState::ReplacedUnconfirmed,detail};
+    const auto result=commitFile(file);
+    const auto state=result.state==FileCommitState::Complete ? InstallState::Complete :
+        result.state==FileCommitState::ReplacedUnconfirmed ? InstallState::ReplacedUnconfirmed : InstallState::FailedBeforeReplace;
+    return {state,result.detail};
 }
+
 bool save(const QString &path, const QByteArray &data, QString *error) {
     const QFileInfo info(path);
     if (!safeDirectory(info.absolutePath()) || info.isSymLink()) return fail(error,"Unsafe update path");

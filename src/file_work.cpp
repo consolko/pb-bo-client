@@ -5,6 +5,85 @@
 #include <QCryptographicHash>
 #include <QXmlStreamReader>
 #include <sys/stat.h>
+#include <QDir>
+#include <QSaveFile>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
+
+static bool ioFailure(QString *error,const QString &operation) {
+    if (error) *error=operation+": "+QString::fromLocal8Bit(std::strerror(errno));
+    return false;
+}
+bool syncDirectory(const QString &path,QString *error) {
+    const QFileInfo info(path);
+    if (!info.isDir() || info.isSymLink() || info.canonicalFilePath()!=info.absoluteFilePath()) {
+        if (error) *error="open_directory: unsafe directory";
+        return false;
+    }
+    const int fd=::open(QFile::encodeName(path),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+    if (fd<0) return ioFailure(error,"open_directory");
+    const bool ok=::fsync(fd)==0;
+    if (!ok) ioFailure(error,"sync_directory");
+    ::close(fd); return ok;
+}
+FileCommitResult commitFile(QSaveFile &file) {
+    auto failed=[](const QString &detail) { return FileCommitResult{FileCommitState::FailedBeforeReplace,detail}; };
+    if (!file.flush()) return failed("flush: "+file.errorString());
+    if (::fsync(file.handle())!=0) return failed("sync_file: "+QString::fromLocal8Bit(std::strerror(errno)));
+    const auto parent=QFileInfo(file.fileName()).absolutePath();
+    const int dir=::open(QFile::encodeName(parent),O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+    if (dir<0) return failed("open_directory: "+QString::fromLocal8Bit(std::strerror(errno)));
+    if (!file.commit()) { ::close(dir); return failed("commit: "+file.errorString()); }
+    const bool ok=::fsync(dir)==0;
+    const QString detail=ok ? QString{} : "sync_directory: "+QString::fromLocal8Bit(std::strerror(errno));
+    ::close(dir);
+    return {ok ? FileCommitState::Complete : FileCommitState::ReplacedUnconfirmed,detail};
+}
+FileCommitResult saveDurable(const QString &path,const QByteArray &data) {
+    const QFileInfo info(path),parent(info.absolutePath());
+    if (info.isSymLink() || !parent.isDir() || parent.canonicalFilePath()!=parent.absoluteFilePath())
+        return {FileCommitState::FailedBeforeReplace,"save: unsafe path"};
+    QSaveFile file(path); file.setDirectWriteFallback(false);
+    if (!file.open(QIODevice::WriteOnly) || file.write(data)!=data.size())
+        return {FileCommitState::FailedBeforeReplace,"write: "+file.errorString()};
+    return commitFile(file);
+}
+bool confirmFile(const QString &path,QString *error) {
+    const auto before=fileStamp(path);
+    if (!before.valid) { if (error) *error="sync_file: unsafe file"; return false; }
+    const int fd=::open(QFile::encodeName(path),O_RDONLY|O_CLOEXEC|O_NOFOLLOW);
+    if (fd<0) return ioFailure(error,"open_file");
+    const bool ok=::fsync(fd)==0;
+    if (!ok) ioFailure(error,"sync_file");
+    ::close(fd);
+    return ok && fileStamp(path)==before && syncDirectory(QFileInfo(path).absolutePath(),error);
+}
+FileCommitResult moveDurable(const QString &source,const QString &destination) {
+    if (!fileStamp(source).valid || QFileInfo::exists(destination) || QFileInfo(destination).isSymLink())
+        return {FileCommitState::FailedBeforeReplace,"rename: unsafe source or existing destination"};
+    if (::rename(QFile::encodeName(source),QFile::encodeName(destination))!=0)
+        return {FileCommitState::FailedBeforeReplace,"rename: "+QString::fromLocal8Bit(std::strerror(errno))};
+    QString error;
+    const bool ok=syncDirectory(QFileInfo(destination).absolutePath(),&error) && syncDirectory(QFileInfo(source).absolutePath(),&error);
+    return {ok ? FileCommitState::Complete : FileCommitState::ReplacedUnconfirmed,error};
+}
+bool makeDurableDirectory(const QString &path,QString *error) {
+    if (!QDir().mkpath(path)) { if (error) *error="create_directory: failed"; return false; }
+    // Account setup may have created ancestors before this transaction started.
+    struct stat device{}; if (::stat(QFile::encodeName(path),&device)!=0) return ioFailure(error,"stat_directory");
+    QString directory=path;
+    while (true) {
+        if (!syncDirectory(directory,error)) return false;
+        const auto parent=QFileInfo(directory).absolutePath(); struct stat next{};
+        if (parent==directory) break;
+        if (::stat(QFile::encodeName(parent),&next)!=0) return ioFailure(error,"stat_directory");
+        if (next.st_dev!=device.st_dev) break;
+        directory=parent;
+    }
+    return true;
+}
 
 FileStamp fileStamp(const QString &path) {
     const QFileInfo info(path); struct stat state{};

@@ -1,4 +1,4 @@
-// VM-only: real Client + real firmware adapter, synthetic server/account/EPUB.
+// VM-only: real Client + real firmware adapter, synthetic server/account/books.
 #include "client.h"
 #include "device.h"
 #include "progress.h"
@@ -39,9 +39,30 @@ int main(int argc,char **argv) {
     require(russian.load(":/translations/bookorbit_ru.qm"), "Russian translation catalog loaded");
     app.installTranslator(&russian);
     QLocale::setDefault(QLocale("ru"));
-    require(argc==3 || (argc==4 && (QString::fromLocal8Bit(argv[3])=="--ui" || QString::fromLocal8Bit(argv[3])=="--history-check")),"isolated directory and fault file supplied");
+    require(argc==3 || (argc==4 && (QString::fromLocal8Bit(argv[3])=="--ui" || QString::fromLocal8Bit(argv[3])=="--history-check" || QString::fromLocal8Bit(argv[3])=="--fb2-restore")),"isolated directory and fault file supplied");
     require(!screen.isEmpty(),"native adapter initialized");
     Client c(QUrl("http://host.containers.internal:8766"),QString::fromLocal8Bit(argv[1]));
+    if (argc==4 && QString::fromLocal8Bit(argv[3])=="--fb2-restore") {
+        QFile fault(QString::fromLocal8Bit(argv[2]));
+        auto mode=[&](const QByteArray &value) {
+            require(fault.open(QIODevice::WriteOnly) && fault.write(value)==value.size(),"set synthetic server mode"); fault.close();
+        };
+        mode("features");
+        require(wait(c,[&] { c.login(c.server(),"demo","demo"); }),"synthetic FB2 login");
+        const QString folder="/mnt/ext1/books/BookOrbit/"+QFileInfo(QString::fromLocal8Bit(argv[1])).fileName();
+        require(QDir().mkpath(folder) && c.setDownloadDirectory(folder),"isolated FB2 folder");
+        require(wait(c,[&] { c.showDetail(1); }),"load synthetic FB2 variant");
+        c.selectFile(202); mode("fb2_restore");
+        require(wait(c,[&] { c.downloadSelected(); }),"download FB2 and complete automatic restoration");
+        const QString path=c.localFile(0); QString position;
+        require(readerBookIndexed(path),"scanner registered downloaded FB2");
+        require(readerPosition(path,&position),"read restored native FB2 position");
+        std::fprintf(stderr,"FB2 native=%s status=%s\n",qPrintable(position),qPrintable(c.status()));
+        require(bookCfi(path,position)=="epubcfi(/6/2!/4/2/4/1:4)","first download restores exact server CFI through native setter");
+        require(readerFileState(path)==ReaderFileState::Closed,"restoration does not open the reader");
+        require(c.syncBooks().first().toMap()["state"]=="synced","restoration persists synchronized state");
+        return 0;
+    }
     if (argc==4 && QString::fromLocal8Bit(argv[3])=="--history-check") {
         c.showDownloaded(true); c.refreshRecents(); require(waitForRecents(c),"native history refresh completes");
         require(c.historyAvailable() && c.recentBook()["fileId"].toInt()==101,"stock-library open appears in the account recent snapshot after restart");
@@ -91,7 +112,11 @@ int main(int argc,char **argv) {
     QString before;
     require(readerPosition(path,&before) && !nativeCfi(before).isEmpty(),"read saved stock-reader CFI");
     UiMessage error;
-    require(saveReaderPosition(path,before,prepareReaderPosition(path,"epubcfi(/6/2!/4/122/1)"),readerProfile(),&error),"prepare distinct native paragraph 060");
+    const auto prepared=prepareReaderPosition(path,"epubcfi(/6/2!/4/122/1)");
+    const bool applied=saveReaderPosition(path,before,prepared,readerProfile(),&error);
+    if (!applied) std::fprintf(stderr,"Native preparation failed: %s; coordinate=%d estimate=%d framework=%d file=%d reader=%d\n",
+        qPrintable(error.code),prepared.coordinate,prepared.estimate,prepared.framework.valid,prepared.file.valid,int(readerFileState(path)));
+    require(applied,"prepare distinct native paragraph 060");
     require(readerPosition(path,&before) && nativeCfi(before)=="epubcfi(/6/2!/4/122/1)","confirm distinct initial CFI");
     require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }),"real saved reader position uploaded to fixture");
     QFile fault(QString::fromLocal8Bit(argv[2]));

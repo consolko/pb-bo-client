@@ -24,6 +24,49 @@
 #include <cstdio>
 #include <cstdlib>
 
+#ifdef BOOKORBIT_STORAGE_CHECK
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
+enum class StorageFailure { None,JournalFile,JournalDirectory,BookFile,Rename,BookDirectory,RecordFile,RecordDirectory,OldUnlink,JournalUnlink };
+static StorageFailure storageFailure=StorageFailure::None;
+static QString storageScope,storageOld;
+static std::atomic<int> storageFaults{0};
+extern "C" int __real_fsync(int fd);
+extern "C" int __wrap_fsync(int fd) {
+    const auto path=QFileInfo("/proc/self/fd/"+QString::number(fd)).symLinkTarget();
+    struct stat info{}; if (::fstat(fd,&info)!=0) return -1;
+    const bool directory=S_ISDIR(info.st_mode);
+    const bool journalExists=!QDir(storageScope+"/transfers").entryList({"*.json"}).isEmpty();
+    bool fail=(!directory && storageFailure==StorageFailure::JournalFile && path.startsWith(storageScope+"/transfers/")) ||
+        (directory && storageFailure==StorageFailure::JournalDirectory && path==storageScope+"/transfers" && journalExists) ||
+        (!directory && storageFailure==StorageFailure::BookFile && QFileInfo(path).absolutePath()==storageScope) ||
+        (!directory && storageFailure==StorageFailure::RecordFile && path.startsWith(storageScope+"/records/"));
+    if (directory && storageFailure==StorageFailure::BookDirectory && path==storageScope &&
+        QDir(storageScope).entryList({"101-*.epub"}).size()>=2) fail=true;
+    if (directory && storageFailure==StorageFailure::RecordDirectory && path==storageScope+"/records") {
+        QFile record(storageScope+"/records/101.json");
+        if (record.open(QIODevice::ReadOnly)) fail=QJsonDocument::fromJson(record.readAll()).object()["filename"].toString()!=QFileInfo(storageOld).fileName();
+    }
+    if (fail) { ++storageFaults; errno=EIO; return -1; }
+    return __real_fsync(fd);
+}
+extern "C" int __real_rename(const char *source,const char *destination);
+extern "C" int __wrap_rename(const char *source,const char *destination) {
+    if (storageFailure==StorageFailure::Rename && QFile::decodeName(source).endsWith(".part")) { ++storageFaults; errno=EIO; return -1; }
+    return __real_rename(source,destination);
+}
+extern "C" int __real_unlink(const char *path);
+extern "C" int __wrap_unlink(const char *path) {
+    const auto name=QFile::decodeName(path);
+    if ((storageFailure==StorageFailure::OldUnlink && name==storageOld) ||
+        (storageFailure==StorageFailure::JournalUnlink && name.startsWith(storageScope+"/transfers/"))) {
+        ++storageFaults; errno=EACCES; return -1;
+    }
+    return __real_unlink(path);
+}
+#endif
+
 QString position;
 QString profile="default";
 bool indexed=true;
@@ -73,6 +116,57 @@ bool until(const std::function<bool()> &predicate) {
 }
 int posts(const QString &root) {
     return QJsonDocument::fromJson(bytes(root+"/requests.json")).object()["POST /api/v1/books/files/101/progress"].toInt();
+}
+
+void storageFailureChecks(const QUrl &endpoint,const QString &root,const QString &fault) {
+#ifdef BOOKORBIT_STORAGE_CHECK
+    int number=0;
+    for (const auto failure:{StorageFailure::JournalFile,StorageFailure::JournalDirectory,StorageFailure::BookFile,
+        StorageFailure::Rename,StorageFailure::BookDirectory,StorageFailure::RecordFile,StorageFailure::RecordDirectory,
+        StorageFailure::OldUnlink,StorageFailure::JournalUnlink}) {
+        const auto data=root+"/storage-failure-"+QString::number(++number);
+        Client client(endpoint,data,nullptr,false); mode(fault,"");
+        require(wait(client,[&] { client.login(endpoint.toString(),"demo","demo"); }),"login for isolated storage failure");
+        wait(client,[&] { client.download(0); });
+        require(waitForRecents(client) && waitForMaintenance(client),"initial download maintenance settles");
+        client.showDownloaded(true); storageOld=client.localFile(0); storageScope=ClientWorkerCheck::scope(client);
+        require(!storageOld.isEmpty(),"initial book exists before injected storage failure");
+        const auto original=bytes(storageOld);
+        mode(fault,"changed"); storageFaults=0; storageFailure=failure;
+        wait(client,[&] { client.download(0); });
+        require(waitForMaintenance(client) && storageFaults>0,"storage fault reaches the real Client transfer protocol");
+        const bool afterCommit=failure==StorageFailure::OldUnlink || failure==StorageFailure::JournalUnlink;
+        require((afterCommit || (QFile::exists(storageOld) && bytes(storageOld)==original)) &&
+            (failure==StorageFailure::JournalFile || !QDir(storageScope+"/transfers").entryList({"*.json"}).isEmpty()),
+            "failed critical transition retains the previous book and a recovery journal");
+        if (failure==StorageFailure::RecordDirectory)
+            require(QDir(storageScope).entryList({"101-*.epub"}).size()>=2,"unconfirmed record replacement retains both book versions");
+        storageFailure=StorageFailure::None;
+        Client restarted(endpoint,data,nullptr,false);
+        require(restarted.configure(endpoint.toString(),"demo") && waitForRecents(restarted) && waitForMaintenance(restarted),"restart rechecks and confirms transfer state");
+        const auto selected=restarted.localFile(0);
+        require(!selected.isEmpty() && QFileInfo::exists(selected),"restart keeps the file selected by the persisted registry");
+    }
+    storageScope.clear(); storageOld.clear(); mode(fault,"");
+#else
+    Q_UNUSED(endpoint); Q_UNUSED(root); Q_UNUSED(fault);
+#endif
+}
+
+void coverCancellationChecks(Client &client,const QString &fault) {
+    require(waitForRecents(client),"history settles before cover cancellation");
+    auto &executor=ClientWorkerCheck::executor(client); WorkerGate gate(executor,&client);
+    require(until([&] { return gate.entered->load(); }),"hold worker before stale cover decode");
+    const auto before=client.presentationWork().coverDecodes;
+    mode(fault,"cover_changed"); require(wait(client,[&] { client.refresh(); }),"queue a cover behind occupied worker");
+    require(until([&] { return ClientWorkerCheck::coverPending(client); }),"cover decode task is queued");
+    ClientWorkerCheck::stopCovers(client);
+    require(wait(client,[&] { client.refresh(); }),"queue a fresh cover generation");
+    require(until([&] { return ClientWorkerCheck::coverPending(client); }),"fresh cover retains its own task token");
+    gate.open(); require(until([&] { return !ClientWorkerCheck::coverPending(client); }),"fresh cover completes after stale work drains");
+    require(client.presentationWork().coverDecodes==before+1,"cancelled queued cover never decodes and cannot cancel its successor");
+    mode(fault,""); require(wait(client,[&] { client.refresh(); }),"restore cover fixture version");
+    require(until([&] { return !ClientWorkerCheck::coverPending(client); }),"restored cover completes");
 }
 
 void cleanupRaces(const QUrl &endpoint,const QString &root,const QByteArray &epub) {
@@ -233,6 +327,21 @@ void workerRaces(Client &client,const QString &root,const QString &fault) {
     }
 }
 
+void modelChecks() {
+    for (int size:{100,1000,5000}) {
+        LibraryModel model; QVariantList values;
+        for (int i=0;i<size;++i) values.append(QVariantMap{{"bookId",i+1},{"title",QString::number(i)}});
+        model.replace(values,true); model.sequenceVisits=model.indexVisits=model.lookups=0;
+        model.replace(values,false);
+        require(model.sequenceVisits==quint64(size) && !model.lookups && !model.indexVisits,
+            "unchanged model reconciliation visits each typed ID once without lookup or reindexing");
+        model.move(0,size-1); model.move(size-1,1); model.remove(0); model.insert(0,{{"bookId",size+1}});
+        bool indexed=true; for (int i=0;i<model.rowCount();++i) indexed=indexed && model.rowFor(model.idAt(i))==i;
+        require(indexed,"model index follows moves, insertions and removals");
+        std::printf("MEASURE: same_order_rows=%d sequence_visits=%d lookups=0 index_visits=0\n",size,size);
+    }
+}
+
 void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &endpoint, const QString &root) {
     const QString data=root+"/presentation", source=root+"/plain.epub";
     QString scope;
@@ -274,11 +383,11 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
     const auto syncWork=client.presentationWork();
     require(summary["total"].toInt()==1000 && syncWork.syncBuilds==1 && syncWork.syncSorts==1 &&
             syncWork.localFileChecks==2000,"sync list and counters build one separate snapshot");
-    require(client.syncBooks()==summary["books"].toList() && client.syncSummary()==summary &&
-            client.presentationWork()==syncWork,"sync getters share the same snapshot");
+    require(client.syncBooks().size()==1000 && !summary.contains("books") && client.syncSummary()==summary,"sync aggregates exclude snapshots and the explicit C++ snapshot remains available");
     client.searchDownloaded("КНИГА 0007");
     require(client.books().size()==1 && client.books().first().toMap()["bookId"].toInt()==10007 &&
-            client.recentBook().isEmpty() && client.presentationWork()==syncWork,
+            client.recentBook().isEmpty() && client.presentationWork().localFileChecks==syncWork.localFileChecks &&
+            client.presentationWork().libraryBuilds==syncWork.libraryBuilds,
         "case-folded search only filters prepared rows and hides recents");
     require(client.localFile(0)==scope+"/50007.epub","indexed actions select the filtered snapshot row");
     opened=false;
@@ -359,6 +468,9 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
                 "single-book status retains model, other delegates and scroll position");
         require(!work.libraryBuilds && !work.librarySorts && !work.syncBuilds && !work.syncSorts && work.localFileChecks==1 && work.bookUpdates==1 && work.syncUpdates==1,
                 "single-book completion updates one group and checks only its file among 1000 books");
+        require(!work.indexBuilds && !work.indexVisits && !work.recentPasses && !work.recentVisits && !work.modelIndexVisits &&
+            !work.modelSequenceVisits && !work.syncSnapshots && work.syncReconciliations==1,
+            "status-only completion performs no whole-library index, recent, reconciliation or snapshot pass");
         QObject::disconnect(changed);
 
         auto record=ClientWorkerCheck::record(client,"50007"); client.resetPresentationWork();
@@ -390,7 +502,7 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
         require(client.books().first().toMap()["bookId"].toInt()==10007 && !client.presentationWork().libraryBuilds && !client.presentationWork().librarySorts,
                 "changed sort key moves one prepared book without sorting the library");
         ClientWorkerCheck::store(client,"50007",record); ClientWorkerCheck::publish(client); client.setLocalSort("recent");
-        require(!resets,"record updates and membership changes never reset the model");
+        require(resets>0,"bulk filtering and sort changes use an anchored reset");
         // The model outlives this local signal counter.
         QObject::disconnect(resetConnection);
         const auto incremental=client.books(); const auto incrementalSync=client.syncSummary();
@@ -398,6 +510,61 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
         require(client.books()==incremental && client.syncSummary()==incrementalSync,"incremental rows, order and counters match a fresh complete build");
     }
 
+    {
+        client.setLocalSort("title"); client.searchDownloaded("");
+        const auto originalA=ClientWorkerCheck::record(client,"50000"),originalC=ClientWorkerCheck::record(client,"50002");
+        auto a=originalA,c=originalC; auto ab=a["book"].toObject(),cb=c["book"].toObject();
+        ab["title"]="000 B"; cb["title"]="000 A"; a["book"]=ab; c["book"]=cb;
+        for (bool reverse:{false,true}) {
+            if (reverse) { ClientWorkerCheck::store(client,"50002",c); ClientWorkerCheck::store(client,"50000",a); }
+            else { ClientWorkerCheck::store(client,"50000",a); ClientWorkerCheck::store(client,"50002",c); }
+            ClientWorkerCheck::publish(client);
+            const auto incremental=client.books();
+            require(incremental[0].toMap().value("bookId").toInt()==10002 && incremental[1].toMap().value("bookId").toInt()==10000,
+                "two changed books reach their common final order independently of insertion order");
+            ClientWorkerCheck::rebuild(client);
+            require(client.books()==incremental,"batched final rows and roles equal a fresh complete build");
+            ClientWorkerCheck::store(client,"50000",originalA); ClientWorkerCheck::store(client,"50002",originalC); ClientWorkerCheck::publish(client);
+        }
+        for (bool gridView:{false,true}) {
+            window->setProperty("coverGrid",gridView); QCoreApplication::processEvents();
+            auto *view=gridView ? grid : catalog;
+            // Downloads use the list; give the hidden grid a viewport for its anchor check.
+            if (gridView) { view->setProperty("width",600); view->setProperty("height",600); }
+            require(QMetaObject::invokeMethod(view,"positionViewAtIndex",Q_ARG(int,400),Q_ARG(int,0)),"scroll before a bulk model reset");
+            QCoreApplication::processEvents();
+            const auto previousY=view->property("contentY").toDouble();
+            ClientWorkerCheck::store(client,"50000",a); ClientWorkerCheck::store(client,"50002",c); ClientWorkerCheck::publish(client);
+            QCoreApplication::processEvents(); QCoreApplication::processEvents();
+            std::printf("ANCHOR: grid=%d before=%.3f after=%.3f\n",gridView,previousY,view->property("contentY").toDouble());
+            require(std::abs(view->property("contentY").toDouble()-previousY)<1,"bulk reset keeps the visible library anchor in list and grid");
+            ClientWorkerCheck::store(client,"50000",originalA); ClientWorkerCheck::store(client,"50002",originalC); ClientWorkerCheck::publish(client);
+            QCoreApplication::processEvents(); QCoreApplication::processEvents();
+        }
+        window->setProperty("coverGrid",false); client.setLocalSort("recent");
+        window->setProperty("syncBookKey","book:10007");
+        client.bookModel(); client.syncModel(); client.resetPresentationWork();
+        for (int i=0;i<1000;++i) {
+            const auto id=QString::number(50000+i); auto record=ClientWorkerCheck::record(client,id);
+            auto status=record["syncStatus"].toObject(); status["profile"]=profile;
+            status["at"]="2026-10-16T12:34:56Z"; record["syncStatus"]=status;
+            ClientWorkerCheck::store(client,id,record); ClientWorkerCheck::publish(client);
+        }
+        const auto series=client.presentationWork();
+        require(series.bookUpdates==1000 && series.syncReconciliations==1000 && !series.indexBuilds && !series.recentPasses &&
+            !series.modelIndexVisits && !series.modelSequenceVisits && !series.modelSnapshots && !series.syncSnapshots,
+            "1000 content-only updates reconcile 1000 groups without whole-library passes or list snapshots");
+        std::printf("MEASURE: status_updates=1000 reconciliations=%llu index_visits=%llu recent_visits=%llu snapshots=%llu\n",
+            static_cast<unsigned long long>(series.syncReconciliations),static_cast<unsigned long long>(series.indexVisits),
+            static_cast<unsigned long long>(series.recentVisits),static_cast<unsigned long long>(series.syncSnapshots));
+        require(window->property("selectedSyncBook").value<QJSValue>().toVariant().toMap()==client.syncBookDetails("book:10007"),
+            "selected sync details refresh when content changes without changing aggregate counts");
+        window->setProperty("syncBookKey","");
+        client.setSyncFilter("waiting"); require(client.syncModel()->rowCount()>0,"sync proxy exposes the waiting category");
+        client.setSyncFilter("invalid"); require(client.syncFilter()=="waiting","invalid sync filter is rejected");
+        client.setSyncFilter("all"); require(client.syncModel()->rowCount()==1000,"sync proxy restores all groups");
+        require(!client.syncBookDetails("book:10007").isEmpty() && client.syncBookDetails("missing").isEmpty(),"sync details use the group index");
+    }
     client.showSyncFile(50000);
     require(client.detail()["pendingProgress"].toBool(),"original profile exposes its pending position");
     require(client.prepareUpdate(),"defer native recents while busy");
@@ -432,8 +599,8 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
     });
     const QString russianLabel=client.syncBooks().first().toMap()["label"].toString();
     require(client.setLanguage("en") && client.syncBooks().first().toMap()["label"].toString()!=russianLabel &&
-            window->property("syncData").value<QJSValue>().toVariant().toMap()["books"]==client.syncSummary()["books"],
-        "live language switch retranslates cached sync labels and QML snapshot");
+            window->property("syncData").value<QJSValue>().toVariant().toMap()==client.syncSummary() && client.syncModel()->rowCount()==1000,
+        "live language switch retranslates sync labels and the QML model");
     require(client.setLanguage("ru"),"restore Russian after cached language check");
     mode(root+"/fault.txt","");
     for (int i=0;i<3;++i) {
@@ -587,15 +754,56 @@ int main(int argc,char **argv) {
     require(wait(client,[&] { client.retry(); }),"retry catalog without entering credentials again");
     require(!window->property("settings").toBool(),"successful catalog retry completes connection navigation");
     require(until([&] { return !client.coverUrl(1).isEmpty() && !client.coverUrl(2).isEmpty(); }),"load both covers");
+    coverCancellationChecks(client,fault);
+    window->setProperty("coverGrid",true);
+    auto *quickWindow=qobject_cast<QQuickWindow *>(window);
+    auto findCover=[&]() -> QQuickItem * {
+        std::function<QQuickItem *(QQuickItem *)> find=[&](QQuickItem *item) -> QQuickItem * {
+            if (item->objectName()=="gridCover-1") return item;
+            for (auto child:item->childItems()) if (auto value=find(child)) return value;
+            return nullptr;
+        };
+        return find(quickWindow->contentItem());
+    };
+    require(until([&] { const auto cover=findCover(); return cover && cover->property("status").toInt()==1; }),"asynchronous cached cover reaches Ready");
+    auto cover=findCover();
+    require(cover->property("asynchronous").toBool() && cover->property("cache").toBool() &&
+        cover->property("sourceSize").toSize()==QSize(240,320),"book cover decoding is asynchronous, cached and size-limited");
+    const auto beforeCover=quickWindow->grabWindow().copy(cover->mapRectToScene(cover->boundingRect()).toAlignedRect());
     const QString firstCover=client.coverUrl(1),secondCover=client.coverUrl(2);
     mode(fault,"cover_changed");
     require(wait(client,[&] { client.refresh(); }),"refresh a changed cover");
     require(until([&] { return !client.coverUrl(1).isEmpty() && client.coverUrl(1)!=firstCover; }) &&
             client.coverUrl(2)==secondCover,"one changed cover leaves other source URLs unchanged");
+    require(until([&] { const auto image=findCover(); return image && image->property("status").toInt()==1 && image->property("source").toUrl().toString()==client.coverUrl(1); }),
+        "revised cover URL finishes asynchronous loading");
+    cover=findCover();
+    require(beforeCover!=quickWindow->grabWindow().copy(cover->mapRectToScene(cover->boundingRect()).toAlignedRect()),
+        "cover cache displays new pixels after URL revision");
+    auto rss=[]() -> qint64 {
+        QFile status("/proc/self/status"); if (!status.open(QIODevice::ReadOnly)) return -1;
+        const auto lines=status.readAll().split('\n');
+        for (const auto &line:lines) if (line.startsWith("VmRSS:")) return line.simplified().split(' ')[1].toLongLong();
+        return -1;
+    };
+    const auto memoryBefore=rss(); auto peak=memoryBefore;
+    for (int i=0;i<20;++i) {
+        window->setProperty("coverGrid",false); QCoreApplication::processEvents();
+        window->setProperty("coverGrid",true); QCoreApplication::processEvents(); peak=qMax(peak,rss());
+    }
+    std::printf("MEASURE: cover_view_cycles=20 rss_before_kib=%lld rss_after_kib=%lld rss_peak_kib=%lld\n",
+        static_cast<long long>(memoryBefore),static_cast<long long>(rss()),static_cast<long long>(peak));
+    window->setProperty("coverGrid",false);
     mode(fault,"");
     client.showDownloaded(true);
+    client.showSyncFile(101);
     position="pbr:/webkit?##epubcfi(/6/2!/4/6/1)";
     require(wait(client,[&] { client.syncFile(101); }),"establish agreed sync baseline");
+    const auto bar=window->findChild<QObject *>("detailProgress"),label=window->findChild<QObject *>("detailReading");
+    require(bar && label && until([&] {
+        return bar->property("visible").toBool() && bar->property("value")==client.detail()["readingProgress"] &&
+            label->property("text").toString().contains('%');
+    }),"successful sync updates the visible QML bar and percentage without reopening details");
     position="pbr:/webkit?##epubcfi(/6/2!/4/8/1)";
     const int before=posts(root);
     mode(fault,"audit_post401");
@@ -604,6 +812,8 @@ int main(int argc,char **argv) {
     require(!wait(client,[&] { client.syncFile(101); }) && client.progressConflict() && posts(root)==before+1,
             "fresh sync detects progress changed on another device during token refresh");
     require(wait(client,[&] { client.resolveProgress(true); }),"explicit fresh choice resolves conflict");
+    require(until([&] { return bar->property("value")==client.detail()["readingProgress"]; }),
+            "conflict resolution refreshes the existing QML progress bar");
     const int agreedPosts=posts(root);
     profile="equivalent-profile";
     position="pbr:/webkit?##epubcfi(/6/2!/4/8[p3]/1:0)";
@@ -632,6 +842,8 @@ int main(int argc,char **argv) {
     require(!wait(client,[&] { client.downloadSelected(); }) && client.localFile(0)==replacement &&
             bytes(replacement)==replacementBytes && bytes(recordPath)==recordBefore,
             "ordinary ZIP cannot replace a valid EPUB or its persisted record");
+    storageFailureChecks(endpoint,root,fault);
+    modelChecks();
     presentationChecks(app,russian,endpoint,root);
     std::puts("PASS: audit regressions");
     return 0;

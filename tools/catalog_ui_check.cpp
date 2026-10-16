@@ -205,7 +205,14 @@ int main(int argc, char **argv) {
     require(qAbs(item("detailCoverFrame")->width() - 180*screen.width()/600.0) < 1, "detail cover uses enlarged reference proportions");
     require(qAbs(item("detailCoverFrame")->mapToScene(QPointF()).y()-item("detailTitle")->mapToScene(QPointF()).y()) < 1, "detail cover and title align at top");
     require(item("downloadButton")->mapToScene(QPointF()).x() > item("detailCoverFrame")->mapToScene(QPointF(item("detailCoverFrame")->width(),0)).x(), "primary action stays beside cover");
-    require(!item("detailEdition")->isVisible() && item("detailEdition")->property("text").toString().contains("240 стр.") && item("detailEdition")->property("text").toString().contains("Научная фантастика"), "full edition metadata stays in collapsed section after primary action");
+    const auto edition = item("detailEdition");
+    const auto editionText = edition->property("text").toString();
+    require(edition->isVisible() && editionText.contains("240 стр.") && editionText.contains("Научная фантастика") &&
+        !editionText.contains(client.detail()["title"].toString()) && !editionText.contains(client.detail()["author"].toString()) &&
+        edition->parentItem() == item("detailTitle")->parentItem() && !item("editionToggle"), "edition metadata is visible beside cover without duplicate title, author or expansion button");
+    require(item("detailReading")->property("horizontalAlignment").toInt() == Qt::AlignLeft &&
+        item("detailDownloadState")->property("horizontalAlignment").toInt() == Qt::AlignLeft &&
+        qAbs(item("detailReading")->mapToScene(QPointF()).x()-item("detailDownloadState")->mapToScene(QPointF()).x()) < 1, "reading and download status share the left edge");
     require(item("detailProgress")->isVisible() && item("detailProgress")->property("value").toDouble() == 37.5, "detail bar uses server percentage");
     require(item("detailDescription")->mapToScene(QPointF()).y() >= item("downloadButton")->mapToScene(QPointF(0,item("downloadButton")->height())).y(), "description follows hero without overlap");
     require(!item("descriptionToggle")->isVisible(), "short description does not show redundant expansion action");
@@ -340,7 +347,7 @@ int main(int argc, char **argv) {
     tap("navigationButton"); settle(); capture("sync-list-conflict");
     tap("navigationButton"); settle();
     require(item("catalog")->isVisible() && !item("syncList")->isVisible(), "back restores the downloaded library");
-    require(window->property("syncData").toMap()["books"].toList().size() == client.syncBooks().size(),
+    require(client.syncModel()->rowCount() == client.syncBooks().size() && !client.syncSummary().contains("books"),
             "QML sync list and counters share the same snapshot");
     setFault("always401");
     require(!wait(client,[&] { client.showDownloaded(false); }) && !client.hasSavedSession(), "UI final 401 invalidates saved connection");
@@ -381,9 +388,11 @@ int main(int argc, char **argv) {
     tap("listViewButton"); settle(); item("catalog")->setProperty("contentY",0); settle();
     setFault("long_ui"); require(wait(client,[&] { client.showDetail(1); }),"load unusually long metadata in real QML");
     capture("long-metadata");
-    require(item("detailTitle")->property("truncated").toBool() &&
-        item("downloadButton")->mapToScene(QPointF(0,item("downloadButton")->height())).y()<window->height() &&
-        item("detailEdition")->property("text").toString().contains("Жанр 49"),"long title authors and 50 genres keep the primary action on the first screen");
+    require(!item("detailTitle")->property("truncated").toBool() &&
+        !item("detailEdition")->property("truncated").toBool() && item("detailEdition")->property("text").toString().contains("Жанр 49") &&
+        item("detailEdition")->mapToScene(QPointF(0,item("detailEdition")->height())).y() <= item("detailReading")->mapToScene(QPointF()).y(),"long edition metadata wraps completely without overlapping reading actions");
+    auto detailFlick = item("detailScroll")->property("contentItem").value<QQuickItem *>();
+    detailFlick->setProperty("contentY", detailFlick->property("contentY").toDouble()+item("formatButton")->mapToItem(detailFlick, QPointF()).y()); settle();
     tap("formatButton"); settle();
     const double blockedY=item("catalog")->property("contentY").toDouble();
     QMetaObject::invokeMethod(window,"pageContent",Q_ARG(QVariant,1)); settle();
@@ -401,7 +410,9 @@ int main(int argc, char **argv) {
             tap("stopSync"); require(!item("stopSync")->isEnabled(),"repeated stop is disabled");
         });
     }) && !client.busy() && window->property("syncFilter")=="waiting","stop returns control to local reading and preserves the selected filter");
-    capture("sync-stopped"); tap("navigationButton"); tap("navigationButton"); tap("addConnection"); settle();
+    capture("sync-stopped"); tap("navigationButton"); settle();
+    require(QMetaObject::invokeMethod(window,"editConnection"),"open settings for connection message isolation"); settle();
+    tap("addConnection"); settle();
     require(item("operationMessage")->property("text").toString().isEmpty(),"sync result never appears on the connection form");
     tap("navigationButton"); tap("navigationButton"); settle();
     // Only the isolated client journal is seeded for pending and conflict UI states.
@@ -419,19 +430,28 @@ int main(int argc, char **argv) {
     require(recordFile.open(QIODevice::WriteOnly|QIODevice::Truncate) && recordFile.write(QJsonDocument(record).toJson())>0,"seed conflict card journal"); recordFile.close();
     require(client.configure(client.server(),client.username()),"reload card conflict"); client.showSyncFile(101); settle();
     require(item("downloadButton")->property("text").toString()=="Выбрать позицию" && item("readReaderPosition")->isVisible(),"conflict primary action and secondary local reading stay distinct");
-    capture("card-conflict"); tap("downloadButton"); settle(); require(client.progressConflict(),"primary conflict action opens the checked position dialog"); tap("deferConflict");
+    capture("card-conflict");
+    detailFlick->setProperty("contentY",detailFlick->property("contentY").toDouble()+item("downloadButton")->mapToItem(detailFlick,QPointF()).y()-20); settle();
+    tap("downloadButton"); settle(); require(client.progressConflict(),"primary conflict action opens the checked position dialog"); tap("deferConflict");
 
     // Verify the populated screens after switching the same production QML to English.
     app.removeTranslator(&russian);
     QLocale::setDefault(QLocale("en"));
-    engine.retranslate();
+    client.retranslate(); engine.retranslate();
     client.showSyncFile(101); settle();
     require(item("downloadButton")->property("text").toString()=="Choose position", "English book action after live retranslation");
     capture("card-conflict-en");
+    detailFlick->setProperty("contentY",detailFlick->property("contentY").toDouble()+item("downloadButton")->mapToItem(detailFlick,QPointF()).y()-20); settle();
     tap("downloadButton"); settle();
     require(client.progressConflict(), "English position dialog opens");
     capture("position-dialog-en"); tap("deferConflict");
     client.closeDetail(); window->setProperty("syncView",true); settle();
+    require(item("syncFilter")->property("currentIndex").toInt()==QStringList{"all","waiting","attention","synced"}.indexOf(client.syncFilter()),
+        "translated selector displays the actual retained sync filter");
+    client.setSyncFilter("all"); settle();
+    require(item("syncFilter")->property("currentIndex").toInt()==0 && item("syncList")->property("count").toInt()==client.syncSummary()["total"].toInt(),
+        "all-groups selector and visible model agree after retranslation");
+    require(client.syncBookDetails("book:1").value("label").toString()=="Choose a position","sync model retranslates its cached status labels");
     capture("sync-en");
 
     std::printf("PDF=%s\nFB2=%s\n", qPrintable(pdfPath), qPrintable(fb2Path));

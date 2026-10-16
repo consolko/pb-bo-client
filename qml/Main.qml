@@ -10,18 +10,59 @@ ApplicationWindow {
     title: "BookOrbit"
     color: "white"
     property real u: width / 600
+    property var libraryAnchor: null
+    function captureLibraryAnchor() {
+        if (libraryAnchor) return
+        const ids = []
+        for (let i = 0; i < catalog.count; ++i) ids.push(catalogBooks.idAt(i))
+        const anchors = []
+        for (const view of [catalog, coverCatalog]) {
+            if (view.width <= 0 || view.height <= 0) continue
+            const grid = view === coverCatalog
+            const top = view.originY === undefined ? 0 : view.originY
+            const columns = grid ? Math.max(1, Math.floor(view.width / view.cellWidth)) : 1
+            let at = view.indexAt(1, view.contentY + 1)
+            if (at < 0) at = view.indexAt(1, view.contentY + (view === coverCatalog ? view.cellHeight / 2 : 20 * u))
+            // A hidden grid can retain an offset without instantiated delegates.
+            if (grid && at < 0 && view.count > 0) at = Math.min(view.count - 1, Math.max(0, Math.floor((view.contentY - top) / view.cellHeight) * columns))
+            if (at < 0) continue
+            const item = view.itemAtIndex(at)
+            const y = grid ? top + Math.floor(at / columns) * view.cellHeight : item ? item.y : view.contentY
+            anchors.push({view: view, ids: ids, at: at, grid: grid, offset: view.contentY - y})
+            if (view === catalog && at > 0) libraryAtBeginning = false
+        }
+        libraryAnchor = {account: activeAccount, offline: client.offlineOnly, page: client.page, views: anchors}
+    }
+    function restoreLibraryAnchor() { Qt.callLater(window.applyLibraryAnchor) }
+    function applyLibraryAnchor() {
+        const pending = libraryAnchor
+        libraryAnchor = null
+        if (!pending || pending.account !== activeAccount || pending.offline !== client.offlineOnly || pending.page !== client.page) return
+        for (const saved of pending.views) {
+            let row = catalogBooks.rowFor(saved.ids[saved.at])
+            for (let i = saved.at + 1; row < 0 && i < saved.ids.length; ++i) row = catalogBooks.rowFor(saved.ids[i])
+            for (let i = saved.at - 1; row < 0 && i >= 0; --i) row = catalogBooks.rowFor(saved.ids[i])
+            saved.view.forceLayout()
+            if (row < 0) { saved.view.positionViewAtBeginning(); continue }
+            saved.view.positionViewAtIndex(row, ListView.Beginning)
+            saved.view.forceLayout()
+            const item = saved.view.itemAtIndex(row)
+            const top = saved.view.originY === undefined ? 0 : saved.view.originY
+            const columns = saved.grid ? Math.max(1, Math.floor(saved.view.width / saved.view.cellWidth)) : 1
+            const y = saved.grid ? top + Math.floor(row / columns) * saved.view.cellHeight : item ? item.y : null
+            if (y !== null) saved.view.contentY = Math.max(top, Math.min(y + saved.offset,
+                Math.max(top, top + saved.view.contentHeight - saved.view.height)))
+        }
+    }
     readonly property var updater: typeof updateManager === "undefined" ? null : updateManager
     Connections {
         target: window.updater
         function onChanged() {
             if (window.settings && window.updater.state === "ready")
-                Qt.callLater(function() {
-                    settingsScroll.contentItem.contentY = Math.max(0, settingsScroll.contentHeight - settingsScroll.height)
-                })
+                window.showUpdates()
         }
     }
     property bool fullDescription: false
-    property bool editionExpanded: false
     property bool coverGrid: false
     readonly property var activeCatalog: coverGrid && !client.offlineOnly ? coverCatalog : catalog
     property real savedCatalogY: 0
@@ -35,14 +76,15 @@ ApplicationWindow {
     readonly property var languageCodes: ["system"].concat(client.languageCodes)
     property bool settings: false
     property bool syncView: false
-    property string syncFilter: "all"
+    readonly property string syncFilter: client.syncFilter
     property string syncBookKey: ""
     readonly property var catalogBooks: client.books
     readonly property var detailData: client.detail
     readonly property var syncData: client.syncSummary
     readonly property var detailFormat: (detailData.files || []).find(file => file.id === detailData.fileId) || ({})
     readonly property var pendingFormat: (detailData.files || []).find(file => file.id === pendingFileId) || ({})
-    readonly property var selectedSyncBook: window.syncData.books.find(book => book.key === syncBookKey) || ({})
+    property var selectedSyncBook: ({})
+    onSyncBookKeyChanged: selectedSyncBook = client.syncBookDetails(syncBookKey)
     readonly property bool loginRequired: !client.authenticated && !client.hasSavedSession
     property bool addingConnection: false
     property bool browsingFolders: false
@@ -55,12 +97,12 @@ ApplicationWindow {
     readonly property bool messageVisible: (uiMessage.context === uiContext || (settings && !addingConnection && uiMessage.context === "connection")) && (!uiMessage.bookId || !client.detailVisible || uiMessage.bookId === detailData.bookId) && (!uiMessage.fileId || !client.detailVisible || uiMessage.fileId === detailData.fileId)
     onUiContextChanged: Qt.callLater(function() { client.setUiContext(window.uiContext) })
     readonly property string activeAccount: client.server + "\n" + client.username
-    onActiveAccountChanged: { savedLibraryY = 0; libraryAtBeginning = true; if (client.offlineOnly) search.text = client.localQuery }
-    onSyncViewChanged: if (syncView) syncFilter = "all"
+    onActiveAccountChanged: { libraryAnchor = null; savedLibraryY = 0; libraryAtBeginning = true; if (client.offlineOnly) search.text = client.localQuery }
+    onSyncViewChanged: if (syncView) client.syncFilter = "all"
     Connections { target: Qt.application; function onStateChanged() { if (Qt.application.state === Qt.ApplicationActive) client.refreshRecents() } }
     function showFile(fileId) {
         savedCatalogY = activeCatalog.contentY
-        fullDescription = false; editionExpanded = false
+        fullDescription = false
         client.showSyncFile(fileId)
         detailScroll.contentItem.contentY = 0
     }
@@ -87,7 +129,7 @@ ApplicationWindow {
     function clearSearch() { search.text = ""; submitSearch() }
     function showBook(id) {
         savedCatalogY = activeCatalog.contentY
-        fullDescription = false; editionExpanded = false
+        fullDescription = false
         client.showDetail(id)
         detailScroll.contentItem.contentY = 0
     }
@@ -109,10 +151,6 @@ ApplicationWindow {
     function editionText() {
         const d = window.detailData, lines = []
         function field(name, value) { if (value) lines.push(name + ": " + value) }
-        field(qsTranslate("BookOrbit", "Title"), d.title)
-        field(qsTranslate("BookOrbit", "Subtitle"), d.subtitle)
-        field(qsTranslate("BookOrbit", "Authors"), d.author)
-        field(qsTranslate("BookOrbit", "Series"), d.seriesName)
         field(qsTranslate("BookOrbit", "My rating"), d.rating ? d.rating + " / 5" : "")
         field(qsTranslate("BookOrbit", "Publisher"), d.publisher)
         field(qsTranslate("BookOrbit", "Published"), d.publishedDate || d.publishedYear)
@@ -125,7 +163,14 @@ ApplicationWindow {
         const series = d.seriesMemberships || []
         if (series.length > 0) field(qsTranslate("BookOrbit", "Series"), series.map(s => s.seriesName + (s.seriesIndex ? " · № " + s.seriesIndex : "")).join("; "))
         for (const rating of d.communityRatings || []) field(qsTranslate("BookOrbit", "Rating: ") + rating.provider, rating.rating)
-        return lines.length ? lines.join("\n") : qsTranslate("BookOrbit", "No additional details")
+        return lines.join("\n")
+    }
+    function showUpdates() {
+        settings = true
+        Qt.callLater(function() {
+            settingsScroll.contentItem.contentY = Math.max(0, Math.min(settingsScroll.contentHeight - settingsScroll.height,
+                settingsScroll.contentItem.contentY + checkUpdateAction.mapToItem(settingsScroll.contentItem, 0, 0).y))
+        })
     }
     function pageContent(direction) {
         if (formatDialog.visible || progressDialog.visible || Qt.inputMethod.visible || settings || client.busy) return
@@ -310,7 +355,7 @@ ApplicationWindow {
             visible: !window.settings && !!window.updater && window.updater.state === "available"
             text: qsTranslate("BookOrbit", "Available version: %1").arg(window.updater ? window.updater.availableVersion : "")
             Layout.fillWidth: true; enabled: !client.busy
-            onClicked: { window.settings = true; Qt.callLater(function() { settingsScroll.contentItem.contentY = Math.max(0, settingsScroll.contentHeight - settingsScroll.height) }) }
+            onClicked: window.showUpdates()
         }
         Text {
             Layout.fillWidth: true
@@ -484,34 +529,12 @@ ApplicationWindow {
                         Accessible.role: Accessible.StaticText; Accessible.name: text
                     }
                     Action {
+                        id: checkUpdateAction
                         objectName: "checkUpdateButton"
                         text: window.updater && window.updater.state === "checking" ? qsTranslate("BookOrbit", "Checking updates…") : qsTranslate("BookOrbit", "Check for updates")
                         Layout.fillWidth: true
                         enabled: !client.busy && !!window.updater && ["idle", "error", "available"].indexOf(window.updater.state) >= 0
                         onClicked: window.updater.check()
-                    }
-                    Text {
-                        text: qsTranslate("BookOrbit", "Available version: %1").arg(window.updater ? window.updater.availableVersion : "")
-                        visible: !!window.updater && window.updater.availableVersion.length > 0
-                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u; font.bold: true
-                    }
-                    Text {
-                        text: window.updater ? window.updater.notes : ""
-                        visible: text.length > 0; textFormat: Text.PlainText
-                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 15 * window.u
-                    }
-                    ProgressBar {
-                        Layout.fillWidth: true
-                        visible: !!window.updater && window.updater.state === "downloading"
-                        value: window.updater ? window.updater.progress : 0
-                        Accessible.name: qsTranslate("BookOrbit", "Update download progress")
-                    }
-                    Text {
-                        visible: !!window.updater && window.updater.availableVersion.length > 0
-                        text: window.updater && window.updater.state === "downloading"
-                            ? qsTranslate("BookOrbit", "%1% · %2 / %3 KB").arg(Math.round(window.updater.progress * 100)).arg(Math.round(window.updater.progress * window.updater.archiveBytes / 1024)).arg(Math.ceil(window.updater.archiveBytes / 1024))
-                            : qsTranslate("BookOrbit", "Download size: %1 KB").arg(window.updater ? Math.ceil(window.updater.archiveBytes / 1024) : 0)
-                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u
                     }
                     Action {
                         objectName: "downloadUpdateButton"
@@ -531,6 +554,30 @@ ApplicationWindow {
                         visible: !!window.updater && window.updater.canInstall
                         enabled: !client.busy
                         onClicked: window.updater.install()
+                    }
+                    Text {
+                        text: qsTranslate("BookOrbit", "Available version: %1").arg(window.updater ? window.updater.availableVersion : "")
+                        visible: !!window.updater && window.updater.availableVersion.length > 0
+                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u; font.bold: true
+                    }
+                    ProgressBar {
+                        Layout.fillWidth: true
+                        visible: !!window.updater && window.updater.state === "downloading"
+                        value: window.updater ? window.updater.progress : 0
+                        Accessible.name: qsTranslate("BookOrbit", "Update download progress")
+                    }
+                    Text {
+                        visible: !!window.updater && window.updater.availableVersion.length > 0
+                        text: window.updater && window.updater.state === "downloading"
+                            ? qsTranslate("BookOrbit", "%1% · %2 / %3 KB").arg(Math.round(window.updater.progress * 100)).arg(Math.round(window.updater.progress * window.updater.archiveBytes / 1024)).arg(Math.ceil(window.updater.archiveBytes / 1024))
+                            : qsTranslate("BookOrbit", "Download size: %1 KB").arg(window.updater ? Math.ceil(window.updater.archiveBytes / 1024) : 0)
+                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u
+                    }
+                    Text {
+                        objectName: "updateNotes"
+                        text: window.updater ? window.updater.notes : ""
+                        visible: text.length > 0; textFormat: Text.PlainText
+                        Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 15 * window.u
                     }
                 }
                 }
@@ -637,10 +684,12 @@ ApplicationWindow {
                 Text { text: qsTranslate("BookOrbit", "Show:"); font.pixelSize: 16 * window.u }
                 Choice {
                     objectName: "syncFilter"; Layout.fillWidth: true
+                    function bindSelection() { currentIndex = Qt.binding(function() { return ["all", "waiting", "attention", "synced"].indexOf(client.syncFilter) }) }
+                    onModelChanged: Qt.callLater(bindSelection)
                     model: [qsTranslate("BookOrbit", "All (") + window.syncData.total + ")", qsTranslate("BookOrbit", "Waiting (") + window.syncData.waiting + ")", qsTranslate("BookOrbit", "Needs attention (") + window.syncData.attention + ")", qsTranslate("BookOrbit", "Synced (") + window.syncData.synced + ")"]
                     currentIndex: ["all", "waiting", "attention", "synced"].indexOf(window.syncFilter)
                     Accessible.name: qsTranslate("BookOrbit", "Filter sync status")
-                    onActivated: index => { window.syncFilter = ["all", "waiting", "attention", "synced"][index]; syncList.contentY = 0 }
+                    onActivated: index => { client.syncFilter = ["all", "waiting", "attention", "synced"][index]; bindSelection(); syncList.contentY = 0 }
                 }
             }
         }
@@ -650,7 +699,7 @@ ApplicationWindow {
             visible: window.syncView && !window.settings && !client.detailVisible && !window.syncBookKey
             Layout.fillWidth: true; Layout.fillHeight: true
             clip: true
-            model: window.syncData.books.filter(book => window.syncFilter === "all" || book.group === window.syncFilter)
+            model: client.syncModel
             ScrollBar.vertical: ScrollBar { }
             delegate: ItemDelegate {
                 required property var modelData
@@ -803,7 +852,7 @@ ApplicationWindow {
                         color: "#eeeeee"
                         Text { anchors.centerIn: parent; visible: cover.status !== Image.Ready; text: qsTranslate("BookOrbit", "Book"); font.pixelSize: 13 * window.u; color: "#555555" }
                         Image { id: cover; anchors.fill: parent; source: { const revision = client.coverRevision; return client.coverUrl(modelData.bookId) }
-                            fillMode: Image.PreserveAspectFit; verticalAlignment: Image.AlignTop; cache: false; sourceSize.width: 240; sourceSize.height: 320 }
+                            fillMode: Image.PreserveAspectFit; verticalAlignment: Image.AlignTop; cache: true; asynchronous: true; sourceSize.width: 240; sourceSize.height: 320 }
                     }
                     ColumnLayout {
                         Layout.fillWidth: true; Layout.minimumHeight: 105 * window.u; Layout.alignment: Qt.AlignTop; spacing: 4 * window.u
@@ -907,8 +956,7 @@ ApplicationWindow {
                             objectName: "gridCover-" + modelData.bookId
                             anchors.fill: parent; anchors.margins: 1
                             source: { const revision = client.coverRevision; return client.coverUrl(modelData.bookId) }
-                            fillMode: Image.PreserveAspectFit; cache: false
-                            sourceSize.width: 300; sourceSize.height: 450
+                            fillMode: Image.PreserveAspectFit; cache: true; asynchronous: true; sourceSize.width: 240; sourceSize.height: 320
                             Accessible.ignored: true
                         }
                         Rectangle {
@@ -946,19 +994,20 @@ ApplicationWindow {
                         Text { anchors.centerIn: parent; visible: detailCover.status !== Image.Ready; text: qsTranslate("BookOrbit", "No cover"); font.pixelSize: 15 * window.u }
                         Image { id: detailCover; anchors.fill: parent; anchors.margins: 1
                             source: { const revision = client.coverRevision; return client.coverUrl(window.detailData.bookId || 0) }
-                            fillMode: Image.PreserveAspectFit; cache: false
+                            fillMode: Image.PreserveAspectFit; cache: true; asynchronous: true; sourceSize.width: 240; sourceSize.height: 320
                             Accessible.name: qsTranslate("BookOrbit", "Cover: ") + (window.detailData.title || "")
                         }
                     }
                     ColumnLayout {
                         Layout.fillWidth: true; Layout.minimumWidth: 0
                         Layout.minimumHeight: 280 * window.u; Layout.alignment: Qt.AlignTop; spacing: 8 * window.u
-                        Text { objectName: "detailTitle"; text: window.detailData.title || ""; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; maximumLineCount: 3; elide: Text.ElideRight; font.bold: true; font.pixelSize: 23 * window.u }
-                        Text { text: window.detailData.subtitle || ""; maximumLineCount: 1; elide: Text.ElideRight; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
-                        Text { text: window.detailData.author || ""; maximumLineCount: 2; elide: Text.ElideRight; visible: text.length > 0; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 17 * window.u }
-                        Text { text: (window.detailData.seriesName || "") + (window.detailData.seriesIndex ? " · № " + window.detailData.seriesIndex : ""); textFormat: Text.PlainText; visible: !!window.detailData.seriesName; Layout.fillWidth: true; maximumLineCount: 1; elide: Text.ElideRight; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
+                        Text { objectName: "detailTitle"; text: window.detailData.title || ""; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.bold: true; font.pixelSize: 23 * window.u }
+                        Text { text: window.detailData.subtitle || ""; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
+                        Text { text: window.detailData.author || ""; visible: text.length > 0; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 17 * window.u }
+                        Text { text: (window.detailData.seriesName || "") + (window.detailData.seriesIndex ? " · № " + window.detailData.seriesIndex : ""); textFormat: Text.PlainText; visible: !!window.detailData.seriesName; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
+                        Text { objectName: "detailEdition"; text: window.editionText(); textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; horizontalAlignment: Text.AlignLeft; font.pixelSize: 14 * window.u }
                         Item { Layout.fillHeight: true; Layout.minimumHeight: 8 * window.u }
-                        Text { objectName: "detailReading"; text: window.readStatusLabel(window.detailData); visible: text.length > 0; Layout.fillWidth: true; horizontalAlignment: Text.AlignRight; font.bold: true; font.pixelSize: 14 * window.u; wrapMode: Text.Wrap }
+                        Text { objectName: "detailReading"; text: window.readStatusLabel(window.detailData); visible: text.length > 0; Layout.fillWidth: true; horizontalAlignment: Text.AlignLeft; font.bold: true; font.pixelSize: 14 * window.u; wrapMode: Text.Wrap }
                         ProgressBar {
                             id: detailProgress
                             objectName: "detailProgress"
@@ -981,7 +1030,7 @@ ApplicationWindow {
                             enabled: !client.busy
                             onClicked: window.chooseFormat(false)
                         }
-                        Text { text: window.detailData.downloaded ? qsTranslate("BookOrbit", "Downloaded to this device") : window.detailData.needsRepair ? qsTranslate("BookOrbit", "Local file missing or damaged") : qsTranslate("BookOrbit", "File not downloaded yet"); Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
+                        Text { objectName: "detailDownloadState"; text: window.detailData.downloaded ? qsTranslate("BookOrbit", "Downloaded to this device") : window.detailData.needsRepair ? qsTranslate("BookOrbit", "Local file missing or damaged") : qsTranslate("BookOrbit", "File not downloaded yet"); Layout.fillWidth: true; horizontalAlignment: Text.AlignLeft; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
                         Text { text: window.detailData.remoteFileChanged ? qsTranslate("BookOrbit", "Server file differs") : window.detailData.hasConflict ? qsTranslate("BookOrbit", "Positions differ") : window.detailData.pendingProgress ? qsTranslate("BookOrbit", "Incoming position has not been applied yet") : ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; font.bold: true }
                         Action {
                             Layout.fillWidth: true
@@ -998,7 +1047,7 @@ ApplicationWindow {
                         }
                     }
                 }
-                Text { text: !window.detailData.supported && window.detailData.format ? qsTranslate("BookOrbit", "The file exceeds the 100 MiB download limit.") : !window.detailData.readable && window.detailData.format ? qsTranslate("BookOrbit", "Available to download; opening this format from the app is not supported yet.") : window.detailData.format && window.detailData.format !== "EPUB" && window.detailData.format !== "FB2" ? qsTranslate("BookOrbit", "Position sync is not supported for this format yet.") : window.detailData.format === "FB2" ? qsTranslate("BookOrbit", "Experimental FB2 sync: text-only books with short sections. Unsupported structures keep their progress unchanged.") : ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
+                Text { text: !window.detailData.supported && window.detailData.format ? qsTranslate("BookOrbit", "The file exceeds the 100 MiB download limit.") : !window.detailData.readable && window.detailData.format ? qsTranslate("BookOrbit", "Available to download; opening this format from the app is not supported yet.") : window.detailData.format && window.detailData.format !== "EPUB" && window.detailData.format !== "FB2" ? qsTranslate("BookOrbit", "Position sync is not supported for this format yet.") : window.detailData.format === "FB2" ? qsTranslate("BookOrbit", "Experimental FB2 sync: prose books, including covers and long sections. Unsupported structures keep their progress unchanged.") : ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
                 Text { objectName: "fileCheckResult"; text: window.detailData.remoteFileChanged ? qsTranslate("BookOrbit", "The server file differs. Progress sync is paused") : window.detailData.syncResult || ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
                 Text { text: window.detailData.hasConflict ? qsTranslate("BookOrbit", "The reader and BookOrbit have different positions. Check again and choose the one to use.") : window.detailData.pendingProgress ? qsTranslate("BookOrbit", "The incoming position has not been applied yet. Close all books in the built-in reader and check again.") : ""; visible: !window.detailData.remoteFileChanged && text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
                 Action { objectName: "redownloadButton"; text: qsTranslate("BookOrbit", "Download again"); visible: !!window.detailData.remoteFileChanged; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.downloadSelected() }
@@ -1014,8 +1063,6 @@ ApplicationWindow {
                 }
                 Action { objectName: "descriptionToggle"; text: window.fullDescription ? qsTranslate("BookOrbit", "Collapse description") : qsTranslate("BookOrbit", "Read more"); visible: window.fullDescription || description.truncated; onClicked: window.fullDescription = !window.fullDescription }
                 Action { text: window.detailData.detailed ? qsTranslate("BookOrbit", "Refresh details") : qsTranslate("BookOrbit", "Load details"); visible: client.offlineOnly || !!window.detailData.notice; enabled: !client.busy && client.authenticated; onClicked: client.refreshDetail() }
-                Action { objectName: "editionToggle"; text: qsTranslate("BookOrbit", "Edition details  ") + (window.editionExpanded ? "▾" : "›"); Layout.fillWidth: true; onClicked: window.editionExpanded = !window.editionExpanded }
-                Text { objectName: "detailEdition"; text: window.editionText(); textFormat: Text.PlainText; visible: window.editionExpanded; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 17 * window.u }
                 Text { text: qsTranslate("BookOrbit", "Personal note"); visible: !!window.detailData.personalNote; font.bold: true; font.pixelSize: 20 * window.u }
                 Text { text: window.detailData.personalNote || ""; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 17 * window.u }
                 Text { text: qsTranslate("BookOrbit", "In my collections"); visible: (window.detailData.collections || []).length > 0; font.bold: true; font.pixelSize: 20 * window.u }
@@ -1171,6 +1218,12 @@ ApplicationWindow {
     }
     Connections {
         target: client
+        function onLibraryAboutToReset() { window.captureLibraryAnchor() }
+        function onLibraryReset() { window.restoreLibraryAnchor() }
+        function onSyncSummaryChanged() {
+            window.selectedSyncBook = client.syncBookDetails(window.syncBookKey)
+            if (window.syncBookKey && !window.selectedSyncBook.key) window.syncBookKey = ""
+        }
         function onSyncBatchChanged() {
             if (client.syncBatch.running && !window.settings && !client.detailVisible) window.syncView = true
         }

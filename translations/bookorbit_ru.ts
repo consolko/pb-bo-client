@@ -3,6 +3,18 @@
   <context>
     <name>BookOrbit</name>
     <message>
+        <source>Book downloaded. %1</source>
+        <translation>Книга скачана. %1</translation>
+    </message>
+    <message>
+        <source>The library has not registered the book yet. Sync its position after registration.</source>
+        <translation>Библиотека ещё не зарегистрировала книгу. После регистрации запустите синхронизацию позиции.</translation>
+    </message>
+    <message>
+        <source>Waiting for the library to register the book…</source>
+        <translation>Ожидание регистрации книги в библиотеке…</translation>
+    </message>
+    <message>
       <source> (code </source>
       <translation> (код </translation>
     </message>
@@ -1602,8 +1614,8 @@ On device</source>
 Download an EPUB or FB2 from the catalog.</source><translation>Пока нечего синхронизировать.
 Скачайте EPUB или FB2 из каталога.</translation></message>
     <message><source>Chapter and excerpt are from the book on this device.</source><translation>Глава и отрывок взяты из книги на этом устройстве.</translation></message>
-    <message><source>This FB2 structure is not supported for sync yet. Images, tables, poetry and long sections require additional validation. You can still read the original file.</source><translation>Синхронизация FB2 с такой структурой пока не поддерживается. Изображения, таблицы, стихи и длинные разделы требуют дополнительной проверки. Исходную книгу можно читать как обычно.</translation></message>
-    <message><source>Experimental FB2 sync: text-only books with short sections. Unsupported structures keep their progress unchanged.</source><translation>Пробная синхронизация FB2: текстовые книги с небольшими разделами. Прогресс книг с неподдерживаемой структурой остаётся без изменений.</translation></message>
+    <message><source>This FB2 structure is not supported for sync yet. Body images, tables, poetry and oversized paragraphs require additional validation. You can still read the original file.</source><translation>Синхронизация FB2 с такой структурой пока не поддерживается. Изображения в тексте, таблицы, стихи и слишком длинные абзацы требуют дополнительной проверки. Исходную книгу можно читать как обычно.</translation></message>
+    <message><source>Experimental FB2 sync: prose books, including covers and long sections. Unsupported structures keep their progress unchanged.</source><translation>Пробная синхронизация FB2: проза, включая книги с обложками и длинными разделами. Прогресс книг с неподдерживаемой структурой остаётся без изменений.</translation></message>
     <message><source>The file, profile or account changed. Retry the operation.</source><translation>Файл, профиль или учётная запись изменились. Повторите операцию.</translation></message>
     <message><source>Checking the book file…</source><translation>Проверяем файл книги…</translation></message>
     <message><source>Verifying the update package…</source><translation>Проверяем пакет обновления…</translation></message>
@@ -1687,6 +1699,10 @@ Download an EPUB or FB2 from the catalog.</source><translation>Пока нече
     <message>
       <source>Update installed, but temporary files could not be removed. Retry cleanup.</source>
       <translation>Обновление установлено, но временные файлы не удалось удалить. Повторите очистку.</translation>
+    </message>
+    <message>
+        <source>Update recovery files need attention. New downloads are blocked to preserve them.</source>
+        <translation>Файлы восстановления обновления требуют проверки. Новые загрузки заблокированы для их сохранности.</translation>
     </message>
 </context>
 </TS>

@@ -41,8 +41,9 @@ bool saveReaderPosition(const QString &path, const QString &expected, const Prep
 }
 bool opened = false, indexed = true;
 QString scanned;
+std::function<void()> afterScan;
 bool openReader(const QString &) { opened = true; return true; }
-void scanBook(const QString &path) { scanned = path; }
+void scanBook(const QString &path) { scanned = path; if (afterScan) afterScan(); }
 bool readerBookIndexed(const QString &) { return indexed; }
 ReaderFileState fakeReader = ReaderFileState::Closed;
 QString blockedPath;
@@ -198,14 +199,33 @@ int main(int argc, char **argv) {
             "resolve second spine and validate element ID assertions");
     require(!epubPosition(root+"/multi.epub","epubcfi(/6/4[wrong]!/4/14/1)",nullptr), "reject wrong CFI ID assertion");
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/14/1:65)";
+    require(wait(c,[&] { c.showDetail(1); }), "open details before syncing reading progress");
+    auto *progressModel=c.bookModel();
+    int progressChanges=0,progressResets=0;
+    const auto progressRoles=progressModel->roleNames();
+    const int progressRole=progressRoles.key("readingProgress");
+    const auto progressConnection=QObject::connect(progressModel,&QAbstractItemModel::dataChanged,&c,
+        [&](const QModelIndex &,const QModelIndex &,const QList<int> &roles) { if (roles.contains(progressRole)) ++progressChanges; });
+    const auto progressResetConnection=QObject::connect(progressModel,&QAbstractItemModel::modelReset,&c,[&] { ++progressResets; });
     const int syncDownloads=requests(root,"GET /api/v1/books/files/101/download")+requests(root,"GET /api/v1/books/files/102/download");
     c.resetPresentationWork();
     require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }), "upload native reading position to empty server");
     require(c.presentationWork().uploadPreparations==1 && !c.presentationWork().remotePreparations && !c.presentationWork().conflictPreviews,
             "upload prepares only the outgoing action");
+    double uploadedPercentage=0;
+    require(epubPosition(file,nativeCfi(fakePosition),&uploadedPercentage) &&
+            c.books()[0].toMap().value("readingProgress",-1).toDouble()==uploadedPercentage &&
+            c.detail().value("readingProgress",-1).toDouble()==uploadedPercentage &&
+            c.detail()["readStatus"].toMap()["status"]=="reading",
+            "confirmed upload updates catalog and open details with server reading state");
+    require(progressChanges==1 && !progressResets && c.bookModel()==progressModel,
+            "progress update notifies its model role without resetting the library");
+    QObject::disconnect(progressConnection); QObject::disconnect(progressResetConnection);
     require(c.syncSummary()["synced"].toInt()==1, "only confirmed sync contributes to success count");
     Client statusRestart(endpoint,root);
     require(statusRestart.syncSummary()["synced"].toInt()==1, "confirmed status survives restart without a network session");
+    require(statusRestart.books()[0].toMap().value("readingProgress",-1).toDouble()==uploadedPercentage,
+            "synced percentage survives an offline restart");
     networkAvailable=false;
     require(!wait(c,[&] { c.syncFile(101); }) && c.syncBooks()[0].toMap()["state"]=="network", "explicit network refusal becomes waiting state");
     networkAvailable=true;
@@ -217,16 +237,29 @@ int main(int argc, char **argv) {
             "unchanged progress uses GET without downloading EPUB again");
     require(!c.presentationWork().uploadPreparations && !c.presentationWork().remotePreparations && !c.presentationWork().conflictPreviews,
             "equal positions prepare neither direction");
+    const int beforeMetadataPosts=requests(root,"POST /api/v1/books/files/101/progress");
+    write(fault,"detail_error");
+    require(!wait(c,[&] { c.syncFile(101); }) && c.books()[0].toMap()["readingProgress"]==uploadedPercentage,
+            "metadata refresh failure is visible and keeps the last displayed percentage");
+    write(fault,"");
+    require(wait(c,[&] { c.syncFile(101); }) && requests(root,"POST /api/v1/books/files/101/progress")==beforeMetadataPosts,
+            "retry after metadata failure keeps the agreed position without another upload");
     fakePosition="pbr:/webkit?##epubcfi(/6/2!/4/6/1)";
     const int beforeMovedDownload=requests(root,"GET /api/v1/books/files/101/download");
     require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }), "sync deliberate backwards reading without percentage ordering");
+    require(c.books()[0].toMap().value("readingProgress",-1).toDouble()<uploadedPercentage &&
+            c.detail()["readingProgress"]==c.books()[0].toMap()["readingProgress"],
+            "backwards sync lowers both visible percentages");
     require(requests(root,"GET /api/v1/books/files/101/download")==beforeMovedDownload,
             "changed local position uploads without downloading EPUB");
     write(fault,"progress_remote");
+    const auto beforeIncoming=c.books()[0].toMap()["readingProgress"];
     applyAllowed=false; opened=false; c.resetPresentationWork();
     require(!wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }), "native write failure is not reported as synchronization success");
     require(c.presentationWork().remotePreparations==1 && !c.presentationWork().uploadPreparations && !c.presentationWork().conflictPreviews,
             "incoming position prepares only the native action");
+    require(c.books()[0].toMap()["readingProgress"]==beforeIncoming && c.detail()["readingProgress"]==beforeIncoming,
+            "failed native apply does not publish incoming percentage as synced");
     Client pendingRestart(endpoint,root);
     pendingRestart.showDownloaded(true);
     require(pendingRestart.books()[0].toMap()["pendingProgress"].toBool(), "incoming position survives restart");
@@ -240,7 +273,14 @@ int main(int argc, char **argv) {
     require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && appliedCfi=="epubcfi(/6/2!/4/62/1)" && !opened,
             "retry saves pending incoming CFI without opening any book");
     require(!c.books()[0].toMap()["pendingProgress"].toBool(), "confirmed native write clears pending state");
+    require(c.books()[0].toMap().value("readingProgress",-1).toDouble()==40 && c.detail().value("readingProgress",-1).toDouble()==40,
+            "incoming sync updates catalog and open details from the confirmed server percentage");
+    c.closeDetail();
     require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }), "acknowledge applied position without echo upload");
+    write(fault,"progress_percentage_zero");
+    require(wait(c,[&] { c.syncFile(101); }) && !c.books()[0].toMap()["readingProgress"].isNull() &&
+            c.books()[0].toMap()["readingProgress"].toDouble()==0,
+            "equal positions still refresh a changed server percentage including zero");
     write(fault,"progress_range");
     require(wait(c,[&] { c.syncFile(c.books().first().toMap()["fileId"].toInt()); }) && appliedCfi=="epubcfi(/6/2!/4/42/1:0)" && !opened,
             "incoming server range saves a point without launching reader");
@@ -522,6 +562,7 @@ int main(int argc, char **argv) {
     require(QDir().rmdir(recordPath) && QFile::rename(recordPath+".saved",recordPath),
             "restore record before restart checkpoint");
     Client beforeReplacement(endpoint,root);
+    require(waitForMaintenance(beforeReplacement),"failed replacement recovery settles before retry");
     require(QJsonDocument::fromJson(contents(recordPath)).object()["progress"].toObject()==progressBeforeRepair &&
             !beforeReplacement.localFile(0).isEmpty(),
             "restart between failed and completed replacement keeps same-EPUB progress");
@@ -535,6 +576,7 @@ int main(int argc, char **argv) {
     require(!wait(c, [&] { c.download(0); }) && c.localFile(0) == changedFile, "failed metadata write preserves current EPUB");
     require(QDir().rmdir(recordPath) && QFile::rename(recordPath+".saved", recordPath), "restore metadata record");
     Client afterFailure(endpoint, root);
+    require(waitForMaintenance(afterFailure),"metadata failure recovery settles");
     afterFailure.showDownloaded(true);
     require(!afterFailure.localFile(0).isEmpty(), "restart after metadata failure keeps previous book");
     const QString orphan = scope+"/101-"+QUuid::createUuid().toString(QUuid::WithoutBraces)+".epub";
@@ -547,6 +589,7 @@ int main(int argc, char **argv) {
     const QString legacyOrphan = scope+"/997.epub";
     write(firstOrphan, "first interrupted download"); write(pdfOrphan, "%PDF-old"); write(legacyOrphan, "unproven legacy file");
     Client afterCrash(endpoint, root);
+    require(waitForMaintenance(afterCrash),"restart transfer cleanup completes before checking orphans");
     require(!QFile::exists(orphan) && !QFile::exists(orphanPart) && !QFile::exists(orphanPart+".ABC123"),
             "restart removes only owned unreferenced versions and partial downloads");
     require(!QFile::exists(firstOrphan) && !QFile::exists(pdfOrphan) && QFile::exists(legacyOrphan),
@@ -798,7 +841,7 @@ int main(int argc, char **argv) {
             const QString nextPath = directory+"/"+nextStem+"."+format, previousPath = directory+"/"+previousStem+"."+format;
             const QString part = caseScope+"/"+nextStem+".part", journal = caseScope+"/transfers/"+nextStem+".json";
             const QByteArray nextBytes = format == "epub" ? recoveryEpub : QByteArray("%PDF-1.4\nsynthetic recovery\n");
-            const QByteArray previousBytes = nextBytes+"previous";
+            const QByteArray previousBytes = format=="epub" ? contents(root+"/compressed.epub") : nextBytes+"previous";
             auto recordFor = [&](const QString &stem, const QByteArray &bytes) {
                 QJsonObject file{{"id",700},{"format",format},{"role","primary"},{"sizeBytes",double(bytes.size())}};
                 QJsonObject book{{"id",700},{"title","Recovery"},{"selectedFile",file},{"files",QJsonArray{file}}};
@@ -838,6 +881,7 @@ int main(int argc, char **argv) {
                 fakeReader=ReaderFileState::Closed;
                 write(nextPath,nextBytes+"damaged");
                 Client damaged(endpoint,caseRoot);
+                require(waitForMaintenance(damaged),"damaged recovery validation settles before restoring its fixture");
                 require(QFile::exists(previousPath) && QFile::exists(journal), "unconfirmed current file preserves previous version");
                 write(nextPath,nextBytes);
                 const QString foreignPath=directory+"/foreign."+format;
@@ -849,6 +893,7 @@ int main(int argc, char **argv) {
                         "recovery preserves symlinks and their unrelated targets");
                 require(QFile::remove(previousPath), "remove test symlink");
             }
+            std::printf("RECOVERY: format=%s shared=%d replacement=%d phase=%d\n",qPrintable(format),shared,replacement,phase);
             Client recovered(endpoint,caseRoot);
             require(waitForMaintenance(recovered),"background recovery validation completes");
             require(!QFile::exists(journal) && !QFile::exists(part), "restart resolves durable transfer journal and staging file");
@@ -922,6 +967,12 @@ int main(int argc, char **argv) {
     require(wait(features,[&] { features.resolveProgress(false); }) && fakePosition=="pbr:/word?page=0&offs=0", "server FB2 position maps back to native coordinates");
     require(wait(features,[&] { features.syncFile(202); }) &&
             requests(root,"POST /api/v1/books/files/202/progress")==1, "applied FB2 position is acknowledged without echo");
+    require(features.detail().value("readingProgress",-1).toDouble()==63,
+            "syncing another format retains the server percentage of the primary file");
+    const auto formatScope=QFileInfo(fb2Path).absolutePath();
+    for (const auto *key:{"201","202"})
+        require(QJsonDocument::fromJson(contents(formatScope+"/records/"+key+".json")).object()["book"].toObject()["readingProgress"].toDouble(-1)==63,
+                "reading state is saved consistently across downloaded formats of the same book");
     require(contents(fb2Path)==originalFb2, "FB2 sync preserves the original file bytes");
     fakePosition=previousPosition;
     write(fault,"features");
@@ -938,6 +989,7 @@ int main(int argc, char **argv) {
     write(categoriesRoot+"/accounts.json",contents(featureRoot+"/accounts.json"));
     auto categoryRecord=QJsonDocument::fromJson(contents(featureRoot+"/"+QFileInfo(scope).fileName()+"/records/101.json")).object();
     categoryRecord.remove("directory");
+    categoryRecord.remove("progress");
     require(QFile::copy(epubPath,categoriesScope+"/"+categoryRecord["filename"].toString()),"copy category fixture EPUB into its own scope");
     for (const auto &state:QStringList{"unknown","network","conflict","reader","reader_unknown","pending","uncertain","auth","file","position","error","synced"}) {
         categoryRecord["syncStatus"]=QJsonObject{{"state",state},{"profile",fakeProfile}};
@@ -1092,5 +1144,35 @@ int main(int argc, char **argv) {
     Client boundedCache(endpoint,coverRoot,nullptr,false);
     require(QDir(coverScope).entryList({"cover-*.png"},QDir::Files).size()==64,
             "restart bounds transient cover cache to 64 files");
+    // First-download restoration waits for native registration and never uploads.
+    for (int scenario=0;scenario<6;++scenario) {
+        Client restore(endpoint,root+"/restore-"+QString::number(scenario));
+        write(fault,"features");
+        require(wait(restore,[&] { restore.login(restore.server(),"demo","demo"); }),"restore fixture signs in");
+        require(wait(restore,[&] { restore.showDetail(1); }),"restore fixture selects FB2");
+        restore.selectFile(202);
+        const QString initial=scenario==0 ? "pbr:/page?page=0" : scenario==4 ? "pbr:/word?page=0&offs=0" : scenario==5 ? "pbr:/page?page=1" : "";
+        fakePosition=initial; appliedCfi.clear(); indexed=false;
+        fakeReader=scenario==2 ? ReaderFileState::Open : ReaderFileState::Closed;
+        const int before=requests(root,"POST /api/v1/books/files/202/progress");
+        write(fault,"fb2_restore");
+        afterScan=[&] {
+            if (scenario!=1) QTimer::singleShot(500,&restore,[] { indexed=true; });
+            if (scenario==3) QTimer::singleShot(100,&restore,[] { fakeProfile="changed-before-registration"; });
+        };
+        require(wait(restore,[&] { restore.downloadSelected(); }),"download remains successful even when restoration needs attention");
+        afterScan={};
+        require(!restore.localFile(0).isEmpty() && requests(root,"POST /api/v1/books/files/202/progress")==before,
+                "automatic restore retains original FB2 and never uploads progress");
+        if (scenario==0) {
+            require(appliedCfi=="epubcfi(/6/2!/4/2/4/1:4)" && fakePosition=="pbr:/word?page=0&offs=21",
+                    "first FB2 download automatically restores server position after delayed indexing");
+            require(restore.syncBooks().first().toMap()["state"]=="synced","automatic restore persists synchronization result");
+        } else {
+            require(appliedCfi.isEmpty() && fakePosition==initial,"timeout, open reader, changed profile or existing position prevents restoration");
+            require(!restore.status().isEmpty(),"retained download reports why restoration did not finish");
+        }
+        fakeReader=ReaderFileState::Closed; fakeProfile="default"; indexed=true;
+    }
     std::puts("PASS: stage 3 client checks");
 }
