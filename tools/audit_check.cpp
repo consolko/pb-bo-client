@@ -285,6 +285,15 @@ void commitBoundaryChecks(const QUrl &endpoint,const QString &root,const QString
         Client recovery(endpoint,root+"/progress-intents"); require(waitForLibrary(recovery),"restart loads progress journal after storage fault");
         require(ClientWorkerCheck::record(recovery,"101")["progress"]==saved,"disk and memory agree after restart of failed intent");
     }
+    {
+        auto record=ClientWorkerCheck::record(client,"101"); record["syncStatus"]=QJsonObject{{"state","synced"}};
+        storageFaults=0; storageFailure=StorageFailure::ProgressDirectory;
+        const bool saved=ClientWorkerCheck::save(client,"101",record);
+        storageFailure=StorageFailure::None;
+        require(!saved && storageFaults>0 && ClientWorkerCheck::record(client,"101")==record &&
+            QJsonDocument::fromJson(bytes(storageScope+"/records/101.json")).object()==record,
+            "unconfirmed record sync reports failure while memory matches the replaced file");
+    }
     position=previousPosition; mode(fault,"");
 #else
     Q_UNUSED(endpoint) Q_UNUSED(root) Q_UNUSED(fault)
@@ -731,6 +740,54 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
     history={};
 }
 
+void syncCollectionNavigationChecks(const QUrl &endpoint,const QString &root,const QString &fault) {
+    mode(fault,"features");
+    Client client(endpoint,root+"/sync-collection",nullptr,false);
+    require(waitForLibrary(client),"registry snapshot loaded");
+    require(wait(client,[&] { client.login(endpoint.toString(),"demo","demo"); }),"login for sync collection navigation");
+    require(wait(client,[&] { client.showDetail(1); }),"load book with collection links");
+    client.selectFile(101);
+    require(wait(client,[&] { client.downloadSelected(); }),"download EPUB for sync list");
+    client.closeDetail(); client.showDownloaded(true); require(waitForRecents(client),"downloaded library ready");
+    QQmlApplicationEngine engine; int warnings=0;
+    QObject::connect(&engine,&QQmlApplicationEngine::warnings,&engine,[&](const QList<QQmlError> &errors) {
+        for (const auto &error:errors) { ++warnings; std::fprintf(stderr,"%s\n",qPrintable(error.toString())); }
+    });
+    engine.rootContext()->setContextProperty("client",&client);
+    engine.rootContext()->setContextProperty("screenWidth",600); engine.rootContext()->setContextProperty("screenHeight",800);
+    engine.load(QUrl("qrc:/Main.qml")); require(!engine.rootObjects().isEmpty(),"load QML for sync collection navigation");
+    auto window=qobject_cast<QQuickWindow *>(engine.rootObjects().first()); require(window,"sync navigation window");
+    window->setProperty("syncView",true); window->setProperty("syncBookKey","book:1");
+    client.showSyncFile(101);
+    require(until([&] { return client.detailVisible(); }) && window->property("syncView").toBool(),"Sync opens About this book");
+    std::function<QQuickItem *(QQuickItem *)> link=[&](QQuickItem *item) -> QQuickItem * {
+        if (item->property("text").toString().endsWith("  ›") && item->isVisible()) return item;
+        for (auto child:item->childItems()) if (auto found=link(child)) return found;
+        return nullptr;
+    };
+    auto action=link(window->contentItem()); require(action,"card shows a collection link");
+    require(wait(client,[&] { require(QMetaObject::invokeMethod(action,"clicked"),"click collection link"); }),"collection loads from sync card");
+    auto catalog=window->findChild<QQuickItem *>("catalog"),syncDetails=window->findChild<QQuickItem *>("syncDetails");
+    require(catalog && syncDetails && client.collectionId()>0 && !client.detailVisible(),"collection replaces the card");
+    require(until([&] { return catalog->isVisible(); }) && !window->property("syncView").toBool() && !syncDetails->isVisible() && !warnings,
+            "collection opened from Sync is visible without QML errors");
+    mode(fault,"");
+}
+
+void staleFirstDownloadChecks(const QUrl &endpoint,const QString &root,const QString &fault) {
+    mode(fault,"");
+    Client client(endpoint,root+"/stale-first-download",nullptr,false);
+    require(waitForLibrary(client),"registry snapshot loaded");
+    require(wait(client,[&] { client.login(endpoint.toString(),"demo","demo"); }),"login with catalog file size");
+    const auto count=[&](const char *route) { return QJsonDocument::fromJson(bytes(root+"/requests.json")).object()[route].toInt(); };
+    const auto details=count("GET /api/v1/books/1");
+    mode(fault,"audit_new_file");
+    require(!wait(client,[&] { client.download(0); }) && client.canRetry(),"first download rejects a byte count changed after the catalog");
+    require(wait(client,[&] { client.retry(); }) && count("GET /api/v1/books/1")>details && !client.localFile(0).isEmpty(),
+            "Retry of a first download resolves current file metadata");
+    mode(fault,"");
+}
+
 int main(int argc,char **argv) {
     QGuiApplication app(argc,argv);
     if (argc==4 && QString::fromLocal8Bit(argv[1])=="--epub-memory") {
@@ -807,8 +864,8 @@ int main(int argc,char **argv) {
     require(epubPosition(cachePath,point,&percentage) && progressWork().packages==3,"atomic replacement also invalidates the index");
     require(QFile::remove(cachePath+".held"),"remove superseded cache fixture");
     for (const auto &name:QStringList{"plain","doctype","comment","cdata","unicode"})
-        require(epubPosition(fixture(name),point,&percentage),"exercise bounded multi-book cache");
-    require(progressWork().cachedBooks<=4 && progressWork().cachedBytes<=16*1024*1024 && progressWork().cachedNodes<=100000 && progressWork().evictions>0,
+        require(epubPosition(fixture(name),point,&percentage),"exercise one-slot book cache");
+    require(progressWork().cachedBooks<=1 && progressWork().cachedBytes<=16*1024*1024 && progressWork().cachedNodes<=100000 && progressWork().evictions>0,
             "cache enforces book, memory and DOM-node limits");
     expireEpubCache(); require(!progressWork().cachedBooks,"idle lifetime releases cached books");
     {
@@ -974,6 +1031,8 @@ int main(int argc,char **argv) {
             bytes(replacement)==replacementBytes && bytes(recordPath)==recordBefore,
             "ordinary ZIP cannot replace a valid EPUB or its persisted record");
     storageFailureChecks(endpoint,root,fault);
+    staleFirstDownloadChecks(endpoint,root,fault);
+    syncCollectionNavigationChecks(endpoint,root,fault);
     commitBoundaryChecks(endpoint,root,fault);
     modelChecks();
     presentationChecks(app,russian,endpoint,root);

@@ -200,7 +200,7 @@ thread_local ProgressWork progressCounters;
 struct EpubIndex;
 void reserveEpubWork(EpubIndex *index);
 struct EpubIndex {
-    struct Chapter { QDomDocument document; qint64 cost=0,used=0; int nodes=0; };
+    struct Chapter { QDomDocument document; qint64 cost=0; int nodes=0; };
     struct Length { qint64 text=0,bytes=0; };
     FileStamp stamp;
     Zip zip;
@@ -209,7 +209,7 @@ struct EpubIndex {
     QHash<QString,Chapter> chapters;
     QHash<QString,Length> lengths;
     QList<qint64> offsets;
-    qint64 total=0,used=0,sequence=0,packageBytes=0,baseCost=0;
+    qint64 total=0,used=0,packageBytes=0,baseCost=0;
     bool valid=false,complete=false;
     explicit EpubIndex(const QString &path,const FileStamp &identity):stamp(identity),zip(path) {
 #ifdef BOOKORBIT_TEST_HTTP
@@ -233,7 +233,7 @@ struct EpubIndex {
     QDomDocument chapter(const QString &resource) {
         if (fileTaskCancelled() || resource.isEmpty()) return {};
         auto existing=chapters.find(resource);
-        if (existing!=chapters.end()) { existing->used=++sequence; return existing->document; }
+        if (existing!=chapters.end()) return existing->document;
         reserveEpubWork(this);
         // Extraction and DOM have a separate working budget from retained cache storage.
         zip.budget=32*1024*1024;
@@ -247,12 +247,9 @@ struct EpubIndex {
         lengths[resource]={length,bytes.size()};
         const auto charge=qint64(bytes.size())*4+qint64(count)*256;
         if (charge<=epubCacheBytes && count<=epubCacheNodes) {
-            chapters[resource]={document,charge,++sequence,count};
-            while (!chapters.isEmpty() && (chapters.size()>2 || cost()>epubCacheBytes || nodes()>epubCacheNodes)) {
-                auto oldest=chapters.begin();
-                for (auto it=chapters.begin();it!=chapters.end();++it) if (it->used<oldest->used) oldest=it;
-                chapters.erase(oldest);
-            }
+            // reserveEpubWork() emptied the cache, so this is the only retained chapter.
+            chapters[resource]={document,charge,count};
+            if (cost()>epubCacheBytes || nodes()>epubCacheNodes) chapters.clear();
         }
         return document;
     }
@@ -285,71 +282,59 @@ struct EpubIndex {
 struct EpubCache {
     QElapsedTimer clock;
     QTimer timer;
-    QHash<QString,std::shared_ptr<EpubIndex>> books;
+    // Package construction reserves the working budget, so one book is retained.
+    QString key;
+    std::shared_ptr<EpubIndex> book;
     EpubCache() {
         clock.start(); timer.setSingleShot(true);
         QObject::connect(&timer,&QTimer::timeout,[this] { trim(); });
     }
+    void reset() { key.clear(); book.reset(); }
     void trim() {
-        qint64 bytes=0; int nodes=0;
-        for (auto it=books.begin();it!=books.end();) {
-            if (clock.elapsed()-it.value()->used>=epubLifetime) it=books.erase(it);
-            else { bytes+=it.value()->cost(); nodes+=it.value()->nodes(); ++it; }
-        }
-        while (books.size()>4 || bytes>epubCacheBytes || nodes>epubCacheNodes) {
-            auto oldest=books.begin();
-            for (auto it=books.begin();it!=books.end();++it) if (it.value()->used<oldest.value()->used) oldest=it;
-            bytes-=oldest.value()->cost(); nodes-=oldest.value()->nodes(); books.erase(oldest);
+        timer.stop();
+        if (!book) return;
+        if (clock.elapsed()-book->used>=epubLifetime) { reset(); return; }
+        if (book->cost()>epubCacheBytes || book->nodes()>epubCacheNodes) {
+            reset();
 #ifdef BOOKORBIT_TEST_HTTP
             ++progressCounters.evictions;
 #endif
+            return;
         }
-        timer.stop();
-        if (!books.isEmpty()) {
-            qint64 next=epubLifetime;
-            for (const auto &book:books) next=qMin(next,epubLifetime-(clock.elapsed()-book->used));
-            timer.start(int(qMax(qint64(1),next)));
-        }
+        timer.start(int(qMax(qint64(1),epubLifetime-(clock.elapsed()-book->used))));
     }
     std::shared_ptr<EpubIndex> get(const QString &path) {
-        trim(); const auto key=QFileInfo(path).absoluteFilePath(); const auto stamp=fileStamp(path);
-        if (!stamp.valid) { books.remove(key); return {}; }
-        auto result=books.value(key);
-        if (result && result->stamp==stamp) {
+        trim(); const auto name=QFileInfo(path).absoluteFilePath(); const auto stamp=fileStamp(path);
+        if (!stamp.valid) { if (key==name) reset(); return {}; }
+        if (book && key==name && book->stamp==stamp) {
 #ifdef BOOKORBIT_TEST_HTTP
             ++progressCounters.hits;
 #endif
         } else {
             // No caller retains a chapter DOM across another package construction.
 #ifdef BOOKORBIT_TEST_HTTP
-            progressCounters.evictions+=books.size();
+            if (book) ++progressCounters.evictions;
 #endif
-            books.clear(); result=std::make_shared<EpubIndex>(path,stamp);
+            reset(); auto result=std::make_shared<EpubIndex>(path,stamp);
             if (!result->valid) return {};
-            books[key]=result;
+            key=name; book=result;
         }
-        result->used=clock.elapsed(); return result;
+        book->used=clock.elapsed(); return book;
     }
 };
 thread_local EpubCache epubCache;
-void reserveEpubWork(EpubIndex *index) {
-    for (auto it=epubCache.books.begin();it!=epubCache.books.end();) {
-        if (it.value().get()!=index) it=epubCache.books.erase(it);
-        else ++it;
-    }
-    index->chapters.clear();
-}
+void reserveEpubWork(EpubIndex *index) { index->chapters.clear(); }
 }
 void clearFb2Cache();
-void clearEpubCache() { epubCache.books.clear(); epubCache.timer.stop(); clearFb2Cache(); }
+void clearEpubCache() { epubCache.reset(); epubCache.timer.stop(); clearFb2Cache(); }
 #ifdef BOOKORBIT_TEST_HTTP
 ProgressWork progressWork() {
-    auto result=progressCounters; result.cachedBooks=epubCache.books.size();
-    for (const auto &book:epubCache.books) { result.cachedBytes+=book->cost(); result.cachedNodes+=book->nodes(); }
+    auto result=progressCounters;
+    if (const auto &book=epubCache.book) { result.cachedBooks=1; result.cachedBytes=book->cost(); result.cachedNodes=book->nodes(); }
     return result;
 }
 void resetProgressWork() { clearEpubCache(); progressCounters={}; }
-void expireEpubCache() { for (const auto &book:epubCache.books) book->used=epubCache.clock.elapsed()-epubLifetime; epubCache.trim(); }
+void expireEpubCache() { if (epubCache.book) epubCache.book->used=epubCache.clock.elapsed()-epubLifetime; epubCache.trim(); }
 #endif
 
 QString nativeCfi(const QString &position) {
@@ -405,10 +390,10 @@ bool epubPosition(const QString &path, const QString &cfi, double *percentage, Q
         if (!index->estimate()) return false;
         const qint64 position=index->offsets[chapter]+before;
         if (position<0 || position>index->total) return false;
-        if (fileTaskCancelled() || fileStamp(path)!=index->stamp) { epubCache.books.remove(QFileInfo(path).absoluteFilePath()); return false; }
+        if (fileTaskCancelled() || fileStamp(path)!=index->stamp) { epubCache.reset(); return false; }
         *percentage=100.0*double(position)/double(index->total);
     }
-    if (fileTaskCancelled() || fileStamp(path)!=index->stamp) { epubCache.books.remove(QFileInfo(path).absoluteFilePath()); return false; }
+    if (fileTaskCancelled() || fileStamp(path)!=index->stamp) { epubCache.reset(); return false; }
 
     if (point) *point="epubcfi("+parts[0]+"!"+start+")";
     if (context) *context=resolvedContext;
@@ -469,7 +454,7 @@ bool validEpub(const QString &path) {
     return true;
 }
 namespace {
-struct FbParagraph { QDomElement node; int section, page; qint64 offset; };
+struct FbParagraph { QDomElement node; int section, page; qint64 offset; qint64 length=0, start=0; };
 struct FbBook { QList<QDomDocument> sections; QList<FbParagraph> paragraphs; qint64 total=0; };
 
 // shortcut: PB634 prose only; body images, tables and poetry need native-model calibration.
@@ -508,10 +493,11 @@ bool fbConvert(const QDomElement &source, QDomElement parent, FbBook &book,
         } else if (!child.isProcessingInstruction()) return false;
     }
     if (paragraph) {
-        offset+=textSize(node)+1;
-        book.total+=textSize(node)+1;
+        const auto length=textSize(node);
+        offset+=length+1;
+        book.total+=length+1;
         // shortcut: keep oversized paragraphs blocked until native paragraph splitting is calibrated.
-        if (textSize(node)>60000) return false;
+        if (length>60000) return false;
     }
     return true;
 }
@@ -559,9 +545,10 @@ bool loadFb(const QString &path, FbBook &book) {
     // U634 word pages split before the paragraph that reaches 2048 text units.
     // Paragraph delimiters affect offsets, but do not count toward the split.
     int storage=-1,nativePage=-1;
-    qint64 pageText=0,pageStart=0;
+    qint64 pageText=0,pageStart=0,start=0;
     for (auto &paragraph:book.paragraphs) {
         const auto length=textSize(paragraph.node);
+        paragraph.length=length; paragraph.start=start; start+=length+1;
         if (paragraph.page!=storage) {
             storage=paragraph.page; ++nativePage; pageText=0; pageStart=paragraph.offset;
         } else if (pageText+length>=2048) {
@@ -683,7 +670,7 @@ bool fbResolve(const FbBook &book,int section,const QString &path,FbLocation &lo
         const auto &p=book.paragraphs[i]; if (p.section!=section) continue;
         if (within(target,p.node)) {
             const auto offset=before-fbBefore(p.node);
-            if (offset<0 || offset>textSize(p.node)) return false;
+            if (offset<0 || offset>p.length) return false;
             location={i,offset}; return true;
         }
         if (target.isElement() && within(p.node,target)) { location={i,0}; return true; }
@@ -720,8 +707,7 @@ bool fbPosition(const QString &path,const QString &cfi,double *percentage,QStrin
     if (native) *native=fbNative(p,first.offset);
     if (point) *point=fbTextPoint(p,first.offset);
     if (percentage || resolved) {
-        qint64 before=first.offset;
-        for (int i=0;i<first.paragraph;++i) before+=textSize(book.paragraphs[i].node)+1;
+        const qint64 before=p.start+first.offset;
         if (percentage) *percentage=100.0*double(before)/double(book.total);
         if (resolved) { resolved->offset=before; resolved->total=book.total; }
     }
@@ -764,7 +750,7 @@ QString bookCfi(const QString &path,const QString &position,const Fb2Snapshot &s
     const auto fb=snapshot ? snapshot : fb2Index(path);
     if (!currentFb(path,fb)) return {};
     for (const auto &p:fb->book.paragraphs)
-        if (p.page==page && offset>=p.offset && offset<=p.offset+textSize(p.node)) {
+        if (p.page==page && offset>=p.offset && offset<=p.offset+p.length) {
             const auto point=fbTextPoint(p,offset-p.offset); return currentFb(path,fb) ? point : QString{};
         }
     return {};

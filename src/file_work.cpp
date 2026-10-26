@@ -1,6 +1,10 @@
 #include "file_work.h"
 #include "progress.h"
+#include "i18n.h"
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QFile>
+#include <QHash>
 #include <QFileInfo>
 #include <QCryptographicHash>
 #include <QXmlStreamReader>
@@ -110,6 +114,19 @@ QByteArray digestFile(const QString &path,const FileCancellation &cancel) {
     }
     return !fileCancelled(cancel) && fileStamp(path)==before ? hash.result().toHex() : QByteArray{};
 }
+// shortcut: vfat keeps mtime to 2 s, so a same-size rewrite within 2 s of a check is not seen; explicit library verification always rereads.
+QByteArray cachedDigest(const QString &path,const FileCancellation &cancel) {
+    thread_local QHash<QString,std::pair<FileStamp,QByteArray>> cache;
+    const auto stamp=fileStamp(path);
+    if (!stamp.valid) return {};
+    if (const auto it=cache.constFind(path); it!=cache.constEnd() && it->first==stamp) return it->second;
+    const auto digest=digestFile(path,cancel);
+    if (!digest.isEmpty() && fileStamp(path)==stamp) {
+        if (cache.size()>4096) cache.clear();
+        cache.insert(path,{stamp,digest});
+    }
+    return digest;
+}
 bool validContent(const QString &path,const QString &format,const FileCancellation &cancel) {
     QFile file(path);
     if (fileCancelled(cancel) || !file.open(QIODevice::ReadOnly)) return false;
@@ -130,7 +147,7 @@ FileStamp fb2Calibration(const FileCancellation &cancel) {
 #ifdef POCKETBOOK_DEVICE
     const QString path=QFileInfo("/ebrmain/lib/libpbrdwrapper.so").canonicalFilePath();
     const auto before=fileStamp(path);
-    return digestFile(path,cancel)=="ab547f547a9e80338434c3c072dd7b560254a3d7f5a74a9adc58c89f0900b965" &&
+    return cachedDigest(path,cancel)=="ab547f547a9e80338434c3c072dd7b560254a3d7f5a74a9adc58c89f0900b965" &&
         fileStamp(path)==before ? before : FileStamp{};
 #else
     Q_UNUSED(cancel)
@@ -146,7 +163,7 @@ PreparedReaderPosition prepareReaderPosition(const QString &path,const QString &
 #ifdef POCKETBOOK_DEVICE
     const QString framework=QFileInfo("/ebrmain/lib/libframework2.so").canonicalFilePath();
     const auto before=fileStamp(framework);
-    if (digestFile(framework,cancel)=="69de9e57ddb9d96f6d38e54150a120efd061dbe524f8d430f90ff5b39a10c5f9" &&
+    if (cachedDigest(framework,cancel)=="69de9e57ddb9d96f6d38e54150a120efd061dbe524f8d430f90ff5b39a10c5f9" &&
         fileStamp(framework)==before) result.framework=before;
 #else
     result.framework.valid=true;
@@ -154,4 +171,29 @@ PreparedReaderPosition prepareReaderPosition(const QString &path,const QString &
     if (path.endsWith(".fb2",Qt::CaseInsensitive)) result.fb2=fb2Calibration(cancel);
     if (fileCancelled(cancel) || fileStamp(path)!=result.file) result.coordinate=result.estimate=false;
     return result;
+}
+
+QJsonObject readObject(const QString &path) {
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly) || file.size() > maxJson) return {};
+    return QJsonDocument::fromJson(file.readAll()).object();
+}
+bool writeObject(const QString &path, const QJsonObject &object, UiMessage *error) {
+    const QString directory = QFileInfo(path).absolutePath();
+    if (!QDir().mkpath(directory)) {
+        if (error) *error = uiMessage("storage_create_folder").arg(directory);
+        return false;
+    }
+    QSaveFile file(path);
+    const auto bytes = QJsonDocument(object).toJson();
+    if (bytes.size() > maxJson) { if (error) *error = uiMessage("storage_file_too_large"); return false; }
+    if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) {
+        if (error) *error = uiMessage("storage_write_failed").arg(path).arg(int(file.error()));
+        return false;
+    }
+    return true;
+}
+bool positiveId(const QJsonValue &value) {
+    return value.isDouble() && value.toDouble() > 0 &&
+           value.toDouble() <= 2147483647 && value.toDouble() == value.toInt();
 }

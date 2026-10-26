@@ -292,6 +292,17 @@ class Handler(BaseHTTPRequestHandler):
                 current = self.server.progress.setdefault(file_id, {"cfi": None, "percentage": 0})
                 current["pageNumber"] = 37
                 fault.write_text("")
+            at = re.fullmatch(r"progress_at_(\d+)(_seconds)?", mode)
+            if at:  # persistent: every request sees a fixed server record, optionally with another coordinate
+                self.server.progress[file_id] = {"cfi": f"epubcfi(/6/2!/4/{at[1]}/1)", "pageNumber": None, "percentage": 40,
+                                                 **({"positionSeconds": 12.5} if at[2] else {})}
+            if mode == "progress_without_cfi":  # persistent: percentage but no exact position
+                self.server.progress[file_id] = {"cfi": None, "pageNumber": None, "percentage": 25}
+            if mode == "confirm_changed" and self.command == "POST":
+                fault.write_text("confirm_changed_get")
+            if mode == "confirm_changed_get" and self.command == "GET":  # the confirming read sees another CFI
+                self.server.progress[file_id] = {"cfi": "epubcfi(/6/2!/4/88/1)", "pageNumber": None, "percentage": 50}
+                fault.write_text("")
             if mode == "progress_page_conflict":
                 self.server.progress[file_id] = {"cfi": "epubcfi(/6/2!/4/82/1)", "pageNumber": 37, "percentage": 40}
                 fault.write_text("")

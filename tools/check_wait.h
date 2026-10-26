@@ -10,8 +10,8 @@ struct ClientWorkerCheck {
     static bool recentsIdle(const Client &client) { return !client.registryLoading && !client.recentsScheduled && !client.recentsRequested; }
     static void changeAccount(Client &client) { ++client.accountGeneration; }
     static bool receiving(const Client &client) { return client.activeDownload && !client.activeDownload->isFinished(); }
-    static bool coverPending(const Client &client) { return bool(client.coverTask); }
-    static void stopCovers(Client &client) { client.stopCovers(); }
+    static bool coverPending(const Client &client) { return bool(client.covers.task); }
+    static void stopCovers(Client &client) { client.covers.stop(); }
     static FileCancellation task(const Client &client) { return client.fileTask; }
     static bool cleanupRunning(const Client &client) { return client.cleanupState==Client::CleanupState::Running; }
     static bool cleanupCancelled(const Client &client) { return client.cleanupState==Client::CleanupState::Cancelled; }

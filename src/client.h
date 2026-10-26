@@ -4,6 +4,8 @@
 #include "i18n.h"
 #include "device.h"
 #include "progress.h"
+#include "covers.h"
+#include <QSslConfiguration>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
@@ -96,6 +98,7 @@ class Client : public QObject {
     Q_PROPERTY(bool libraryLoading READ libraryLoading NOTIFY libraryLoadingChanged)
     Q_PROPERTY(bool authenticated READ authenticated NOTIFY connectionChanged)
     Q_PROPERTY(int page READ page NOTIFY catalogChanged)
+    Q_PROPERTY(int pageSize READ catalogPageSize CONSTANT)
     Q_PROPERTY(int total READ total NOTIFY catalogChanged)
     Q_PROPERTY(int coverRevision READ coverRevision NOTIFY coversChanged)
     Q_PROPERTY(QString server READ server NOTIFY connectionChanged)
@@ -177,9 +180,10 @@ public:
     bool libraryLoading() const { return registryLoading; }
     bool authenticated() const { return !token.isEmpty(); }
     int page() const { return currentPage; }
+    int catalogPageSize() const;
     int total() const { return count; }
-    int coverRevision() const { return coverVersion; }
-    Q_INVOKABLE QString coverUrl(int bookId) const;
+    int coverRevision() const { return covers.revision(); }
+    Q_INVOKABLE QString coverUrl(int bookId) const { return covers.url(bookId); }
     QString server() const { return endpoint.toString(); }
     QString username() const { return user; }
     QStringList accounts() const;
@@ -219,13 +223,13 @@ public:
         bool operator==(const PresentationWork &) const = default;
     };
     PresentationWork presentationWork() const {
-        auto result=presentationCounters; result.coverDecodes=coverDecodeCount->load();
+        auto result=presentationCounters; result.coverDecodes=covers.decodes->load();
         result.modelLookups=libraryModel.lookups; result.modelIndexVisits=libraryModel.indexVisits;
         result.modelSequenceVisits=libraryModel.sequenceVisits; result.modelSnapshots=libraryModel.snapshots;
         return result;
     }
     void resetPresentationWork() const {
-        presentationCounters={}; *coverDecodeCount=0; libraryModel.lookups=libraryModel.indexVisits=libraryModel.sequenceVisits=libraryModel.snapshots=0;
+        presentationCounters={}; *covers.decodes=0; libraryModel.lookups=libraryModel.indexVisits=libraryModel.sequenceVisits=libraryModel.snapshots=0;
     }
 #endif
 signals:
@@ -251,7 +255,7 @@ private:
     friend class UpdateManager;
     friend struct ClientWorkerCheck;
     FileExecutor files;
-    FileCancellation fileTask,recentsTask,conflictTask,cleanupTask,coverTask,registryTask;
+    FileCancellation fileTask,recentsTask,conflictTask,cleanupTask,registryTask;
     bool registryLoading=false,committingDownload=false;
     quint64 recordsRevision=0;
     std::function<void()> recordsReady;
@@ -306,7 +310,6 @@ private:
     void clearSyncResult(const QString &id);
 #ifdef BOOKORBIT_TEST_HTTP
     mutable PresentationWork presentationCounters;
-    std::shared_ptr<std::atomic<quint64>> coverDecodeCount=std::make_shared<std::atomic<quint64>>(0);
 #endif
     bool updateLocked=false;
     UiMessage logError;
@@ -319,7 +322,12 @@ private:
     QString conflictDigest;
     QVariantList positionChoices;
     int positionRevision = 0;
+    struct ProgressSync; struct PreparedSync;
     void syncBook(const QString &id, int choice = 0);
+    void compareRemoteProgress(const ProgressSync &sync);
+    void applyProgressAction(const ProgressSync &sync,const PreparedSync &prepared);
+    bool readerChanged(const QString &path,const QString &position,bool changed=false);
+    void saveConflict(const ProgressSync &sync,QJsonObject state,const QVariantList &choices={},const FileStamp &stamp={});
     void finishProgress(const QString &id, const QJsonObject &remote, const UiMessage &text);
     void verifyRemoteFile(const QString &id, bool renew = true);
     void verifyBook(const QString &id);
@@ -353,18 +361,16 @@ private:
     void renewSession(const std::function<void()> &resume);
     void finish(UiMessage text, bool success, const QString &operation, const QString &syncState = {},bool persistStatus=true);
     bool saveRecord(const QString &id, const QJsonObject &record);
-    void saveProgressIntent(const QString &id,const QJsonObject &record,const std::function<void()> &confirmed);
+    QJsonObject progressState(const QString &id,const QString &profile) const;
+    bool persistProgress(const QString &id,const QString &profile,QJsonObject state);
+    void saveProgressIntent(const QString &id,const QString &profile,QJsonObject state,const std::function<void()> &confirmed);
     QString recordFile(const QString &id, const QJsonObject &record) const;
     void loadRecords(bool startup=false);
     void cleanupBooks(const QString &verifiedFile = {});
     void cleanupCovers();
-    void removeCover(int bookId);
-    void queueCovers();
-    void fetchNextCover();
-    void stopCovers();
     QJsonArray visibleItems(bool applyQuery=true) const;
     QString localFile(const QJsonObject &book, LocalFiles *files=nullptr) const;
-    void downloadBook(const QJsonObject &book, bool renew = true);
+    void downloadBook(const QJsonObject &book, bool renew = true, bool refetch = false);
     void transferBook(const QJsonObject &book, bool renew);
     void openBook(const QJsonObject &book, bool applyIncoming);
     QJsonObject selectBookFile(QJsonObject book, LocalFiles *files=nullptr) const;
@@ -377,6 +383,10 @@ private:
     void invalidateSession();
     void logEvent(const QString &event, int code = 0, int http = 0);
     QNetworkAccessManager network;
+    CoverCache covers{network,files,[this](const QString &path) { return request(path); }};
+    // shortcut: a CA file added while running applies after the connection is selected again.
+    mutable QSslConfiguration ssl;
+    mutable QString sslHost;
     QUrl endpoint;
     QString languagePreference = "system";
     QString rootDir, scopeDir, bookDirectory, user;
@@ -387,7 +397,7 @@ private:
     QJsonArray items;
     QJsonArray collectionItems;
     QList<QJsonObject> browseHistory;
-    QJsonObject detailBook, fileChoices, coverVersions, coverRevisions;
+    QJsonObject detailBook, fileChoices;
     UiMessage detailMessage;
     QString activeCollectionName;
     int activeCollection = 0, detailGeneration = 0;
@@ -397,10 +407,8 @@ private:
     QMap<int,QStringList> filesByBook;
     void indexRecord(const QString &id, const QJsonObject &before, const QJsonObject &after);
     QJsonArray savedAccounts;
-    QPointer<QNetworkReply> activeDownload, activeCover;
+    QPointer<QNetworkReply> activeDownload;
     QPointer<QNetworkReply> activeVerification;
-    QList<int> coverQueue;
-    int coverVersion = 0, coverGeneration = 0;
     QJsonObject retryBook;
     QString retryQuery;
     int retryPage = 0, retryKind = 0;

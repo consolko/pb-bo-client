@@ -33,34 +33,18 @@
 
 namespace {
 constexpr qint64 maxBook = 100 * 1024 * 1024;
-constexpr qint64 maxJson = 2 * 1024 * 1024;
 constexpr int pageSize = 10;
 struct TransferStage { bool journal=false,valid=false; FileStamp stamp; QString error; };
-QJsonObject readObject(const QString &path) {
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly) || file.size() > maxJson) return {};
-    return QJsonDocument::fromJson(file.readAll()).object();
-}
-bool writeObject(const QString &path, const QJsonObject &object, UiMessage *error = nullptr) {
-    const QString directory = QFileInfo(path).absolutePath();
-    if (!QDir().mkpath(directory)) {
-        if (error) *error = uiMessage("storage_create_folder").arg(directory);
-        return false;
-    }
-    QSaveFile file(path);
-    const auto bytes = QJsonDocument(object).toJson();
-    if (bytes.size() > maxJson) { if (error) *error = uiMessage("storage_file_too_large"); return false; }
-    if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) {
-        if (error) *error = uiMessage("storage_write_failed").arg(path).arg(int(file.error()));
-        return false;
-    }
-    return true;
-}
 constexpr auto sessionPermissions = QFileDevice::ReadOwner | QFileDevice::WriteOwner;
 bool privateSessionPermissions(QFileDevice::Permissions permissions) {
     constexpr auto shared = QFileDevice::ReadGroup | QFileDevice::WriteGroup | QFileDevice::ExeGroup |
                             QFileDevice::ReadOther | QFileDevice::WriteOther | QFileDevice::ExeOther | QFileDevice::ExeOwner;
     return (permissions & sessionPermissions) == sessionPermissions && !(permissions & shared);
+}
+// FAT permissions come from mount options; chmod cannot make a file private there.
+bool permissionlessStorage(const QString &path) {
+    const auto type = QStorageInfo(path).fileSystemType();
+    return type == "vfat" || type == "msdos" || type == "exfat";
 }
 bool validServer(const QUrl &url) {
 #ifdef BOOKORBIT_TEST_HTTP
@@ -71,10 +55,6 @@ bool validServer(const QUrl &url) {
 #endif
     return url.isValid() && !url.host().isEmpty() && url.userInfo().isEmpty() &&
         !url.hasQuery() && !url.hasFragment() && (url.scheme() == "https" || local);
-}
-bool positiveId(const QJsonValue &value) {
-    return value.isDouble() && value.toDouble() > 0 &&
-           value.toDouble() <= 2147483647 && value.toDouble() == value.toInt();
 }
 QJsonObject smallBook(const QJsonObject &book) {
     QJsonObject result;
@@ -179,6 +159,14 @@ QString syncGroupKey(const QString &id,const QJsonObject &record) {
     return positiveId(book["id"]) ? "book:"+QString::number(book["id"].toInt()) : "file:"+id;
 }
 const QStringList syncPriority{"conflict","file","position","reader","reader_unknown","error","auth","pending","uncertain","network","unknown","synced"};
+bool hasPageNumber(const QJsonObject &remote) { return remote.contains("pageNumber") && !remote["pageNumber"].isNull(); }
+// Server coordinates besides the CFI; uploading a CFI alone would discard them.
+bool hasOtherCoordinates(const QJsonObject &remote) {
+    for (const auto key : {"positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
+                          "koboLocationType","koboLocationValue","koboContentSourceProgressPercent","koreaderProgress","narrationPercentage","narrationUpdatedAt"})
+        if (remote.contains(key) && !remote[key].isNull()) return true;
+    return false;
+}
 
 }
 QHash<int,QByteArray> LibraryModel::roleNames() const {
@@ -309,6 +297,9 @@ void SyncProxy::setFilter(const QString &value) {
 Client::Client(QUrl server, QString root, QObject *parent, bool restoreAccount)
     : QObject(parent), libraryModel(this), syncRows(this), syncView(this), endpoint(server), rootDir(root) {
     syncView.setSourceModel(&syncRows);
+    connect(&covers,&CoverCache::changed,this,&Client::coversChanged);
+    connect(&covers,&CoverCache::drained,this,&Client::cleanupCovers);
+    connect(&covers,&CoverCache::networkUnavailable,this,[this] { logEvent("cover network unavailable"); });
     connect(&libraryModel,&QAbstractItemModel::modelAboutToBeReset,this,[this] { if (preservingLibraryAnchor) emit libraryAboutToReset(); });
     connect(&libraryModel,&QAbstractItemModel::modelReset,this,[this] { if (preservingLibraryAnchor) emit libraryReset(); });
     diagnosticClock.start();
@@ -364,7 +355,7 @@ bool Client::acceptFileContext(const FileContext &context,const FileStamp &stamp
 
 bool Client::prepareUpdate() {
     if(busy() || downloading() || checkingLibrary || syncingAll) return false;
-    updateLocked=true; working=true; stopCovers(); notifyOperation(); return true;
+    updateLocked=true; working=true; covers.stop(); notifyOperation(); return true;
 }
 void Client::cancelUpdate() {
     if(updateLocked) { updateLocked=false; working=false; notifyOperation(); }
@@ -410,7 +401,7 @@ void Client::loadRecords(bool startup) {
     if (sessionInfo.exists() || sessionInfo.isSymLink()) {
         const bool protectedFile = sessionInfo.isFile() && !sessionInfo.isSymLink() &&
             sessionInfo.canonicalPath() == sessionInfo.absolutePath() &&
-            (privateSessionPermissions(sessionInfo.permissions()) ||
+            (permissionlessStorage(scopeDir) || privateSessionPermissions(sessionInfo.permissions()) ||
              (QFile::setPermissions(sessionFile, sessionPermissions) &&
               privateSessionPermissions(QFileInfo(sessionFile).permissions())));
         if (!protectedFile) {
@@ -434,7 +425,7 @@ void Client::loadRecords(bool startup) {
     ++detailGeneration; detailMessage.clear();
     activeCollection = 0; activeCollectionName.clear(); collectionList = false;
     fileChoices = readObject(scopeDir+"/file-choices.json");
-    coverVersions = readObject(scopeDir+"/cover-index.json");
+    covers.setScope(scopeDir);
     count = currentPage = 0;
     downloads = {};
     savedRecordStamps.clear(); durableRecordStamps.clear(); blockedTransfers.clear(); filesByBook.clear();
@@ -639,7 +630,6 @@ void Client::cleanupBooks(const QString &verifiedFile) {
             return;
         }
         const bool confirmed=candidate && proof!=cleanupProofs.cend() && proof->valid;
-        bool removed = false;
         if (!registered || confirmed) {
             const bool newRemoved = registered || removeUnused(newFile);
             const bool oldRemoved = recordFile(id, current) == oldFile || removeUnused(oldFile);
@@ -663,7 +653,7 @@ void Client::cleanupBooks(const QString &verifiedFile) {
                 return;
             }
         }
-        if (!removed) { retained.insert(newFile); retained.insert(oldFile); retained.insert(staging); }
+        retained.insert(newFile); retained.insert(oldFile); retained.insert(staging);
     }
     static const QRegularExpression owned("^([1-9][0-9]*)(?:-([0-9a-f-]{36}))?\\.([a-z0-9]+)(?:\\.[A-Za-z0-9]+)?$");
     const QDir dir(scopeDir);
@@ -682,18 +672,6 @@ void Client::cleanupBooks(const QString &verifiedFile) {
     cleanupProofs.clear();
 }
 
-void Client::removeCover(int bookId) {
-    const QString key = QString::number(bookId);
-    if (coverVersions.contains(key)) {
-        coverVersions.remove(key);
-        writeObject(scopeDir+"/cover-index.json", coverVersions);
-    }
-    if (QFile::remove(scopeDir+"/cover-"+key+".png")) {
-        coverRevisions[scopeDir+"/cover-"+key+".png"]=++coverVersion;
-        emit coversChanged();
-    }
-}
-
 void Client::cleanupCovers() {
     QSet<int> downloaded, visible;
     for (auto value : items) if (positiveId(value.toObject()["id"])) visible.insert(value.toObject()["id"].toInt());
@@ -701,22 +679,7 @@ void Client::cleanupCovers() {
         const auto book = it.value().toObject()["book"].toObject();
         if (positiveId(book["id"]) && book["hasCover"] != false) downloaded.insert(book["id"].toInt());
     }
-    static const QRegularExpression owned("^cover-([1-9][0-9]*)\\.png$");
-    QList<QFileInfo> transient;
-    for (const auto &name : QDir(scopeDir).entryList({"cover-*.png"}, QDir::Files)) {
-        const auto match = owned.match(name);
-        if (!match.hasMatch()) continue;
-        const int id = match.captured(1).toInt();
-        if (downloaded.contains(id)) continue;
-        if (!coverVersions.contains(QString::number(id)) && !visible.contains(id)) removeCover(id);
-        else transient.append(QFileInfo(scopeDir+"/"+name));
-    }
-    std::sort(transient.begin(), transient.end(), [&visible](const QFileInfo &a, const QFileInfo &b) {
-        const int left=a.baseName().mid(6).toInt(), right=b.baseName().mid(6).toInt();
-        if (visible.contains(left) != visible.contains(right)) return !visible.contains(left);
-        return a.lastModified() < b.lastModified();
-    });
-    for (int i=0; i<transient.size()-64; ++i) removeCover(transient[i].baseName().mid(6).toInt());
+    covers.cleanup(visible,downloaded);
 }
 
 void Client::invalidateLibrary(bool data) {
@@ -788,13 +751,33 @@ bool Client::saveRecord(const QString &id, const QJsonObject &record) {
 #ifdef BOOKORBIT_TEST_HTTP
     ++presentationCounters.recordWrites;
 #endif
-    if (!writeObject(path, record)) return false;
+    const auto bytes=QJsonDocument(record).toJson();
+    if (bytes.size()>maxJson) return false;
+    const auto result=saveDurable(path,bytes);
+    if (result.state==FileCommitState::FailedBeforeReplace) return false;
+    // The file was replaced even when its sync is unconfirmed; keep memory equal to it.
     storeRecord(id, record);
+    if (result.state!=FileCommitState::Complete) {
+        logDiagnostic("record.persistence_failed",{{"state","replaced_unconfirmed"},{"detail",result.detail}});
+        return false;
+    }
     savedRecordStamps[id]=fileStamp(path);
     return true;
 }
 
-void Client::saveProgressIntent(const QString &id,const QJsonObject &record,const std::function<void()> &confirmed) {
+QJsonObject Client::progressState(const QString &id,const QString &profile) const {
+    const auto state=downloads.value(id).toObject()["progress"].toObject();
+    return state.contains("profile") && state["profile"].toString()!=profile ? QJsonObject{} : state;
+}
+
+bool Client::persistProgress(const QString &id,const QString &profile,QJsonObject state) {
+    auto record=downloads.value(id).toObject(); state["profile"]=profile; record["progress"]=state;
+    if (saveRecord(id,record)) return true;
+    finish(uiMessage("could_not_save_progress_retry_sync"),false,"progress"); return false;
+}
+
+void Client::saveProgressIntent(const QString &id,const QString &profile,QJsonObject state,const std::function<void()> &confirmed) {
+    auto record=downloads.value(id).toObject(); state["profile"]=profile; record["progress"]=state;
     const auto path=recordFile(id,record),recordPath=scopeDir+"/records/"+id+".json";
     const auto context=fileContext(id,path); const auto stamp=fileStamp(path);
 #ifdef BOOKORBIT_TEST_HTTP
@@ -1263,10 +1246,7 @@ void Client::prepareConflict(const QString &id,const QString &local,const QJsonO
         if (!cancelled && account==accountGeneration && profile==readerProfile() && conflictId==id && conflictLocal==local &&
             conflictRemote==remote && downloads.value(id).toObject()["sha256"]==record["sha256"] &&
             downloads.value(id).toObject()["progress"]==record["progress"] && fileStamp(path)==result.second) {
-            bool other=false;
-            for (const auto key:{"pageNumber","positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
-                "koboLocationType","koboLocationValue","koboContentSourceProgressPercent","koreaderProgress","narrationPercentage","narrationUpdatedAt"})
-                if (remote.contains(key) && !remote[key].isNull()) other=true;
+            const bool other=hasPageNumber(remote) || hasOtherCoordinates(remote);
             conflictPreview=result.first; conflictStamp=result.second; conflictDigest=record["sha256"].toString();
             positionChoices=result.first;
             for (auto &choice:positionChoices) {
@@ -1296,7 +1276,7 @@ void Client::prepareConflict(const QString &id,const QString &local,const QJsonO
             context["local"]=useLocal; context["valid"]=valid; context["percentageValue"]=percentage; context["empty"]=cfi.isEmpty();
             choices.append(context);
         }
-        const bool same=before.valid && digestFile(path,cancel)==record["sha256"].toString().toLatin1() && fileStamp(path)==before;
+        const bool same=before.valid && cachedDigest(path,cancel)==record["sha256"].toString().toLatin1() && fileStamp(path)==before;
         if (!same) for (auto &choice:choices) {
             auto context=choice.toMap(); context["valid"]=false; context.remove("chapter"); context.remove("excerpt"); choice=context;
         }
@@ -1457,7 +1437,7 @@ void Client::syncSelected() {
 void Client::showCollections() {
     if (busy()) return;
     beginFeedback("catalog");
-    closeDetail(); stopCovers(); browseHistory.clear();
+    closeDetail(); covers.stop(); browseHistory.clear();
     collectionList = true; localView = false; activeCollection = 0; activeCollectionName.clear();
     collectionItems = {}; items = {}; count = currentPage = 0;
     invalidateLibrary(); emit catalogChanged(); publishDataChanges();
@@ -1500,7 +1480,7 @@ void Client::openCollection(int id, const QString &name, double catalogOffset, d
 QVariantMap Client::backFromCollection() {
     if (busy() || browseHistory.isEmpty()) return {};
     const auto saved = browseHistory.takeLast();
-    stopCovers(); ++detailGeneration;
+    covers.stop(); ++detailGeneration;
     detailBook = saved["detail"].toObject(); items = saved["items"].toArray();
     currentPage = saved["page"].toInt(); count = saved["total"].toInt(); localView = saved["local"].toBool();
     activeCollection = saved["collectionId"].toInt(); activeCollectionName = saved["collectionName"].toString();
@@ -1618,13 +1598,16 @@ void Client::finish(UiMessage text, bool success, const QString &operation, cons
 QNetworkRequest Client::request(const QString &path) const {
     QNetworkRequest request(QUrl(endpoint.toString()+path));
     if (endpoint.scheme() == "https") {
-        auto ssl = request.sslConfiguration();
-        auto certificates = ssl.caCertificates();
-        if (endpoint.host() == "books.lan")
-            certificates.append(QSslCertificate::fromPath(":/books-lan-ca.pem", QSsl::Pem, QSslCertificate::PatternSyntax::FixedString));
-        // Public LAN CA, scoped to this host and this client's data directory.
-        certificates.append(QSslCertificate::fromPath(rootDir+"/certificates/"+endpoint.host()+".pem", QSsl::Pem, QSslCertificate::PatternSyntax::FixedString));
-        ssl.setCaCertificates(certificates);
+        if (sslHost != endpoint.host()) {
+            ssl = request.sslConfiguration();
+            auto certificates = ssl.caCertificates();
+            if (endpoint.host() == "books.lan")
+                certificates.append(QSslCertificate::fromPath(":/books-lan-ca.pem", QSsl::Pem, QSslCertificate::PatternSyntax::FixedString));
+            // Public LAN CA, scoped to this host and this client's data directory.
+            certificates.append(QSslCertificate::fromPath(rootDir+"/certificates/"+endpoint.host()+".pem", QSsl::Pem, QSslCertificate::PatternSyntax::FixedString));
+            ssl.setCaCertificates(certificates);
+            sslHost = endpoint.host();
+        }
         request.setSslConfiguration(ssl);
     }
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
@@ -1652,10 +1635,12 @@ bool Client::saveSession() {
     QSaveFile file(path);
     const auto bytes = QJsonDocument(QJsonObject{{"refreshToken", refreshToken}}).toJson();
     const QFileInfo info(path);
+    const bool permissionless = permissionlessStorage(scopeDir);
     sessionStored = !info.isSymLink() && QFileInfo(scopeDir).canonicalFilePath() == scopeDir &&
-        file.open(QIODevice::WriteOnly) && file.setPermissions(sessionPermissions) &&
-        privateSessionPermissions(file.permissions()) && file.write(bytes) == bytes.size() && file.commit() &&
-        privateSessionPermissions(QFileInfo(path).permissions());
+        file.open(QIODevice::WriteOnly) &&
+        (permissionless || (file.setPermissions(sessionPermissions) && privateSessionPermissions(file.permissions()))) &&
+        file.write(bytes) == bytes.size() && file.commit() &&
+        (permissionless || privateSessionPermissions(QFileInfo(path).permissions()));
     if (!sessionStored) {
         file.cancelWriting();
         const bool removed = (!QFile::exists(path) && !QFileInfo(path).isSymLink()) || QFile::remove(path);
@@ -1671,7 +1656,7 @@ void Client::invalidateSession() {
     ++accountGeneration;
     cancelCleanup();
     token.clear(); refreshToken.clear(); sessionStored = false; sessionNotice.clear();
-    stopCovers();
+    covers.stop();
     const QString path = scopeDir+"/session.json";
     if ((QFile::exists(path) || QFileInfo(path).isSymLink()) && !QFile::remove(path))
         sessionNotice = uiMessage("could_not_remove_the_invalid_session_from_this_device");
@@ -1693,11 +1678,11 @@ void Client::restoreSession() {
 }
 
 void Client::renewSession(const std::function<void()> &resume) {
-    stopCovers();
+    covers.stop();
     message = uiMessage("refreshing_session");
     notifyOperation(); emit feedbackChanged();
     jsonRequest("/api/v1/auth/refresh", {{"refreshToken", refreshToken}}, [this, resume](const QJsonObject &response) {
-        if (setCredentials(response)) { queueCovers(); resume(); }
+        if (setCredentials(response)) { covers.fetch(items); resume(); }
     }, false);
 }
 
@@ -1804,7 +1789,7 @@ void Client::refresh(int targetPage, const QString &query) {
     if (targetPage < 0 || query.size() > 500) return;
     if (localView || collectionList) invalidateLibrary();
     collectionList = false;
-    stopCovers();
+    covers.stop();
     localView = false;
     beginFeedback("catalog");
     emit catalogChanged();
@@ -1835,7 +1820,7 @@ void Client::refresh(int targetPage, const QString &query) {
                 book["files"] = bookFiles(book);
                 parsed.append(selectBookFile(book));
             }
-            stopCovers();
+            covers.stop();
             bool saved=true;
             for (auto value : parsed) {
                 const auto book = value.toObject();
@@ -1854,12 +1839,12 @@ void Client::refresh(int targetPage, const QString &query) {
                     record["book"] = stored;
                     if (!saveRecord(fileId, record)) saved=false;
                 }
-                if (book["hasCover"] == false) removeCover(bookId);
+                if (book["hasCover"] == false) covers.remove(bookId);
             }
             items = parsed; currentPage = targetPage; count = response["total"].toInt(); committedQuery=query;
             invalidateLibrary(); emit catalogChanged();
             cleanupCovers();
-            queueCovers();
+            covers.fetch(items);
             finish(!saved ? uiMessage("details_received_but_not_saved_for_offline_use") : items.isEmpty() ? uiMessage("no_books_found") : UiMessage{}, saved, "catalog");
         }, true, activeCollection > 0);
 }
@@ -1872,13 +1857,13 @@ void Client::download(int index) {
     downloadBook(visible[index].toObject());
 }
 
-void Client::downloadBook(const QJsonObject &book, bool renew) {
+void Client::downloadBook(const QJsonObject &book, bool renew, bool refetch) {
     const int bookId=book["id"].toInt(), fileId=book["selectedFile"].toObject()["id"].toInt();
     const auto previous=downloads.value(QString::number(fileId)).toObject();
-    if (previous.isEmpty()) { transferBook(book,renew); return; }
+    if (previous.isEmpty() && !refetch) { transferBook(book,renew); return; }
     beginFeedback("book",bookId,fileId);
     retryKind=2; retryBook=book;
-    if (bookId<=0 || fileId<=0 || previous["bookId"].toInt()!=bookId) {
+    if (bookId<=0 || fileId<=0 || (!previous.isEmpty() && previous["bookId"].toInt()!=bookId)) {
         finish(uiMessage("this_file_is_already_linked_to_another_book_refresh_the_details"),false,"download"); return;
     }
     // Repairs and retries resolve file metadata again. A known replacement may
@@ -1955,7 +1940,6 @@ void Client::transferBook(const QJsonObject &book, bool renew) {
         hash->addData(chunk);
     };
     connect(reply, &QNetworkReply::readyRead, this, drain);
-    QTimer::singleShot(120000, reply, [reply] { if (!reply->isFinished()) reply->abort(); });
     connect(reply, &QNetworkReply::finished, this, [this, reply, output, hash, size, expected, file, drain, book, id, oldFile, previous, staging, finalPath, stem, directory, renew, format,generation,transferContext] {
         if (generation!=fileGeneration) { output->cancelWriting(); reply->deleteLater(); return; }
         if (reply->bytesAvailable()) drain();
@@ -1990,7 +1974,7 @@ void Client::transferBook(const QJsonObject &book, bool renew) {
         const auto context=transferContext;
         message =uiMessage("checking_the_book_file"); emit feedbackChanged();
         fileTask=files.submit(this,[oldFile](const FileCancellation &cancel) {
-            const auto before=fileStamp(oldFile); return std::make_pair(digestFile(oldFile,cancel),before);
+            const auto before=fileStamp(oldFile); return std::make_pair(cachedDigest(oldFile,cancel),before);
         },[this,context,output,book,id,oldFile,previous,staging,finalPath,stem,directory,format,newHash,size,file](const auto &result,bool wasCancelled) {
             if (!acceptFileContext(context,result.second) || wasCancelled) { output->cancelWriting(); return; }
             const auto oldStamp=result.second;
@@ -2060,7 +2044,7 @@ void Client::transferBook(const QJsonObject &book, bool renew) {
                     const auto moved=moveDurable(staging,finalPath); result.error=moved.detail;
                     if (moved.state!=FileCommitState::Complete) return result;
                     result.stamp=fileStamp(finalPath);
-                    result.valid=result.stamp.valid && digestFile(finalPath,cancel)==newHash.toLatin1() && fileStamp(finalPath)==result.stamp;
+                    result.valid=result.stamp.valid && cachedDigest(finalPath,cancel)==newHash.toLatin1() && fileStamp(finalPath)==result.stamp;
                     return result;
                 },[this,context,oldStamp,oldFile,finalPath,id,record,recordPath,journal,book,format](const TransferStage &result,bool wasCancelled) {
                     if (!acceptFileContext(context,oldStamp) || wasCancelled || !result.valid || fileStamp(finalPath)!=result.stamp ||
@@ -2149,7 +2133,7 @@ void Client::openBook(const QJsonObject &book, bool applyIncoming) {
     message =uiMessage("checking_the_book_file"); notifyOperation(); emit feedbackChanged();
     const auto context=fileContext(id,path);
     fileTask=files.submit(this,[path](const FileCancellation &cancel) {
-        const auto stamp=fileStamp(path); const auto digest=digestFile(path,cancel);
+        const auto stamp=fileStamp(path); const auto digest=cachedDigest(path,cancel);
         return std::make_pair(digest,stamp);
     },[this,book,applyIncoming,path,id,context](const auto &result,bool cancelled) {
         if (!acceptFileContext(context,result.second) || cancelled) return;
@@ -2186,6 +2170,8 @@ QStringList Client::accounts() const {
     }
     return result;
 }
+
+int Client::catalogPageSize() const { return pageSize; }
 
 bool Client::validDownloadDirectory(const QString &path) const {
     static const QRegularExpression accountFolder("^[0-9a-f]{24}(?:/|$)");
@@ -2293,9 +2279,9 @@ bool Client::configure(const QString &address, const QString &name) {
         finish(uiMessage("could_not_save_the_connection_1").arg(error), false, "settings"); return false;
     }
     dismissConflict();
-    stopCovers();
+    covers.stop();
     token.clear(); refreshToken.clear(); retryKind = 0; savedAccounts = next;
-    endpoint = url; user = name;
+    endpoint = url; user = name; sslHost.clear();
     localView = true; loadRecords();
     emit connectionChanged(); emit catalogChanged(); emit settingsChanged();
     finish(uiMessage("connection_saved_downloaded_books_are_available_without_signing_in"), true, "settings");
@@ -2313,7 +2299,7 @@ void Client::logout() {
     ++accountGeneration;
     cancelCleanup();
     beginFeedback("connection");
-    stopCovers();
+    covers.stop();
     const QString credential = refreshToken;
     const QString sessionFile = scopeDir+"/session.json";
     if (QFile::exists(sessionFile) && !QFile::remove(sessionFile)) {
@@ -2345,7 +2331,7 @@ void Client::showDownloaded(bool value) {
     if (!value) { refresh(); return; }
     localView = true;
     refreshRecents();
-    stopCovers();
+    covers.stop();
     items = {}; count = currentPage = 0;
     cleanupCovers();
     invalidateLibrary(); emit catalogChanged(); publishDataChanges();
@@ -2540,104 +2526,9 @@ void Client::cancelDownload() {
 void Client::retry() {
     if (!canRetry()) return;
     if (retryKind == 1) refresh(retryPage, retryQuery);
-    else if (retryKind == 2) downloadBook(retryBook);
+    else if (retryKind == 2) downloadBook(retryBook, true, true);
     else if (retryKind == 3) refreshDetail();
     else if (retryKind == 4) showCollections();
-}
-
-QString Client::coverUrl(int bookId) const {
-    const QString path = scopeDir+"/cover-"+QString::number(bookId)+".png";
-    return bookId > 0 && QFileInfo::exists(path) ? QUrl::fromLocalFile(path).toString()+"?v="+QString::number(coverRevisions.value(path).toInt()) : QString{};
-}
-
-void Client::stopCovers() {
-    if (coverTask) coverTask->store(true);
-    coverTask.reset();
-    ++coverGeneration;
-    coverQueue.clear();
-    if (activeCover) activeCover->abort();
-    activeCover.clear();
-}
-
-void Client::queueCovers() {
-    stopCovers();
-    for (auto value : items) {
-        const auto book = value.toObject();
-        if (!positiveId(book["id"])) continue;
-        const int id=book["id"].toInt();
-        if (book["hasCover"] == false) { removeCover(id); continue; }
-        const QString version=book["coverVersion"].toString();
-        const QString path=scopeDir+"/cover-"+QString::number(id)+".png";
-        if (!version.isEmpty() && coverVersions[QString::number(id)].toString()==version && QFile::exists(path)) continue;
-        if (!version.isEmpty() && coverVersions.contains(QString::number(id)) &&
-            coverVersions[QString::number(id)].toString()!=version) removeCover(id);
-        coverQueue.append(id);
-    }
-    fetchNextCover();
-}
-
-void Client::fetchNextCover() {
-    if (coverQueue.isEmpty() || token.isEmpty()) return;
-    if (!connectNetwork()) { stopCovers(); logEvent("cover network unavailable"); return; }
-    const int id = coverQueue.takeFirst(), generation = coverGeneration;
-    const QString path = scopeDir+"/cover-"+QString::number(id)+".png";
-    QString version;
-    for (auto value : items) if (value.toObject()["id"].toInt()==id) { version=value.toObject()["coverVersion"].toString(); break; }
-    auto request = this->request("/api/v1/books/"+QString::number(id)+"/thumbnail");
-    auto reply = network.get(request);
-    activeCover = reply;
-    auto bytes = std::make_shared<QByteArray>();
-    connect(reply, &QNetworkReply::readyRead, this, [reply, bytes] {
-        bytes->append(reply->readAll());
-        if (bytes->size() > maxJson) reply->abort();
-    });
-    QTimer::singleShot(15000, reply, [reply] { if (!reply->isFinished()) reply->abort(); });
-    connect(reply, &QNetworkReply::finished, this, [this, reply, bytes, path, id, version, generation] {
-        reply->deleteLater();
-        if (generation != coverGeneration) return;
-        activeCover.clear();
-        bytes->append(reply->readAll());
-        if (reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 404) removeCover(id);
-        if (reply->error() == QNetworkReply::NoError && bytes->size() <= maxJson &&
-            reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200) {
-            const auto account=accountGeneration;
-            coverTask=files.submit(this,[data=*bytes
-#ifdef BOOKORBIT_TEST_HTTP
-                ,counter=coverDecodeCount
-#endif
-            ](const FileCancellation &cancel) {
-                if (fileCancelled(cancel)) return QByteArray{};
-                QByteArray source=data,encoded;
-                QBuffer buffer(&source); buffer.open(QIODevice::ReadOnly); QImageReader reader(&buffer);
-                const auto format=reader.format(); const auto size=reader.size();
-                if (!fileCancelled(cancel) && (format=="png" || format=="jpeg" || format=="webp") &&
-                    size.width()>0 && size.height()>0 && size.width()<=2048 && size.height()<=2048) {
-                    reader.setScaledSize(size.scaled(240,320,Qt::KeepAspectRatio));
-                    if (fileCancelled(cancel)) return QByteArray{};
-#ifdef BOOKORBIT_TEST_HTTP
-                    ++*counter;
-#endif
-                    const auto cover=reader.read();
-                    if (fileCancelled(cancel) || cover.isNull()) return QByteArray{};
-                    QBuffer output(&encoded); output.open(QIODevice::WriteOnly);
-                    if (!cover.save(&output,"PNG")) encoded.clear();
-                }
-                return encoded;
-            },[this,path,id,version,generation,account](const QByteArray &encoded,bool cancelled) {
-                if (generation!=coverGeneration || account!=accountGeneration) return;
-                coverTask.reset();
-                QSaveFile file(path);
-                if (!cancelled && !encoded.isEmpty() && file.open(QIODevice::WriteOnly) && file.write(encoded)==encoded.size() && file.commit()) {
-                    if (version.isEmpty()) coverVersions.remove(QString::number(id)); else coverVersions[QString::number(id)]=version;
-                    writeObject(scopeDir+"/cover-index.json",coverVersions);
-                    coverRevisions[path]=++coverVersion; emit coversChanged(); cleanupCovers();
-                }
-                fetchNextCover();
-            });
-            return;
-        }
-        fetchNextCover();
-    });
 }
 
 void Client::dismissConflict() {
@@ -2676,7 +2567,7 @@ void Client::verifyLibrary() {
     if (!authenticated()) { finish(uiMessage("sign_in_to_verify_library_files"),false,"verify"); return; }
     syncQueue=downloads.keys();
     if (syncQueue.isEmpty()) { finish(uiMessage("no_downloaded_files_to_verify"),true,"verify"); return; }
-    dismissConflict(); stopCovers(); retryKind=0;
+    dismissConflict(); covers.stop(); retryKind=0;
     checkingLibrary=true; verificationCancelled=false;
     syncCount=syncQueue.size(); syncSucceeded=verificationDifferent=verificationErrors=0;
     emit syncBatchChanged();
@@ -2738,7 +2629,6 @@ void Client::verifyRemoteFile(const QString &id, bool renew) {
         hash->addData(bytes);
     };
     connect(reply,&QNetworkReply::readyRead,this,drain);
-    QTimer::singleShot(120000,reply,[reply] { if (!reply->isFinished()) reply->abort(); });
     connect(reply,&QNetworkReply::finished,this,[this,reply,id,renew,drain,hash,size,generation,context] {
         drain(); reply->deleteLater();
         if (generation!=fileGeneration) return;
@@ -2822,6 +2712,31 @@ void Client::finishProgress(const QString &id, const QJsonObject &remote, const 
     },true,true);
 }
 
+// Values passed between sync stages; each field is a snapshot taken at the stage noted.
+struct Client::ProgressSync {
+    QString id,path,position,profile; int choice=0; FileContext context;  // local stage start
+    QString local; PositionInfo localInfo; Fb2Snapshot fb;                // local check
+    QJsonObject remote,progress;                                          // server progress
+    QString cfi; int action=0; bool changedChoice=false;                  // decision
+};
+struct Client::PreparedSync {
+    FileStamp stamp; PreparedReaderPosition reader; QVariantList choices; double percentage=0; bool estimate=false;
+};
+
+bool Client::readerChanged(const QString &path,const QString &position,bool changed) {
+    QString current;
+    if (!changed && readerFileState(path)==ReaderFileState::Closed && readerPosition(path,&current) && current==position) return false;
+    finish(uiMessage("the_reader_state_has_changed_retry_sync"),false,"progress"); return true;
+}
+
+void Client::saveConflict(const ProgressSync &sync,QJsonObject state,const QVariantList &choices,const FileStamp &stamp) {
+    // Persist both versions; after restart the next GET rechecks the conflict.
+    state["conflictLocal"]=sync.local; state["conflictRemote"]=sync.remote;
+    if (!persistProgress(sync.id,sync.profile,state)) return;
+    if (!syncingAll) prepareConflict(sync.id,sync.local,sync.remote,sync.profile,choices,stamp);
+    finish(sync.changedChoice ? uiMessage("the_position_changed_while_you_were_choosing_review_the_choices_again") : uiMessage("choose_a_reading_position"),false,"progress","conflict");
+}
+
 void Client::syncBook(const QString &id, int choice) {
     if (busy()) return;
     if (!syncingAll) beginFeedback(detailVisible() ? "book" : "sync", downloads.value(id).toObject()["bookId"].toInt(),id.toInt());
@@ -2834,28 +2749,28 @@ void Client::syncBook(const QString &id, int choice) {
     if (!syncFormat(record["format"].toString("epub"))) {
         finish(uiMessage("position_sync_is_available_for_epub_and_supported_fb2_books_you_9f7a76"),false,"progress"); return;
     }
-    const QString path=localFile(record["book"].toObject());
-    QString position;
-    const QString profile=readerProfile();
-    startFileOperation(); retryKind=0; stopCovers();
+    ProgressSync sync; sync.id=id; sync.choice=choice;
+    sync.path=localFile(record["book"].toObject());
+    sync.profile=readerProfile();
+    startFileOperation(); retryKind=0; covers.stop();
     message =syncingAll ? uiMessage("checking_file_1_of_2_3").arg(syncCount-syncQueue.size()).arg(syncCount)
         .arg(record["book"].toObject()["title"].toString()) : uiMessage("syncing_progress");
     notifyOperation(); emit feedbackChanged();
-    if (path.isEmpty()) {
+    if (sync.path.isEmpty()) {
         finish(uiMessage("download_a_valid_book_file_before_syncing"),false,"progress","file"); return;
     }
-    const auto reader=readerFileState(path);
+    const auto reader=readerFileState(sync.path);
     if (reader==ReaderFileState::Open) {
         finish(uiMessage("close_the_book_in_the_built_in_reader_and_retry_sync_the_home_bu_e4edc4"),false,"progress","reader"); return;
     }
-    if (reader==ReaderFileState::Unknown || !readerPosition(path,&position)) {
+    if (reader==ReaderFileState::Unknown || !readerPosition(sync.path,&sync.position)) {
         finish(uiMessage("could_not_check_the_reader_state_positions_were_kept_unchanged_try_again"),false,"progress","reader_unknown"); return;
     }
     struct LocalCheck { QByteArray digest; FileStamp stamp; QString local; PositionInfo info; Fb2Snapshot fb; bool supported=true,valid=false; };
-    const auto context=fileContext(id,path);
+    sync.context=fileContext(id,sync.path);
     // The scanner seeds a first download with this placeholder before any reader session.
-    const bool initialPosition=restoringDownload && position=="pbr:/page?page=0";
-    fileTask=files.submit(this,[path,position,initialPosition,format=record["format"].toString()](const FileCancellation &cancel) {
+    const bool initialPosition=restoringDownload && sync.position=="pbr:/page?page=0";
+    fileTask=files.submit(this,[path=sync.path,position=sync.position,initialPosition,format=record["format"].toString()](const FileCancellation &cancel) {
         LocalCheck result; result.stamp=fileStamp(path);
         if (format=="fb2") { result.fb=fb2Index(path); result.supported=fb2Calibration(cancel).valid && !bookCfi(path,"pbr:/word?page=0",result.fb).isEmpty(); }
         if (result.supported && !fileCancelled(cancel)) {
@@ -2863,221 +2778,175 @@ void Client::syncBook(const QString &id, int choice) {
             result.valid=(position.isEmpty() || initialPosition || !result.local.isEmpty()) &&
                 (result.local.isEmpty() || bookPosition(path,result.local,nullptr,nullptr,nullptr,nullptr,&result.info,result.fb));
         }
-        result.digest=digestFile(path,cancel);
+        result.digest=cachedDigest(path,cancel);
         return result;
-    },[this,id,path,position,choice,profile,context](const LocalCheck &result,bool cancelled) {
-        if (!acceptFileContext(context,result.stamp) || cancelled) return;
-        if (result.digest!=context.record["sha256"].toString().toLatin1()) {
-            libraryFiles.remove(id.toInt()); syncFiles.remove(id.toInt()); invalidateBook(libraryBookId(context.record)); detailPending=detailPending || detailVisible();
+    },[this,sync](const LocalCheck &result,bool cancelled) {
+        if (!acceptFileContext(sync.context,result.stamp) || cancelled) return;
+        if (result.digest!=sync.context.record["sha256"].toString().toLatin1()) {
+            libraryFiles.remove(sync.id.toInt()); syncFiles.remove(sync.id.toInt()); invalidateBook(libraryBookId(sync.context.record)); detailPending=detailPending || detailVisible();
             finish(uiMessage("download_a_valid_book_file_before_syncing"),false,"progress","file"); return;
         }
-        QString current;
-        if (readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position) {
-            finish(uiMessage("the_reader_state_has_changed_retry_sync"),false,"progress"); return;
-        }
+        if (readerChanged(sync.path,sync.position)) return;
         if (!result.supported) {
             finish(uiMessage("this_fb2_structure_is_not_supported_for_sync_yet_images_tables_p_e1f2b9"),false,"progress","position"); return;
         }
         if (!result.valid) {
             finish(uiMessage("the_local_position_format_is_unsupported_progress_was_kept_unchanged"),false,"progress","position"); return;
         }
-        const QString local=result.local;
-        const QString route="/api/v1/books/files/"+id+"/progress";
-        // shortcut: trust the downloaded file identity; explicit library verification detects server replacements.
-        jsonRequest(route,{},[this,id,path,position,local,localInfo=result.info,fb=result.fb,choice,route,profile,context](const QJsonObject &remote) {
-            if (!acceptFileContext(context)) return;
-            QString current;
-            if (readerProfile()!=profile || readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position) {
-                finish(uiMessage("the_reader_state_has_changed_retry_sync"),false,"progress"); return;
+        auto next=sync; next.local=result.local; next.localInfo=result.info; next.fb=result.fb;
+        compareRemoteProgress(next);
+    });
+}
+
+void Client::compareRemoteProgress(const ProgressSync &sync) {
+    // shortcut: trust the downloaded file identity; explicit library verification detects server replacements.
+    jsonRequest("/api/v1/books/files/"+sync.id+"/progress",{},[this,sync](const QJsonObject &remote) {
+        if (!acceptFileContext(sync.context) || readerChanged(sync.path,sync.position,readerProfile()!=sync.profile)) return;
+        const QString remoteCfi=remote["cfi"].toString();
+        const auto percent=remote["percentage"];
+        if (!remote.contains("cfi") || (!remote["cfi"].isNull() && !remote["cfi"].isString()) ||
+            !percent.isDouble() || percent.toDouble()<0 || percent.toDouble()>100) {
+            finish(uiMessage("invalid_progress_response_expected_a_cfi_and_a_percentage_from_0_2d14d6"),false,"progress"); return;
+        }
+        struct RemoteCheck {
+            QByteArray digest; FileStamp stamp; QString point; PositionInfo info; bool valid=true,equal=false,localBaseEqual=false,remoteBaseEqual=false;
+        };
+        auto next=sync; next.remote=remote; next.progress=downloads.value(sync.id).toObject()["progress"].toObject();
+        fileTask=files.submit(this,[path=sync.path,local=sync.local,remoteCfi,progress=next.progress,fb=sync.fb](const FileCancellation &cancel) {
+            RemoteCheck result; result.stamp=fileStamp(path); result.point=remoteCfi;
+            if (!remoteCfi.isEmpty()) result.valid=bookPosition(path,remoteCfi,nullptr,&result.point,nullptr,nullptr,&result.info,fb);
+            if (result.valid && !fileCancelled(cancel)) {
+                result.equal=local==result.point || sameBookPosition(path,local,result.point,false,fb);
+                if (!result.equal) {
+                    const auto localBase=progress["localBase"].toString();
+                    const auto remoteBase=progress["remoteBase"].toObject()["cfi"].toString();
+                    result.localBaseEqual=local==localBase || sameBookPosition(path,local,localBase,false,fb);
+                    result.remoteBaseEqual=remoteCfi==remoteBase || sameBookPosition(path,remoteCfi,remoteBase,true,fb);
+                }
             }
-            const QString remoteCfi=remote["cfi"].toString();
-            const auto percent=remote["percentage"];
-            if (!remote.contains("cfi") || (!remote["cfi"].isNull() && !remote["cfi"].isString()) ||
-                !percent.isDouble() || percent.toDouble()<0 || percent.toDouble()>100) {
-                finish(uiMessage("invalid_progress_response_expected_a_cfi_and_a_percentage_from_0_2d14d6"),false,"progress"); return;
+            result.digest=cachedDigest(path,cancel);
+            return result;
+        },[this,sync=next](const RemoteCheck &analysis,bool cancelled) {
+            if (!acceptFileContext(sync.context,analysis.stamp) || cancelled ||
+                readerChanged(sync.path,sync.position,downloads.value(sync.id).toObject()["progress"].toObject()!=sync.progress)) return;
+            if (analysis.digest!=sync.context.record["sha256"].toString().toLatin1()) {
+                finish(uiMessage("the_local_book_file_changed_during_sync_progress_was_kept_unchanged"),false,"progress","file"); return;
             }
-            struct RemoteCheck {
-                QByteArray digest; FileStamp stamp; QString point; PositionInfo info; bool valid=true,equal=false,localBaseEqual=false,remoteBaseEqual=false;
-            };
-            const auto progress=downloads.value(id).toObject()["progress"].toObject();
-            fileTask=files.submit(this,[path,local,remoteCfi,progress,fb](const FileCancellation &cancel) {
-                RemoteCheck result; result.stamp=fileStamp(path); result.point=remoteCfi;
-                if (!remoteCfi.isEmpty()) result.valid=bookPosition(path,remoteCfi,nullptr,&result.point,nullptr,nullptr,&result.info,fb);
-                if (result.valid && !fileCancelled(cancel)) {
-                    result.equal=local==result.point || sameBookPosition(path,local,result.point,false,fb);
-                    if (!result.equal) {
-                        const auto localBase=progress["localBase"].toString();
-                        const auto remoteBase=progress["remoteBase"].toObject()["cfi"].toString();
-                        result.localBaseEqual=local==localBase || sameBookPosition(path,local,localBase,false,fb);
-                        result.remoteBaseEqual=remoteCfi==remoteBase || sameBookPosition(path,remoteCfi,remoteBase,true,fb);
-                    }
+            if (!analysis.valid) {
+                finish(uiMessage("could_not_match_the_server_cfi_to_this_book_progress_was_kept_unchanged"),false,"progress","position"); return;
+            }
+            const auto &id=sync.id,&local=sync.local,&profile=sync.profile; const auto &remote=sync.remote;
+            const QString cfi=analysis.point;
+            const bool other=hasOtherCoordinates(remote),hasPage=hasPageNumber(remote);
+            const bool remoteEmpty=cfi.isEmpty() && remote["percentage"].toDouble()==0 && !hasPage && !other;
+            // A first download only restores incoming progress; it must never upload local state.
+            if (restoringDownload && remoteEmpty) {
+                syncingId.clear();
+                finish(uiMessage("book_downloaded_and_available_offline"),true,"download"); return;
+            }
+            if (cfi.isEmpty() && !remoteEmpty) {
+                finish(uiMessage("the_server_has_progress_without_an_exact_cfi_automatic_sync_is_n_df1162"),false,"progress","position"); return;
+            }
+            const auto state=progressState(id,profile);
+            const auto pending=state["pending"].toObject();
+            if (analysis.equal) {
+                if (persistProgress(id,profile,{{"localBase",local},{"remoteBase",remote}})) finishProgress(id,remote,uiMessage("progress_synced"));
+                return;
+            }
+            const bool known=state.contains("profile") && state["profile"].toString()==profile &&
+                state.contains("localBase") && state["remoteBase"].isObject();
+            const bool localChanged=known ? !analysis.localBaseEqual : !local.isEmpty();
+            const bool remoteChanged=known ? !analysis.remoteBaseEqual : !remoteEmpty;
+            auto next=sync; next.cfi=cfi;
+            next.changedChoice=sync.choice && (conflictId!=id || conflictProfile!=profile || conflictLocal!=local || conflictRemote!=remote);
+            int &action=next.action;
+            if (next.changedChoice) action=0; // A stale explicit choice must never become an automatic write.
+            else if (sync.choice) action=sync.choice;
+            else if (state.contains("profile") && !pending.isEmpty() && pending==remote && state["pendingLocal"].toString()==local && state["profile"].toString()==profile) action=2;
+            else {
+                switch (decideSync(known,localChanged,remoteChanged)) {
+                case SyncDecision::Upload: action=1; break;
+                case SyncDecision::ApplyRemote: action=2; break;
+                case SyncDecision::Unchanged:
+                    if (persistProgress(id,profile,state)) finishProgress(id,remote,uiMessage("progress_unchanged"));
+                    return;
+                case SyncDecision::Conflict: break;
                 }
-                result.digest=digestFile(path,cancel);
-                return result;
-            },[this,id,path,position,local,localInfo,fb,choice,route,profile,remote,percent,context,progress](const RemoteCheck &analysis,bool cancelled) {
-                if (!acceptFileContext(context,analysis.stamp) || cancelled) return;
-                QString current;
-                if (readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position ||
-                    downloads.value(id).toObject()["progress"].toObject()!=progress) {
-                    finish(uiMessage("the_reader_state_has_changed_retry_sync"),false,"progress"); return;
-                }
-                if (analysis.digest!=context.record["sha256"].toString().toLatin1()) {
-                    finish(uiMessage("the_local_book_file_changed_during_sync_progress_was_kept_unchanged"),false,"progress","file"); return;
-                }
-                if (!analysis.valid) {
-                    finish(uiMessage("could_not_match_the_server_cfi_to_this_book_progress_was_kept_unchanged"),false,"progress","position"); return;
-                }
-                const QString cfi=analysis.point;
-                bool other=false;
-                for (const auto key : {"positionSeconds","mediaOverlayFragment","mediaOverlaySectionIndex","koboLocationSource",
-                                      "koboLocationType","koboLocationValue","koboContentSourceProgressPercent","koreaderProgress","narrationPercentage","narrationUpdatedAt"})
-                    if (remote.contains(key) && !remote[key].isNull()) other=true;
-                const bool hasPage=remote.contains("pageNumber") && !remote["pageNumber"].isNull();
-                const bool remoteEmpty=cfi.isEmpty() && percent.toDouble()==0 && !hasPage && !other;
-                // A first download only restores incoming progress; it must never upload local state.
-                if (restoringDownload && remoteEmpty) {
-                    syncingId.clear();
-                    finish(uiMessage("book_downloaded_and_available_offline"),true,"download"); return;
-                }
-                if (cfi.isEmpty() && !remoteEmpty) {
-                    finish(uiMessage("the_server_has_progress_without_an_exact_cfi_automatic_sync_is_n_df1162"),false,"progress","position"); return;
-                }
-                auto record=downloads.value(id).toObject(); auto state=record["progress"].toObject();
-                if (state.contains("profile") && state["profile"].toString()!=profile) state={};
-                const auto pending=state["pending"].toObject();
-                auto persist=[this,id,profile,&record,&state] {
-                    state["profile"]=profile;
-                    record["progress"]=state;
-                    if (saveRecord(id,record)) return true;
-                    finish(uiMessage("could_not_save_progress_retry_sync"),false,"progress"); return false;
-                };
-                auto acknowledge=[&] {
-                    state={{"localBase",local},{"remoteBase",remote}};
-                    if (persist()) finishProgress(id,remote,uiMessage("progress_synced"));
-                };
-                if (analysis.equal) { acknowledge(); return; }
-                const bool known=state.contains("profile") && state["profile"].toString()==profile &&
-                    state.contains("localBase") && state["remoteBase"].isObject();
-                const bool localChanged=known ? !analysis.localBaseEqual : !local.isEmpty();
-                const bool remoteChanged=known ? !analysis.remoteBaseEqual : !remoteEmpty;
-                int action=0;
-                const bool changedChoice=choice && (conflictId!=id || conflictProfile!=profile || conflictLocal!=local || conflictRemote!=remote);
-                if (changedChoice) action=0; // A stale explicit choice must never become an automatic write.
-                else if (choice) action=choice;
-                else if (state.contains("profile") && !pending.isEmpty() && pending==remote && state["pendingLocal"].toString()==local && state["profile"].toString()==profile) action=2;
-                else {
-                    switch (decideSync(known,localChanged,remoteChanged)) {
-                    case SyncDecision::Upload: action=1; break;
-                    case SyncDecision::ApplyRemote: action=2; break;
-                    case SyncDecision::Unchanged:
-                        if (persist()) finishProgress(id,remote,uiMessage("progress_unchanged"));
-                        return;
-                    case SyncDecision::Conflict: break;
-                    }
-                }
-                if (!action && syncingAll) {
-                    // Persist both versions; after restart the next GET rechecks the conflict.
-                    state["conflictLocal"]=local; state["conflictRemote"]=remote;
-                    if (!persist()) return;
-                    finish(changedChoice ? uiMessage("the_position_changed_while_you_were_choosing_review_the_choices_again") : uiMessage("choose_a_reading_position"),false,"progress","conflict"); return;
-                }
-                if (action==2 && cfi.isEmpty()) { finish(uiMessage("the_server_has_no_exact_position_to_open"),false,"progress"); return; }
-                if (action==1 && (local.isEmpty() || other || hasPage)) {
-                    finish(hasPage ? uiMessage("the_server_position_includes_a_page_number_upload_stopped_to_preserve_it") :
-                           other ? uiMessage("the_server_record_contains_other_reading_coordinates_upload_stop_23d8ab") :
-                                   uiMessage("no_exact_position_on_the_reader_yet"),false,"progress"); return;
-                }
-                struct PreparedSync {
-                    FileStamp stamp; PreparedReaderPosition reader; QVariantList choices; double percentage=0; bool estimate=false;
-                };
+            }
+            if (!action && syncingAll) { saveConflict(next,state); return; }
+            if (action==2 && cfi.isEmpty()) { finish(uiMessage("the_server_has_no_exact_position_to_open"),false,"progress"); return; }
+            if (action==1 && (local.isEmpty() || other || hasPage)) {
+                finish(hasPage ? uiMessage("the_server_position_includes_a_page_number_upload_stopped_to_preserve_it") :
+                       other ? uiMessage("the_server_record_contains_other_reading_coordinates_upload_stop_23d8ab") :
+                               uiMessage("no_exact_position_on_the_reader_yet"),false,"progress"); return;
+            }
 #ifdef BOOKORBIT_TEST_HTTP
-                if (action==1) ++presentationCounters.uploadPreparations;
-                else if (action==2) ++presentationCounters.remotePreparations;
-                else ++presentationCounters.conflictPreviews;
+            if (action==1) ++presentationCounters.uploadPreparations;
+            else if (action==2) ++presentationCounters.remotePreparations;
+            else ++presentationCounters.conflictPreviews;
 #endif
-                fileTask=files.submit(this,[path,localInfo,remoteInfo=analysis.info,cfi,action,stamp=analysis.stamp,fb](const FileCancellation &cancel) {
-                    PreparedSync result; result.stamp=stamp;
-                    if (fileCancelled(cancel) || fileStamp(path)!=stamp) return result;
-                    if (action==1) result.estimate=positionEstimate(path,localInfo,&result.percentage);
-                    else if (action==2) result.reader=prepareReaderPosition(path,cfi,cancel,fb);
-                    else for (bool useLocal:{true,false}) {
-                        const auto &info=useLocal ? localInfo : remoteInfo;
-                        auto preview=info.context; double percentage=0;
-                        const bool valid=!fileCancelled(cancel) && positionEstimate(path,info,&percentage);
-                        preview["local"]=useLocal; preview["valid"]=valid; preview["percentageValue"]=percentage; preview["empty"]=info.point.isEmpty();
-                        result.choices.append(preview);
-                    }
-                    return result;
-                },[this,id,path,position,local,cfi,route,profile,remote,context,progress,action,changedChoice](const PreparedSync &prepared,bool cancelled) {
-                    if (!acceptFileContext(context,prepared.stamp) || cancelled) return;
-                    QString current;
-                    if (readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position ||
-                        downloads.value(id).toObject()["progress"].toObject()!=progress) {
-                        finish(uiMessage("the_reader_state_has_changed_retry_sync"),false,"progress"); return;
-                    }
-                    auto record=downloads.value(id).toObject(); auto state=record["progress"].toObject();
-                    if (state.contains("profile") && state["profile"].toString()!=profile) state={};
-                    auto persist=[this,id,profile,&record,&state] {
-                        state["profile"]=profile; record["progress"]=state;
-                        if (saveRecord(id,record)) return true;
-                        finish(uiMessage("could_not_save_progress_retry_sync"),false,"progress"); return false;
-                    };
-                    if (!action) {
-                        // Persist both versions; after restart the next GET rechecks the conflict.
-                        state["conflictLocal"]=local; state["conflictRemote"]=remote;
-                        if (!persist()) return;
-                        if (!syncingAll) prepareConflict(id,local,remote,profile,prepared.choices,prepared.stamp);
-                        finish(changedChoice ? uiMessage("the_position_changed_while_you_were_choosing_review_the_choices_again") : uiMessage("choose_a_reading_position"),false,"progress","conflict"); return;
-                    }
-                    if (action==2) {
-                        // Journal before native mutation; failed writes do not advance the agreed baseline.
-                        state["pending"]=remote; state["pendingLocal"]=local;
-                        state["profile"]=profile; record["progress"]=state;
-                        saveProgressIntent(id,record,[this,id,path,position,prepared,profile,cfi,remote,context] {
-                            if (!acceptFileContext(context,prepared.stamp)) return;
-                            UiMessage error;
-                            if (!saveReaderPosition(path,position,prepared.reader,profile,&error)) {
-                                finish(error,false,"progress","pending"); return;
-                            }
-                            auto record=downloads.value(id).toObject();
-                            record["progress"]=QJsonObject{{"localBase",cfi},{"remoteBase",remote},{"profile",profile}};
-                            if (saveRecord(id,record)) finishProgress(id,remote,uiMessage("position_saved_open_the_book_from_the_built_in_library"));
-                            else finish(uiMessage("could_not_save_progress_retry_sync"),false,"progress");
-                        });
-                        return;
-                    }
-                    const double percentage=prepared.percentage;
-                    if (!prepared.estimate) {
-                        finish(uiMessage("the_position_was_recognized_but_the_book_percentage_could_not_be_68fd96"),
-                               false,"progress","position"); return;
-                    }
-                    // Save before POST. An uncertain result is reconciled by the next GET, never blindly retried.
-                    const QJsonObject outgoing{{"source","text"},{"cfi",local},{"pageNumber",QJsonValue::Null},{"percentage",percentage}};
-                    state["outgoing"]=outgoing;
-                    state["profile"]=profile; record["progress"]=state;
-                    saveProgressIntent(id,record,[this,id,path,position,local,route,profile,outgoing,context,stamp=prepared.stamp] {
-                        if (!acceptFileContext(context,stamp)) return;
-                        QString current;
-                        if (readerFileState(path)!=ReaderFileState::Closed || !readerPosition(path,&current) || current!=position) {
-                            finish(uiMessage("the_reader_state_has_changed_retry_sync"),false,"progress"); return;
-                        }
-                        const auto sentContext=fileContext(id,path);
-                        jsonRequest(route,outgoing,[this,id,local,route,profile,sentContext](const QJsonObject &) {
-                            if (!acceptFileContext(sentContext)) return;
-                            jsonRequest(route,{},[this,id,local,profile,sentContext](const QJsonObject &confirmed) {
-                                if (!acceptFileContext(sentContext)) return;
-                                if (confirmed["cfi"].toString()!=local) {
-                                    finish(uiMessage("the_server_position_changed_after_upload_check_again"),false,"progress"); return;
-                                }
-                                auto record=downloads.value(id).toObject();
-                                record["progress"]=QJsonObject{{"localBase",local},{"remoteBase",confirmed},{"profile",profile}};
-                                if (!saveRecord(id,record)) { finish(uiMessage("uploaded_but_the_result_could_not_be_saved_check_again"),false,"progress"); return; }
-                                finishProgress(id,confirmed,uiMessage("progress_sent_to_bookorbit"));
-                            },true,true);
-                        });
-                    });
-                });
+            fileTask=files.submit(this,[path=sync.path,localInfo=sync.localInfo,remoteInfo=analysis.info,cfi,action,stamp=analysis.stamp,fb=sync.fb](const FileCancellation &cancel) {
+                PreparedSync result; result.stamp=stamp;
+                if (fileCancelled(cancel) || fileStamp(path)!=stamp) return result;
+                if (action==1) result.estimate=positionEstimate(path,localInfo,&result.percentage);
+                else if (action==2) result.reader=prepareReaderPosition(path,cfi,cancel,fb);
+                else for (bool useLocal:{true,false}) {
+                    const auto &info=useLocal ? localInfo : remoteInfo;
+                    auto preview=info.context; double percentage=0;
+                    const bool valid=!fileCancelled(cancel) && positionEstimate(path,info,&percentage);
+                    preview["local"]=useLocal; preview["valid"]=valid; preview["percentageValue"]=percentage; preview["empty"]=info.point.isEmpty();
+                    result.choices.append(preview);
+                }
+                return result;
+            },[this,sync=next](const PreparedSync &prepared,bool cancelled) {
+                if (!acceptFileContext(sync.context,prepared.stamp) || cancelled) return;
+                applyProgressAction(sync,prepared);
             });
-        },true,true);
+        });
+    },true,true);
+}
+
+void Client::applyProgressAction(const ProgressSync &sync,const PreparedSync &prepared) {
+    if (readerChanged(sync.path,sync.position,downloads.value(sync.id).toObject()["progress"].toObject()!=sync.progress)) return;
+    auto state=progressState(sync.id,sync.profile);
+    if (!sync.action) { saveConflict(sync,state,prepared.choices,prepared.stamp); return; }
+    if (sync.action==2) {
+        // Journal before native mutation; failed writes do not advance the agreed baseline.
+        state["pending"]=sync.remote; state["pendingLocal"]=sync.local;
+        saveProgressIntent(sync.id,sync.profile,state,[this,sync,prepared] {
+            if (!acceptFileContext(sync.context,prepared.stamp)) return;
+            UiMessage error;
+            if (!saveReaderPosition(sync.path,sync.position,prepared.reader,sync.profile,&error)) {
+                finish(error,false,"progress","pending"); return;
+            }
+            if (persistProgress(sync.id,sync.profile,{{"localBase",sync.cfi},{"remoteBase",sync.remote}}))
+                finishProgress(sync.id,sync.remote,uiMessage("position_saved_open_the_book_from_the_built_in_library"));
+        });
+        return;
+    }
+    if (!prepared.estimate) {
+        finish(uiMessage("the_position_was_recognized_but_the_book_percentage_could_not_be_68fd96"),
+               false,"progress","position"); return;
+    }
+    // Save before POST. An uncertain result is reconciled by the next GET, never blindly retried.
+    const QJsonObject outgoing{{"source","text"},{"cfi",sync.local},{"pageNumber",QJsonValue::Null},{"percentage",prepared.percentage}};
+    state["outgoing"]=outgoing;
+    saveProgressIntent(sync.id,sync.profile,state,[this,sync,outgoing,stamp=prepared.stamp] {
+        if (!acceptFileContext(sync.context,stamp) || readerChanged(sync.path,sync.position)) return;
+        const auto route="/api/v1/books/files/"+sync.id+"/progress";
+        const auto sentContext=fileContext(sync.id,sync.path);
+        jsonRequest(route,outgoing,[this,id=sync.id,local=sync.local,route,profile=sync.profile,sentContext](const QJsonObject &) {
+            if (!acceptFileContext(sentContext)) return;
+            jsonRequest(route,{},[this,id,local,profile,sentContext](const QJsonObject &confirmed) {
+                if (!acceptFileContext(sentContext)) return;
+                if (confirmed["cfi"].toString()!=local) {
+                    finish(uiMessage("the_server_position_changed_after_upload_check_again"),false,"progress"); return;
+                }
+                auto record=downloads.value(id).toObject();
+                record["progress"]=QJsonObject{{"localBase",local},{"remoteBase",confirmed},{"profile",profile}};
+                if (!saveRecord(id,record)) { finish(uiMessage("uploaded_but_the_result_could_not_be_saved_check_again"),false,"progress"); return; }
+                finishProgress(id,confirmed,uiMessage("progress_sent_to_bookorbit"));
+            },true,true);
+        });
     });
 }

@@ -220,7 +220,7 @@ ApplicationWindow {
         const bottom = top + Math.max(0, target.contentHeight-target.height)
         const edge = direction > 0 ? target.contentY >= bottom-1 : target.contentY <= top+1
         if (edge && !client.detailVisible && !syncView && !client.collectionsView && !client.offlineOnly &&
-                (direction > 0 ? (client.page+1)*10 < client.total : client.page > 0)) {
+                (direction > 0 ? (client.page+1)*client.pageSize < client.total : client.page > 0)) {
             pageOffset = target.contentY; pageDirection = direction; catalogTransition = true
             client.refresh(client.page + direction, client.catalogQuery)
         } else target.contentY = Math.max(top, Math.min(bottom, target.contentY + direction*target.height*0.85))
@@ -848,28 +848,8 @@ ApplicationWindow {
             ScrollBar.vertical: ScrollBar { }
             delegate: ItemDelegate {
                 id: bookRow
-                required property var bookId
-                required property var title
-                required property var author
-                required property var seriesName
-                required property var seriesIndex
-                required property var readStatus
-                required property var readingProgress
-                required property var fileId
-                required property var format
-                required property var fileCount
-                required property var formats
-                required property var localFormats
-                required property var downloaded
-                required property var readable
-                required property var canSync
-                required property var supported
-                required property var needsRepair
-                required property var syncResult
-                required property var pendingProgress
-                required property var remoteFileChanged
-                required property var hasConflict
-                readonly property var modelData: ({bookId: bookId, title: title, author: author, seriesName: seriesName, seriesIndex: seriesIndex, readStatus: readStatus, readingProgress: readingProgress, fileId: fileId, format: format, fileCount: fileCount, formats: formats, localFormats: localFormats, downloaded: downloaded, readable: readable, canSync: canSync, supported: supported, needsRepair: needsRepair, syncResult: syncResult, pendingProgress: pendingProgress, remoteFileChanged: remoteFileChanged, hasConflict: hasConflict})
+                required property var model
+                readonly property var modelData: model
                 required property int index
                 objectName: "book-" + modelData.bookId
                 width: catalog.width
@@ -947,28 +927,8 @@ ApplicationWindow {
             ScrollBar.vertical: ScrollBar { }
             delegate: ItemDelegate {
                 id: coverTile
-                required property var bookId
-                required property var title
-                required property var author
-                required property var seriesName
-                required property var seriesIndex
-                required property var readStatus
-                required property var readingProgress
-                required property var fileId
-                required property var format
-                required property var fileCount
-                required property var formats
-                required property var localFormats
-                required property var downloaded
-                required property var readable
-                required property var canSync
-                required property var supported
-                required property var needsRepair
-                required property var syncResult
-                required property var pendingProgress
-                required property var remoteFileChanged
-                required property var hasConflict
-                readonly property var modelData: ({bookId: bookId, title: title, author: author, seriesName: seriesName, seriesIndex: seriesIndex, readStatus: readStatus, readingProgress: readingProgress, fileId: fileId, format: format, fileCount: fileCount, formats: formats, localFormats: localFormats, downloaded: downloaded, readable: readable, canSync: canSync, supported: supported, needsRepair: needsRepair, syncResult: syncResult, pendingProgress: pendingProgress, remoteFileChanged: remoteFileChanged, hasConflict: hasConflict})
+                required property var model
+                readonly property var modelData: model
                 objectName: "gridBook-" + modelData.bookId
                 width: coverCatalog.cellWidth; height: coverCatalog.cellHeight
                 padding: 8 * window.u
@@ -1112,7 +1072,7 @@ ApplicationWindow {
                     Action {
                         required property var modelData
                         text: modelData.name + "  ›"; Layout.fillWidth: true; enabled: !client.busy
-                        onClicked: { client.openCollection(modelData.id, modelData.name, window.savedCatalogY, detailScroll.contentItem.contentY); search.text = "" }
+                        onClicked: { window.syncView = false; search.text = ""; client.openCollection(modelData.id, modelData.name, window.savedCatalogY, detailScroll.contentItem.contentY) }
                     }
                 }
             }
@@ -1121,8 +1081,8 @@ ApplicationWindow {
             visible: !window.settings && !window.syncView && !client.offlineOnly && !client.collectionsView && !client.detailVisible
             Layout.fillWidth: true
             Action { objectName: "previousPage"; text: "‹"; Layout.preferredWidth: 100 * window.u; Accessible.name: qsTranslate("BookOrbit", "Previous page"); enabled: !client.busy && client.authenticated && (client.page > 0 || activeCatalog.contentY > 1); onClicked: window.pageContent(-1) }
-            Text { objectName: "catalogRange"; text: client.total === 0 ? qsTranslate("BookOrbit", "Books: 0") : (client.catalogQuery ? qsTranslate("BookOrbit", "Found: ") + client.total + qsTranslate("BookOrbit", " · showing ") : qsTranslate("BookOrbit", "Books ")) + (client.page*10+1) + "–" + Math.min((client.page+1)*10, client.total) + (client.catalogQuery ? "" : qsTranslate("BookOrbit", " of ") + client.total); Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; font.pixelSize: 14 * window.u }
-            Action { objectName: "nextPage"; text: "›"; Layout.preferredWidth: 100 * window.u; Accessible.name: qsTranslate("BookOrbit", "Next page"); enabled: !client.busy && client.authenticated && ((client.page+1)*10 < client.total || activeCatalog.contentY < Math.max(0, activeCatalog.contentHeight-activeCatalog.height)-1); onClicked: window.pageContent(1) }
+            Text { objectName: "catalogRange"; text: client.total === 0 ? qsTranslate("BookOrbit", "Books: 0") : (client.catalogQuery ? qsTranslate("BookOrbit", "Found: ") + client.total + qsTranslate("BookOrbit", " · showing ") : qsTranslate("BookOrbit", "Books ")) + (client.page*client.pageSize+1) + "–" + Math.min((client.page+1)*client.pageSize, client.total) + (client.catalogQuery ? "" : qsTranslate("BookOrbit", " of ") + client.total); Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; font.pixelSize: 14 * window.u }
+            Action { objectName: "nextPage"; text: "›"; Layout.preferredWidth: 100 * window.u; Accessible.name: qsTranslate("BookOrbit", "Next page"); enabled: !client.busy && client.authenticated && ((client.page+1)*client.pageSize < client.total || activeCatalog.contentY < Math.max(0, activeCatalog.contentHeight-activeCatalog.height)-1); onClicked: window.pageContent(1) }
         }
         Action { visible: client.downloading; text: qsTranslate("BookOrbit", "Cancel download"); enabled: client.downloadCancellable; Layout.fillWidth: true; onClicked: client.cancelDownload() }
         Action { objectName: "cancelVerificationButton"; visible: client.verifyingLibrary; text: qsTranslate("BookOrbit", "Cancel verification"); Layout.fillWidth: true; onClicked: client.cancelLibraryVerification() }

@@ -52,6 +52,12 @@ int main(int argc,char **argv) {
         require(percent>=0 && percent<=100 && context.contains("excerpt"),"display estimate and context");
     }
     require(progressWork().fb2Parses==1,"all conversions share one cached FB2 parse");
+    {
+        // Old per-call sum of preceding paragraph lengths+1: 6+6+8+22+1+7+5+9 = 64 of total 73.
+        double percent=-1;
+        require(bookPosition(path,"epubcfi(/6/8!/4/2/4/2/1:3)",&percent) && percent==100.0*double(64+3)/double(73),
+            "last paragraph percentage matches the per-paragraph sum");
+    }
     clearEpubCache();
     require(bookCfi(path,cases[0].first,snapshot)==cases[0].second &&
         bookPosition(path,cases[4].second,nullptr,nullptr,nullptr,nullptr,nullptr,snapshot) &&

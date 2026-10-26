@@ -61,12 +61,15 @@ bool removeAttempt(const SavedAttempt &attempt) {
 }
 AttemptScan scanAttempts(const QString &root,const QString &destination,const FileCancellation &cancel) {
     AttemptScan result; QList<SavedAttempt> attempts;
+    const auto entries=QDir(root+"/update").entryInfoList({"attempt-*"},QDir::Dirs|QDir::NoDotAndDotDot);
+    // Most starts have no attempts; skip hashing the running executable.
+    if (entries.isEmpty()) return result;
     const auto targetStamp=fileStamp(destination);
     const auto targetHash=Ota::hashFile(destination);
     bool targetVerified=Ota::isRunningExecutable(destination);
     QString installedVersion=targetVerified ? Ota::version() : QString{};
     const QSet<QString> owned{"archive.zip","bookorbit.next","release.json","release.sig","install.json"};
-    for (const auto &entry:QDir(root+"/update").entryInfoList({"attempt-*"},QDir::Dirs|QDir::NoDotAndDotDot)) {
+    for (const auto &entry:entries) {
         if (fileCancelled(cancel)) return result;
         if (QUuid::fromString(entry.fileName().mid(8)).isNull() || !Ota::safeDirectory(entry.absoluteFilePath())) continue;
         SavedAttempt attempt; attempt.directory=entry.absoluteFilePath();

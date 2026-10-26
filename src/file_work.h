@@ -3,6 +3,9 @@
 #include <QString>
 #include <QByteArray>
 class QSaveFile;
+class QJsonObject;
+class QJsonValue;
+struct UiMessage;
 struct Fb2Index;
 
 enum class FileCommitState { FailedBeforeReplace, ReplacedUnconfirmed, Complete };
@@ -22,6 +25,7 @@ struct FileStamp {
 };
 FileStamp fileStamp(const QString &path);
 QByteArray digestFile(const QString &path,const FileCancellation &cancel={});
+QByteArray cachedDigest(const QString &path,const FileCancellation &cancel={});
 bool validContent(const QString &path,const QString &format,const FileCancellation &cancel={});
 FileStamp fb2Calibration(const FileCancellation &cancel={});
 struct PreparedReaderPosition {
@@ -31,3 +35,8 @@ struct PreparedReaderPosition {
     bool coordinate=false,estimate=false;
 };
 PreparedReaderPosition prepareReaderPosition(const QString &path,const QString &cfi,const FileCancellation &cancel={},const std::shared_ptr<const Fb2Index> &fb={});
+
+constexpr qint64 maxJson=2*1024*1024;
+QJsonObject readObject(const QString &path);
+bool writeObject(const QString &path,const QJsonObject &object,UiMessage *error=nullptr);
+bool positiveId(const QJsonValue &value);

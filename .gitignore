@@ -28,3 +28,6 @@ build/
 !/tools/ota_check.cpp
 !/tools/ota_fixtures.py
 !/tools/check_update_path.py
+!/tools/dev.py
+!/tools/capture_frame.py
+!/tools/check_live.py

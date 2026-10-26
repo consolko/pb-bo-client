@@ -652,6 +652,8 @@ int main(int argc, char **argv) {
     if (c.coverUrl(1).isEmpty()) finalCover.exec();
     QObject::disconnect(coverConnection);
     require(!c.coverUrl(1).isEmpty(), "cover finishes before testing logout persistence");
+    require(QJsonDocument::fromJson(contents(scope+"/cover-index.json")).object().contains("1"),
+            "cover index reaches disk once the cover queue drains");
     write(fault, "error");
     require(!wait(c, [&] { c.logout(); }) && !c.authenticated() && c.status().contains("не подтверждён"), "failed server logout still clears local credentials");
     write(fault, "");
@@ -697,7 +699,7 @@ int main(int argc, char **argv) {
     legacy.showDownloaded(true);
     require(legacy.books().size() == 2 && !legacy.localFile(0).isEmpty() &&
             QFile::exists(legacyScope+"/downloads-v1.json") && !QFile::exists(legacyScope+"/downloads.json"), "migration resumes and keeps backup");
-    require(!QFile::exists(migrationOrphan), "completed migration permits owned orphan cleanup");
+    require(waitUntil([&] { return !QFile::exists(migrationOrphan); }), "completed migration permits owned orphan cleanup");
     const QString manyRoot = root+"/many-check";
     const QString manyScope = manyRoot+"/"+QFileInfo(scope).fileName();
     require(QDir().mkpath(manyScope+"/records"), "create large isolated library");
@@ -1181,6 +1183,69 @@ int main(int argc, char **argv) {
             require(!restore.status().isEmpty(),"retained download reports why restoration did not finish");
         }
         fakeReader=ReaderFileState::Closed; fakeProfile="default"; indexed=true;
+    }
+    // Characterization of syncBook branches: other server coordinates, batch conflicts, CFI-less progress, changed confirmation.
+    {
+        Client chars(endpoint,root+"/char-sync"); require(waitForLibrary(chars),"registry snapshot loaded");
+        const auto cfiAt=[](int n) { return QString("pbr:/webkit?##epubcfi(/6/2!/4/%1/1)").arg(n); };
+        const auto posts=[&](int id) { return requests(root,QString("POST /api/v1/books/files/%1/progress").arg(id)); };
+        fakeReader=ReaderFileState::Closed; fakeProfile="default"; indexed=true; applyAllowed=true; blockedPath.clear();
+        fakePosition=cfiAt(62); write(fault,"progress_at_62");
+        require(wait(chars,[&] { chars.login(chars.server(),"demo","demo"); }) && wait(chars,[&] { chars.showDownloaded(false); }) &&
+                wait(chars,[&] { chars.download(0); }) && wait(chars,[&] { chars.download(1); }), "characterization fixture downloads two books");
+        const QString charScope=QFileInfo(chars.localFile(0)).absolutePath();
+        const auto progressOf=[&](int id) { return QJsonDocument::fromJson(contents(charScope+"/records/"+QString::number(id)+".json")).object()["progress"].toObject(); };
+        const auto stateOf=[&](int id) { for (const auto &row:chars.syncBooks()) for (const auto &file:row.toMap()["files"].toList()) if (file.toMap()["fileId"].toInt()==id) return file.toMap()["state"].toString(); return QString{}; };
+        const auto agree=[&] { // equal local and server positions replace the whole progress journal with a fresh baseline
+            fakePosition=cfiAt(62); write(fault,"progress_at_62");
+            require(wait(chars,[&] { chars.syncFile(101); }) && wait(chars,[&] { chars.syncFile(102); }) &&
+                    progressOf(101)["localBase"]==nativeCfi(cfiAt(62)) && !progressOf(101).contains("conflictRemote") && !progressOf(101).contains("outgoing"),
+                    "equal positions acknowledge a clean baseline");
+        };
+        agree();
+        // Exact CFI is absent but the percentage is not zero: no automatic direction is safe.
+        write(fault,"progress_without_cfi"); fakePosition=cfiAt(14);
+        auto beforeNoCfi=progressOf(101); QString appliedBefore=appliedCfi; int postsBefore=posts(101);
+        require(!wait(chars,[&] { chars.syncFile(101); }) && chars.status()==uiMessage("the_server_has_progress_without_an_exact_cfi_automatic_sync_is_n_df1162").text() &&
+                posts(101)==postsBefore && appliedCfi==appliedBefore && fakePosition==cfiAt(14) && !chars.progressConflict() && progressOf(101)==beforeNoCfi,
+                "server percentage without CFI stops sync with no upload, no incoming position and an untouched journal");
+        // Local changed, server unchanged since baseline, but the server record holds positionSeconds: upload must stop.
+        write(fault,"progress_at_62_seconds"); fakePosition=cfiAt(10);
+        beforeNoCfi=progressOf(101); postsBefore=posts(101);
+        require(!wait(chars,[&] { chars.syncFile(101); }) && chars.status()==uiMessage("the_server_record_contains_other_reading_coordinates_upload_stop_23d8ab").text() &&
+                posts(101)==postsBefore && !chars.progressConflict() && progressOf(101)==beforeNoCfi,
+                "other server coordinates stop an automatic upload without POST or journal change");
+        // Both sides changed: the dialog forbids choosing local and an explicit local choice is refused too.
+        write(fault,"progress_at_82_seconds");
+        require(!wait(chars,[&] { chars.syncFile(101); }) && chars.progressConflict() && chars.conflictPositions().size()==2 && posts(101)==postsBefore,
+                "other server coordinates plus two changed sides open the conflict dialog");
+        for (const auto &entry:chars.conflictPositions()) {
+            const auto choice=entry.toMap();
+            if (choice["local"].toBool())
+                require(!choice["canUse"].toBool() && choice["notice"].toString()==QCoreApplication::translate("BookOrbit","Upload stopped to preserve other server position data."),
+                        "local choice is unusable and explains that other server data would be lost");
+            else require(choice["canUse"].toBool() && choice["notice"].toString().isEmpty(), "server choice stays usable");
+        }
+        require(!wait(chars,[&] { chars.resolveProgress(true); }) && chars.status()==uiMessage("the_server_record_contains_other_reading_coordinates_upload_stop_23d8ab").text() &&
+                posts(101)==postsBefore, "explicit local choice cannot erase other server coordinates");
+        chars.dismissConflict();
+        // After a POST the confirming GET reports another CFI: the baseline must not advance to the uploaded one.
+        agree();
+        fakePosition=cfiAt(10); write(fault,"confirm_changed"); postsBefore=posts(101);
+        require(!wait(chars,[&] { chars.syncFile(101); }) && chars.status()==uiMessage("the_server_position_changed_after_upload_check_again").text() &&
+                posts(101)==postsBefore+1 && progressOf(101)["localBase"]==nativeCfi(cfiAt(62)) && progressOf(101)["outgoing"].toObject()["cfi"]==nativeCfi(cfiAt(10)) &&
+                stateOf(101)=="uncertain", "changed confirmation keeps the old baseline and the journaled upload");
+        // Batch: a conflict is stored for both books without any POST and without opening the dialog.
+        agree();
+        write(fault,"progress_at_82"); fakePosition=cfiAt(10); postsBefore=posts(101); const int otherPosts=posts(102);
+        wait(chars,[&] { chars.syncAll(); });
+        require(!chars.progressConflict() && posts(101)==postsBefore && posts(102)==otherPosts, "batch conflict sends nothing and shows no blocking dialog");
+        for (const int id:{101,102}) {
+            const auto progress=progressOf(id);
+            require(progress["conflictLocal"]==nativeCfi(cfiAt(10)) && progress["conflictRemote"].toObject()["cfi"].toString()==QString("epubcfi(/6/2!/4/82/1)") &&
+                    progress["localBase"]==nativeCfi(cfiAt(62)) && stateOf(id)=="conflict", "batch persists both conflicting positions and marks the book as conflict");
+        }
+        write(fault,"");
     }
     std::puts("PASS: stage 3 client checks");
 }

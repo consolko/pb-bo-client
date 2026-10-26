@@ -58,8 +58,12 @@ int main(int argc,char **argv) {
     check(digestFile(file)==expected,"bounded full-file hash preserves SHA-256");
     auto cancelled=std::make_shared<std::atomic_bool>(true);
     check(digestFile(file,cancelled).isEmpty(),"cancelled hashing yields no usable digest");
+    check(cachedDigest(file)==expected,"cached hash matches the full-file hash");
+    check(cachedDigest(file,cancelled)==expected,"unchanged stamp reuses the cached hash without reading");
     check(content.open(QIODevice::WriteOnly) && content.write(QByteArray(payload.size(),'y'))==payload.size(),"change content without changing its size"); content.close();
     check(fileStamp(file)!=stamp && digestFile(file)!=expected,"identity stamp detects a same-size rewrite");
+    check(cachedDigest(file,cancelled).isEmpty(),"changed file is reread and honours cancellation");
+    check(cachedDigest(file)==QCryptographicHash::hash(QByteArray(payload.size(),'y'),QCryptographicHash::Sha256).toHex(),"changed file gets its new hash");
     check(QFile::link(file,temp.path()+"/alias") && !fileStamp(temp.path()+"/alias").valid,"symlink cannot provide a trusted file identity");
 
     const QString database=temp.path()+"/history.db";
