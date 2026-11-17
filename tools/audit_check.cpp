@@ -81,7 +81,11 @@ bool opened=false;
 ReaderRecents history;
 bool connectNetwork() { return true; }
 QString readerProfile() { return profile; }
-bool readerPosition(const QString &,QString *value) { *value=position; return true; }
+bool readerPosition(const QString &,QString *value,bool *completed) {
+    *value=position;
+    if (completed) *completed=false;
+    return true;
+}
 ReaderFileState readerFileState(const QString &) { return ReaderFileState::Closed; }
 std::function<ReaderRecents(const FileCancellation &)> readerRecentsTask(const QStringList &,const QString &profile) {
     auto snapshot=history; snapshot.profile=profile;

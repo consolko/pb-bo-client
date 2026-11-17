@@ -230,6 +230,8 @@ class Handler(BaseHTTPRequestHandler):
             book.pop("readingProgress", None)  # Real detail API has no book-level percentage.
             if any(str(entry["id"]) in self.server.progress for entry in book["files"]):
                 book["readStatus"] = {"status": "reading"}
+            if mode in ("completed_without_cfi", "completed_without_progress") and book["id"] == 1:
+                book["readStatus"] = {"status": "read"}
             if mode == "bad_files":
                 book["files"] = [{"id": 201, "format": "../pdf", "role": "primary", "sizeBytes": 1}]
             return self.send(200, book)
@@ -296,8 +298,10 @@ class Handler(BaseHTTPRequestHandler):
             if at:  # persistent: every request sees a fixed server record, optionally with another coordinate
                 self.server.progress[file_id] = {"cfi": f"epubcfi(/6/2!/4/{at[1]}/1)", "pageNumber": None, "percentage": 40,
                                                  **({"positionSeconds": 12.5} if at[2] else {})}
-            if mode == "progress_without_cfi":  # persistent: percentage but no exact position
+            if mode == "progress_without_cfi" or (mode == "completed_without_cfi" and file_id == "101"):
                 self.server.progress[file_id] = {"cfi": None, "pageNumber": None, "percentage": 25}
+            if mode == "completed_without_progress" and file_id == "101":
+                self.server.progress.pop(file_id, None)
             if mode == "confirm_changed" and self.command == "POST":
                 fault.write_text("confirm_changed_get")
             if mode == "confirm_changed_get" and self.command == "GET":  # the confirming read sees another CFI

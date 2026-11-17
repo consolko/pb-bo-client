@@ -26,6 +26,7 @@ inline QString interfaceLanguage(QString systemLanguage, const QString &preferen
 inline const QMap<QString, const char *> &messageSources() {
     static const QMap<QString, const char *> sources{
         {"book_downloaded_progress_result", QT_TRANSLATE_NOOP("BookOrbit", "Book downloaded. %1")},
+        {"book_is_marked_as_read_on_both", QT_TRANSLATE_NOOP("BookOrbit", "Marked as read on PocketBook and in BookOrbit")},
         {"book_registration_pending_sync_later", QT_TRANSLATE_NOOP("BookOrbit", "The library has not registered the book yet. Sync its position after registration.")},
         {"waiting_for_book_registration", QT_TRANSLATE_NOOP("BookOrbit", "Waiting for the library to register the book…")},
         {"1_files_2_matching_3_different_4_errors_5_unchecked_6_see_book_d_4bf1b3", QT_TRANSLATE_NOOP("BookOrbit", "%1. Files: %2; matching: %3; different: %4; errors: %5; unchecked: %6. See book details for results.")},

@@ -21,9 +21,14 @@
 bool networkAvailable = true;
 bool connectNetwork() { return networkAvailable; }
 QString fakePosition;
+bool fakeCompleted=false;
 QString fakeProfile="default";
 QString readerProfile() { return fakeProfile; }
-bool readerPosition(const QString &, QString *position) { *position=fakePosition; return true; }
+bool readerPosition(const QString &, QString *position, bool *completed) {
+    *position=fakePosition;
+    if (completed) *completed=fakeCompleted;
+    return true;
+}
 bool historyReadable=true;
 QMap<QString,ReaderRecent> fakeRecents;
 std::function<ReaderRecents(const FileCancellation &)> readerRecentsTask(const QStringList &,const QString &profile) {
@@ -1203,12 +1208,30 @@ int main(int argc, char **argv) {
                     "equal positions acknowledge a clean baseline");
         };
         agree();
+        const auto agreedProgress=progressOf(101);
+        const int completedPosts=posts(101), completedGets=requests(root,"GET /api/v1/books/files/101/progress");
+        const auto completedApplied=appliedCfi;
+        write(fault,"completed_without_cfi"); fakePosition=cfiAt(14); fakeCompleted=true;
+        require(wait(chars,[&] { chars.syncFile(101); }) && stateOf(101)=="synced" &&
+                chars.status()==uiMessage("book_is_marked_as_read_on_both").text() &&
+                chars.books().first().toMap()["readStatus"].toMap()["status"]=="read" &&
+                progressOf(101)==agreedProgress && posts(101)==completedPosts && appliedCfi==completedApplied && fakePosition==cfiAt(14),
+                "matching read statuses succeed without a server CFI or changes to the positions or baseline");
+        write(fault,"completed_without_progress"); fakePosition="pbr:/page?page=0";
+        require(wait(chars,[&] { chars.syncFile(101); }) && stateOf(101)=="synced" &&
+                requests(root,"GET /api/v1/books/files/101/progress")==completedGets && posts(101)==completedPosts &&
+                appliedCfi==completedApplied && fakePosition=="pbr:/page?page=0",
+                "matching read statuses succeed when BookOrbit has no progress and PocketBook has a placeholder position");
+        write(fault,"completed_without_cfi"); fakePosition=cfiAt(14); fakeCompleted=false;
+        require(!wait(chars,[&] { chars.syncFile(101); }) && stateOf(101)=="position" && posts(101)==completedPosts,
+                "a book marked read only in BookOrbit still requires an exact position");
         // Exact CFI is absent but the percentage is not zero: no automatic direction is safe.
-        write(fault,"progress_without_cfi"); fakePosition=cfiAt(14);
+        write(fault,"progress_without_cfi"); fakeCompleted=true;
         auto beforeNoCfi=progressOf(101); QString appliedBefore=appliedCfi; int postsBefore=posts(101);
         require(!wait(chars,[&] { chars.syncFile(101); }) && chars.status()==uiMessage("the_server_has_progress_without_an_exact_cfi_automatic_sync_is_n_df1162").text() &&
                 posts(101)==postsBefore && appliedCfi==appliedBefore && fakePosition==cfiAt(14) && !chars.progressConflict() && progressOf(101)==beforeNoCfi,
-                "server percentage without CFI stops sync with no upload, no incoming position and an untouched journal");
+                "reader-only completion does not bypass the protection for server progress without a CFI");
+        fakeCompleted=false;
         // Local changed, server unchanged since baseline, but the server record holds positionSeconds: upload must stop.
         write(fault,"progress_at_62_seconds"); fakePosition=cfiAt(10);
         beforeNoCfi=progressOf(101); postsBefore=posts(101);
@@ -1245,6 +1268,11 @@ int main(int argc, char **argv) {
             require(progress["conflictLocal"]==nativeCfi(cfiAt(10)) && progress["conflictRemote"].toObject()["cfi"].toString()==QString("epubcfi(/6/2!/4/82/1)") &&
                     progress["localBase"]==nativeCfi(cfiAt(62)) && stateOf(id)=="conflict", "batch persists both conflicting positions and marks the book as conflict");
         }
+        write(fault,"completed_without_cfi"); fakePosition=cfiAt(82); fakeCompleted=true;
+        require(wait(chars,[&] { chars.syncAll(); }) && stateOf(101)=="synced" && stateOf(102)=="synced" &&
+                progressOf(101)==agreedProgress && posts(101)==postsBefore && posts(102)==otherPosts,
+                "batch recognizes a completed book, clears its old conflict and keeps its last confirmed positions");
+        fakeCompleted=false;
         write(fault,"");
     }
     std::puts("PASS: stage 3 client checks");

@@ -326,9 +326,11 @@ private:
     void syncBook(const QString &id, int choice = 0);
     void compareRemoteProgress(const ProgressSync &sync);
     void applyProgressAction(const ProgressSync &sync,const PreparedSync &prepared);
-    bool readerChanged(const QString &path,const QString &position,bool changed=false);
+    bool readerChanged(const ProgressSync &sync,bool changed=false);
     void saveConflict(const ProgressSync &sync,QJsonObject state,const QVariantList &choices={},const FileStamp &stamp={});
+    void fetchProgressBook(const FileContext &context,const std::function<void(const QJsonObject &,const QJsonArray &)> &callback);
     void finishProgress(const QString &id, const QJsonObject &remote, const UiMessage &text);
+    void finishBookProgress(int bookId,const QJsonValue &readStatus,const QJsonValue &percentage,const UiMessage &text);
     void verifyRemoteFile(const QString &id, bool renew = true);
     void verifyBook(const QString &id);
     QString conflictId, conflictLocal, conflictMessage, conflictProfile;

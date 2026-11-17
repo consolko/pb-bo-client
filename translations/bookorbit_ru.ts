@@ -7,6 +7,10 @@
         <translation>Книга скачана. %1</translation>
     </message>
     <message>
+        <source>Marked as read on PocketBook and in BookOrbit</source>
+        <translation>Книга отмечена прочитанной на PocketBook и в BookOrbit</translation>
+    </message>
+    <message>
         <source>The library has not registered the book yet. Sync its position after registration.</source>
         <translation>Библиотека ещё не зарегистрировала книгу. После регистрации запустите синхронизацию позиции.</translation>
     </message>

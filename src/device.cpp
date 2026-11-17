@@ -22,7 +22,7 @@
 #include <inkview.h>
 #endif
 
-static bool readReaderPosition(const QString &path, QString *position, qint64 *bookId);
+static bool readReaderPosition(const QString &path, QString *position, qint64 *bookId, bool *completed=nullptr);
 
 QSize setupDevice() {
 #ifdef POCKETBOOK_DEVICE
@@ -233,7 +233,7 @@ ReaderRecents readerRecents(const QStringList &paths) {
     return result;
 }
 
-static bool readReaderPosition(const QString &path, QString *position, qint64 *bookId) {
+static bool readReaderPosition(const QString &path, QString *position, qint64 *bookId, bool *completed) {
 #ifdef POCKETBOOK_DEVICE
     const QString profileName = readerProfile();
     bool ok = false;
@@ -244,7 +244,7 @@ static bool readReaderPosition(const QString &path, QString *position, qint64 *b
         db.setConnectOptions("QSQLITE_OPEN_READONLY;QSQLITE_BUSY_TIMEOUT=100");
         if (db.open()) {
             QSqlQuery q(db);
-            q.prepare("SELECT s.position, f.book_id FROM files f JOIN folders d ON d.id=f.folder_id "
+            q.prepare("SELECT s.position, f.book_id, s.completed FROM files f JOIN folders d ON d.id=f.folder_id "
                       "JOIN profiles p ON (p.name=? OR (?='' AND p.name='default' AND (SELECT COUNT(*) FROM profiles)=1)) "
                       "LEFT JOIN books_settings s ON s.bookid=f.book_id AND s.profileid=p.id "
                       "WHERE d.name=? AND f.filename=? AND f.book_id>0");
@@ -256,6 +256,7 @@ static bool readReaderPosition(const QString &path, QString *position, qint64 *b
             if (q.exec() && q.next()) {
                 *position=q.value(0).toString();
                 if (bookId) *bookId=q.value(1).toLongLong();
+                if (completed) *completed=q.value(2).toInt()==1;
                 ok=!q.next();
             }
         }
@@ -263,17 +264,17 @@ static bool readReaderPosition(const QString &path, QString *position, qint64 *b
     QSqlDatabase::removeDatabase(connection);
     return ok;
 #else
-    Q_UNUSED(path) Q_UNUSED(position) Q_UNUSED(bookId)
+    Q_UNUSED(path) Q_UNUSED(position) Q_UNUSED(bookId) Q_UNUSED(completed)
     return false;
 #endif
 }
 
 
-bool readerPosition(const QString &path, QString *position) {
+bool readerPosition(const QString &path, QString *position, bool *completed) {
 #ifdef POCKETBOOK_DEVICE
     if (path.endsWith(".fb2",Qt::CaseInsensitive) && QByteArray(GetSoftwareVersion())!="U634.6.10.3425") return false;
 #endif
-    return readReaderPosition(path, position, nullptr);
+    return readReaderPosition(path, position, nullptr, completed);
 }
 
 bool saveReaderPosition(const QString &path, const QString &expectedPosition,

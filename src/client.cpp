@@ -2671,50 +2671,60 @@ void Client::verifyRemoteFile(const QString &id, bool renew) {
     });
 }
 
-void Client::finishProgress(const QString &id, const QJsonObject &remote, const UiMessage &text) {
-    const auto record=downloads.value(id).toObject();
-    const int bookId=libraryBookId(record);
-    const auto context=fileContext(id,recordFile(id,record));
-    jsonRequest("/api/v1/books/"+QString::number(bookId),{},[this,id,bookId,remote,text,context](const QJsonObject &book) {
+void Client::fetchProgressBook(const FileContext &context,const std::function<void(const QJsonObject &,const QJsonArray &)> &callback) {
+    const int bookId=libraryBookId(context.record);
+    jsonRequest("/api/v1/books/"+QString::number(bookId),{},[this,bookId,context,callback](const QJsonObject &book) {
         if (!acceptFileContext(context)) return;
         const auto variants=bookFiles(book);
         if (book["id"].toInt()!=bookId || variants.isEmpty() ||
             (!book["readStatus"].isNull() && !book["readStatus"].isUndefined() && !book["readStatus"].isObject())) {
             finish(uiMessage("the_server_returned_invalid_book_details"),false,"progress"); return;
         }
+        callback(book,variants);
+    },true,true);
+}
+
+void Client::finishProgress(const QString &id, const QJsonObject &remote, const UiMessage &text) {
+    const auto context=fileContext(id,recordFile(id,downloads.value(id).toObject()));
+    fetchProgressBook(context,[this,id,remote,text,context](const QJsonObject &book,const QJsonArray &variants) {
         auto primary=variants.first().toObject();
         for (const auto &value:variants) if (value.toObject()["role"]=="primary") { primary=value.toObject(); break; }
-        auto publish=[this,bookId,readStatus=book["readStatus"],text,context](const QJsonObject &progress) {
+        auto publish=[this,bookId=book["id"].toInt(),readStatus=book["readStatus"],text,context](const QJsonObject &progress) {
             if (!acceptFileContext(context)) return;
             const auto percentage=progress["percentage"];
             if (!percentage.isDouble() || percentage.toDouble()<0 || percentage.toDouble()>100) {
                 finish(uiMessage("the_server_returned_invalid_data"),false,"progress"); return;
             }
-            auto update=[&](QJsonObject metadata) {
-                metadata["readingProgress"]=percentage; metadata["readStatus"]=readStatus;
-                return metadata;
-            };
-            bool saved=true;
-            for (const auto &fileId:filesByBook.value(bookId)) {
-                auto record=downloads.value(fileId).toObject();
-                record["book"]=update(record["book"].toObject());
-                if (!saveRecord(fileId,record)) saved=false;
-            }
-            for (int i=0;i<items.size();++i) if (items[i].toObject()["id"].toInt()==bookId) items[i]=update(items[i].toObject());
-            if (detailBook["id"].toInt()==bookId) { detailBook=update(detailBook); detailPending=true; }
-            invalidateBook(bookId,false);
-            dismissConflict();
-            finish(saved ? text : uiMessage("details_received_but_not_saved_for_offline_use"),saved,"progress");
+            finishBookProgress(bookId,readStatus,percentage,text);
         };
         // The library percentage belongs to the primary file, even when another format was synced.
         if (primary["id"].toInt()==id.toInt()) publish(remote);
         else jsonRequest("/api/v1/books/files/"+QString::number(primary["id"].toInt())+"/progress",{},publish,true,true);
-    },true,true);
+    });
+}
+
+void Client::finishBookProgress(int bookId,const QJsonValue &readStatus,const QJsonValue &percentage,const UiMessage &text) {
+    auto update=[&](QJsonObject metadata) {
+        if (!percentage.isUndefined()) metadata["readingProgress"]=percentage;
+        metadata["readStatus"]=readStatus;
+        return metadata;
+    };
+    bool saved=true;
+    for (const auto &fileId:filesByBook.value(bookId)) {
+        auto record=downloads.value(fileId).toObject();
+        record["book"]=update(record["book"].toObject());
+        if (!saveRecord(fileId,record)) saved=false;
+    }
+    for (int i=0;i<items.size();++i) if (items[i].toObject()["id"].toInt()==bookId) items[i]=update(items[i].toObject());
+    if (detailBook["id"].toInt()==bookId) { detailBook=update(detailBook); detailPending=true; }
+    invalidateBook(bookId,false);
+    dismissConflict();
+    finish(saved ? text : uiMessage("details_received_but_not_saved_for_offline_use"),saved,"progress");
 }
 
 // Values passed between sync stages; each field is a snapshot taken at the stage noted.
 struct Client::ProgressSync {
-    QString id,path,position,profile; int choice=0; FileContext context;  // local stage start
+    QString id,path,position,profile; int choice=0; bool completed=false; FileContext context;  // local stage start
     QString local; PositionInfo localInfo; Fb2Snapshot fb;                // local check
     QJsonObject remote,progress;                                          // server progress
     QString cfi; int action=0; bool changedChoice=false;                  // decision
@@ -2723,9 +2733,10 @@ struct Client::PreparedSync {
     FileStamp stamp; PreparedReaderPosition reader; QVariantList choices; double percentage=0; bool estimate=false;
 };
 
-bool Client::readerChanged(const QString &path,const QString &position,bool changed) {
-    QString current;
-    if (!changed && readerFileState(path)==ReaderFileState::Closed && readerPosition(path,&current) && current==position) return false;
+bool Client::readerChanged(const ProgressSync &sync,bool changed) {
+    QString current; bool completed=false;
+    if (!changed && readerProfile()==sync.profile && readerFileState(sync.path)==ReaderFileState::Closed &&
+        readerPosition(sync.path,&current,&completed) && current==sync.position && completed==sync.completed) return false;
     finish(uiMessage("the_reader_state_has_changed_retry_sync"),false,"progress"); return true;
 }
 
@@ -2763,7 +2774,7 @@ void Client::syncBook(const QString &id, int choice) {
     if (reader==ReaderFileState::Open) {
         finish(uiMessage("close_the_book_in_the_built_in_reader_and_retry_sync_the_home_bu_e4edc4"),false,"progress","reader"); return;
     }
-    if (reader==ReaderFileState::Unknown || !readerPosition(sync.path,&sync.position)) {
+    if (reader==ReaderFileState::Unknown || !readerPosition(sync.path,&sync.position,&sync.completed)) {
         finish(uiMessage("could_not_check_the_reader_state_positions_were_kept_unchanged_try_again"),false,"progress","reader_unknown"); return;
     }
     struct LocalCheck { QByteArray digest; FileStamp stamp; QString local; PositionInfo info; Fb2Snapshot fb; bool supported=true,valid=false; };
@@ -2786,22 +2797,42 @@ void Client::syncBook(const QString &id, int choice) {
             libraryFiles.remove(sync.id.toInt()); syncFiles.remove(sync.id.toInt()); invalidateBook(libraryBookId(sync.context.record)); detailPending=detailPending || detailVisible();
             finish(uiMessage("download_a_valid_book_file_before_syncing"),false,"progress","file"); return;
         }
-        if (readerChanged(sync.path,sync.position)) return;
-        if (!result.supported) {
-            finish(uiMessage("this_fb2_structure_is_not_supported_for_sync_yet_images_tables_p_e1f2b9"),false,"progress","position"); return;
-        }
-        if (!result.valid) {
-            finish(uiMessage("the_local_position_format_is_unsupported_progress_was_kept_unchanged"),false,"progress","position"); return;
-        }
-        auto next=sync; next.local=result.local; next.localInfo=result.info; next.fb=result.fb;
-        compareRemoteProgress(next);
+        if (readerChanged(sync)) return;
+        const auto comparePositions=[this,sync,result] {
+            if (!result.supported) {
+                finish(uiMessage("this_fb2_structure_is_not_supported_for_sync_yet_images_tables_p_e1f2b9"),false,"progress","position"); return;
+            }
+            if (!result.valid) {
+                finish(uiMessage("the_local_position_format_is_unsupported_progress_was_kept_unchanged"),false,"progress","position"); return;
+            }
+            auto next=sync; next.local=result.local; next.localInfo=result.info; next.fb=result.fb;
+            compareRemoteProgress(next);
+        };
+        if (!sync.completed) { comparePositions(); return; }
+        fetchProgressBook(sync.context,[this,sync,stamp=result.stamp,comparePositions](const QJsonObject &book,const QJsonArray &variants) {
+            if (!acceptFileContext(sync.context,stamp) || readerChanged(sync)) return;
+            const auto readStatus=book["readStatus"];
+            const bool linked=std::any_of(variants.begin(),variants.end(),[&sync](const auto &file) {
+                return file.toObject()["id"].toInt()==sync.id.toInt();
+            });
+            if (readStatus.toObject()["status"]!="read" || !linked) { comparePositions(); return; }
+
+            // Retire unfinished position transfers for this reading without moving the last confirmed baseline.
+            const auto previous=progressState(sync.id,sync.profile);
+            if (previous["profile"].isString()) {
+                auto state=previous;
+                for (const auto *key:{"pending","pendingLocal","outgoing","conflictLocal","conflictRemote"}) state.remove(key);
+                if (state!=previous && !persistProgress(sync.id,sync.profile,state)) return;
+            }
+            finishBookProgress(book["id"].toInt(),readStatus,QJsonValue::Undefined,uiMessage("book_is_marked_as_read_on_both"));
+        });
     });
 }
 
 void Client::compareRemoteProgress(const ProgressSync &sync) {
     // shortcut: trust the downloaded file identity; explicit library verification detects server replacements.
     jsonRequest("/api/v1/books/files/"+sync.id+"/progress",{},[this,sync](const QJsonObject &remote) {
-        if (!acceptFileContext(sync.context) || readerChanged(sync.path,sync.position,readerProfile()!=sync.profile)) return;
+        if (!acceptFileContext(sync.context) || readerChanged(sync)) return;
         const QString remoteCfi=remote["cfi"].toString();
         const auto percent=remote["percentage"];
         if (!remote.contains("cfi") || (!remote["cfi"].isNull() && !remote["cfi"].isString()) ||
@@ -2828,7 +2859,7 @@ void Client::compareRemoteProgress(const ProgressSync &sync) {
             return result;
         },[this,sync=next](const RemoteCheck &analysis,bool cancelled) {
             if (!acceptFileContext(sync.context,analysis.stamp) || cancelled ||
-                readerChanged(sync.path,sync.position,downloads.value(sync.id).toObject()["progress"].toObject()!=sync.progress)) return;
+                readerChanged(sync,downloads.value(sync.id).toObject()["progress"].toObject()!=sync.progress)) return;
             if (analysis.digest!=sync.context.record["sha256"].toString().toLatin1()) {
                 finish(uiMessage("the_local_book_file_changed_during_sync_progress_was_kept_unchanged"),false,"progress","file"); return;
             }
@@ -2907,14 +2938,14 @@ void Client::compareRemoteProgress(const ProgressSync &sync) {
 }
 
 void Client::applyProgressAction(const ProgressSync &sync,const PreparedSync &prepared) {
-    if (readerChanged(sync.path,sync.position,downloads.value(sync.id).toObject()["progress"].toObject()!=sync.progress)) return;
+    if (readerChanged(sync,downloads.value(sync.id).toObject()["progress"].toObject()!=sync.progress)) return;
     auto state=progressState(sync.id,sync.profile);
     if (!sync.action) { saveConflict(sync,state,prepared.choices,prepared.stamp); return; }
     if (sync.action==2) {
         // Journal before native mutation; failed writes do not advance the agreed baseline.
         state["pending"]=sync.remote; state["pendingLocal"]=sync.local;
         saveProgressIntent(sync.id,sync.profile,state,[this,sync,prepared] {
-            if (!acceptFileContext(sync.context,prepared.stamp)) return;
+            if (!acceptFileContext(sync.context,prepared.stamp) || readerChanged(sync)) return;
             UiMessage error;
             if (!saveReaderPosition(sync.path,sync.position,prepared.reader,sync.profile,&error)) {
                 finish(error,false,"progress","pending"); return;
@@ -2932,7 +2963,7 @@ void Client::applyProgressAction(const ProgressSync &sync,const PreparedSync &pr
     const QJsonObject outgoing{{"source","text"},{"cfi",sync.local},{"pageNumber",QJsonValue::Null},{"percentage",prepared.percentage}};
     state["outgoing"]=outgoing;
     saveProgressIntent(sync.id,sync.profile,state,[this,sync,outgoing,stamp=prepared.stamp] {
-        if (!acceptFileContext(sync.context,stamp) || readerChanged(sync.path,sync.position)) return;
+        if (!acceptFileContext(sync.context,stamp) || readerChanged(sync)) return;
         const auto route="/api/v1/books/files/"+sync.id+"/progress";
         const auto sentContext=fileContext(sync.id,sync.path);
         jsonRequest(route,outgoing,[this,id=sync.id,local=sync.local,route,profile=sync.profile,sentContext](const QJsonObject &) {

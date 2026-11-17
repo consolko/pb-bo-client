@@ -28,7 +28,7 @@ ReaderFileState readerFileState(const QString &path);
 bool connectNetwork();
 bool networkConnected();
 UiMessage updateDeviceError(QJsonObject *details=nullptr);
-bool readerPosition(const QString &path, QString *position);
+bool readerPosition(const QString &path, QString *position, bool *completed=nullptr);
 QString readerProfile();
 bool saveReaderPosition(const QString &path, const QString &expectedPosition,
                         const PreparedReaderPosition &prepared, const QString &profile, UiMessage *error);
