@@ -34,6 +34,12 @@
 namespace {
 constexpr qint64 maxBook = 100 * 1024 * 1024;
 constexpr int pageSize = 10;
+QJsonObject catalogPayload(int page, const QString &query) {
+    return {{"sort", QJsonArray{}}, {"pagination", QJsonObject{{"page", page}, {"size", pageSize}}}, {"q", query}};
+}
+bool failedJsonReply(const QNetworkReply &reply, int code, qsizetype size) {
+    return reply.error() != QNetworkReply::NoError || code < 200 || code >= 300 || size > maxJson;
+}
 struct TransferStage { bool journal=false,valid=false; FileStamp stamp; QString error; };
 constexpr auto sessionPermissions = QFileDevice::ReadOwner | QFileDevice::WriteOwner;
 bool privateSessionPermissions(QFileDevice::Permissions permissions) {
@@ -386,7 +392,9 @@ void Client::retranslate() {
 
 void Client::loadRecords(bool startup) {
     recordsReady={};
+    resetSessionRestore();
     ++accountGeneration; ++recentsGeneration;
+    if (startup) startupAccountGeneration = accountGeneration;
     files.submit(this,[](const FileCancellation &) { clearEpubCache(); return true; },[](bool,bool) {});
     if (recentsTask) recentsTask->store(true);
     cancelCleanup();
@@ -420,13 +428,9 @@ void Client::loadRecords(bool startup) {
         }
     }
     invalidateLibrary(); invalidateSync(); detailPending=true;
-    nativeRecents={}; libraryQuery.clear(); committedQuery.clear();
-    items = {}; collectionItems = {}; detailBook = {}; browseHistory.clear();
-    ++detailGeneration; detailMessage.clear();
-    activeCollection = 0; activeCollectionName.clear(); collectionList = false;
+    nativeRecents={}; clearNavigation();
     fileChoices = readObject(scopeDir+"/file-choices.json");
     covers.setScope(scopeDir);
-    count = currentPage = 0;
     downloads = {};
     savedRecordStamps.clear(); durableRecordStamps.clear(); blockedTransfers.clear(); filesByBook.clear();
     syncResults = {};
@@ -511,7 +515,7 @@ void Client::loadRecords(bool startup) {
         downloads=std::move(snapshot.records); savedRecordStamps=std::move(snapshot.stamps);
         filesByBook=std::move(snapshot.index); libraryFiles=std::move(snapshot.files); syncFiles=libraryFiles; knownFiles=libraryFiles;
         canCleanupBooks=snapshot.cleanup; registryLoading=false;
-        if (startup) { localView=!downloads.isEmpty(); emit catalogChanged(); }
+        if (startup) { localView = !downloads.isEmpty(); emit catalogChanged(); }
         invalidateLibrary(); invalidateSync(); detailPending=true;
         notifyOperation(); emit libraryLoadingChanged(); publishDataChanges();
         refreshRecents();
@@ -520,6 +524,7 @@ void Client::loadRecords(bool startup) {
             if (account==accountGeneration && canCleanupBooks) { cleanupBooks(); cleanupCovers(); }
         });
         if (auto ready=std::exchange(recordsReady,{})) ready();
+        loadStartupCatalog();
     });
 }
 
@@ -674,7 +679,13 @@ void Client::cleanupBooks(const QString &verifiedFile) {
 
 void Client::cleanupCovers() {
     QSet<int> downloaded, visible;
-    for (auto value : items) if (positiveId(value.toObject()["id"])) visible.insert(value.toObject()["id"].toInt());
+    const auto tab = selectedTab();
+    auto keepCovers = [&visible](const QJsonArray &page) {
+        for (const auto value : page) if (positiveId(value.toObject()["id"])) visible.insert(value.toObject()["id"].toInt());
+    };
+    keepCovers(items);
+    if (tab != CatalogTab) keepCovers(catalogBrowsePage.items);
+    if (tab != CollectionsTab) keepCovers(collectionsBrowsePage.items);
     for (auto it=downloads.begin(); it!=downloads.end(); ++it) {
         const auto book = it.value().toObject()["book"].toObject();
         if (positiveId(book["id"]) && book["hasCover"] != false) downloaded.insert(book["id"].toInt());
@@ -1434,13 +1445,90 @@ void Client::syncSelected() {
     syncBook(QString::number(detailBook["selectedFile"].toObject()["id"].toInt()));
 }
 
+Client::BrowseTab Client::selectedTab() const {
+    if (localView) return DownloadsTab;
+    return collectionList || activeCollection > 0 ? CollectionsTab : CatalogTab;
+}
+
+Client::BrowsePage Client::currentBrowsePage() const {
+    return {items, currentPage, count, activeCollection, committedQuery, activeCollectionName, pageAttempted};
+}
+
+void Client::changeBrowsePage(BrowseTab tab, BrowsePage page, bool restore) {
+    emit browseViewAboutToChange();
+    const auto previous = selectedTab();
+    if (previous == CatalogTab) catalogBrowsePage = currentBrowsePage();
+    else if (previous == CollectionsTab) collectionsBrowsePage = currentBrowsePage();
+    closeDetail();
+    covers.stop();
+    localView = tab == DownloadsTab;
+    collectionList = tab == CollectionsTab && page.collection == 0;
+    items = std::move(page.items);
+    currentPage = page.page;
+    count = page.total;
+    activeCollection = page.collection;
+    committedQuery = std::move(page.query);
+    activeCollectionName = std::move(page.name);
+    pageAttempted = page.attempted;
+    retryKind = 0;
+    message.clear();
+    invalidateLibrary();
+    emit catalogChanged(); notifyOperation(); emit feedbackChanged(); publishDataChanges();
+    emit browseViewChanged(restore);
+}
+
+void Client::clearNavigation() {
+    localView = true;
+    libraryQuery.clear(); committedQuery.clear();
+    items = {}; collectionItems = {}; detailBook = {}; browseHistory.clear();
+    catalogBrowsePage = {}; collectionsBrowsePage = {};
+    pageAttempted = collectionListAttempted = tabSelected = false;
+    retryKind = retryPage = 0; retryQuery.clear(); retryBook = {};
+    ++detailGeneration; detailMessage.clear();
+    activeCollection = 0; activeCollectionName.clear(); collectionList = false;
+    count = currentPage = 0;
+    emit browseSessionReset();
+}
+
+void Client::selectTab(int tab) {
+    if (busy() || tab < DownloadsTab || tab > CollectionsTab) return;
+    tabSelected = true;
+    const bool same = tab == selectedTab();
+    if (!same) {
+        changeBrowsePage(BrowseTab(tab), tab == CatalogTab ? catalogBrowsePage : tab == CollectionsTab ? collectionsBrowsePage : BrowsePage{});
+    }
+    if (tab == DownloadsTab) {
+        refreshRecents();
+    } else if (collectionList) {
+        if (same || !collectionListAttempted) loadCollections();
+    } else if (same || !pageAttempted) {
+        refresh(currentPage, committedQuery);
+    }
+}
+
 void Client::showCollections() {
     if (busy()) return;
+    if (!collectionList) {
+        browseHistory.clear();
+        changeBrowsePage(CollectionsTab, {});
+    }
+    loadCollections();
+}
+
+void Client::showCollectionList() {
+    if (busy() || collectionList) return;
+    browseHistory.clear();
+    changeBrowsePage(CollectionsTab, {});
+    if (!collectionListAttempted) loadCollections();
+}
+
+void Client::loadCollections() {
     beginFeedback("catalog");
-    closeDetail(); covers.stop(); browseHistory.clear();
-    collectionList = true; localView = false; activeCollection = 0; activeCollectionName.clear();
-    collectionItems = {}; items = {}; count = currentPage = 0;
-    invalidateLibrary(); emit catalogChanged(); publishDataChanges();
+    collectionListAttempted = true;
+    if (!authenticated() && hasSavedSession()) {
+        restoreSessionThen([this] { loadCollections(); }, "catalog");
+        return;
+    }
     retryKind = 4;
     if (!authenticated()) { finish(uiMessage("sign_in_to_load_collections"), false, "collections"); return; }
     working = true; message = uiMessage("loading_collections"); notifyOperation(); emit feedbackChanged();
@@ -1455,39 +1543,39 @@ void Client::showCollections() {
             seen.insert(collection["id"].toInt());
             if (collection["mediaType"] == "books") parsed.append(collection);
         }
+        emit browseResultsAboutToChange(true, 0);
         collectionItems = parsed;
         emit catalogChanged();
+        emit browseResultsChanged();
         finish({}, true, "collections");
     }, true, true, true);
 }
 
-void Client::openCollection(int id, const QString &name, double catalogOffset, double detailOffset) {
+void Client::openCollection(int id, const QString &name, double catalogOffset, double detailOffset,
+                            const QVariantMap &navigation) {
     if (busy() || id <= 0) return;
     if (detailVisible() && id == activeCollection) { closeDetail(); return; }
     if (detailVisible()) {
         if (browseHistory.size() == 16) browseHistory.removeFirst();
-        browseHistory.append(QJsonObject{{"detail", detailBook}, {"items", items}, {"page", currentPage},
-        {"total", count}, {"local", localView}, {"collectionId", activeCollection}, {"collectionName", activeCollectionName},
-        {"query", committedQuery}, {"catalogY", catalogOffset}, {"detailY", detailOffset}, {"notice", detailMessage.toJson()}});
+        browseHistory.append({selectedTab(), currentBrowsePage(), detailBook, detailMessage, catalogOffset, detailOffset, navigation});
+    } else {
+        browseHistory.clear();
     }
-    closeDetail();
-    items={}; currentPage=count=0; committedQuery.clear();
-    activeCollection = id; activeCollectionName = name;
-    invalidateLibrary();
+    BrowsePage page;
+    page.collection = id;
+    page.name = name;
+    changeBrowsePage(CollectionsTab, page, false);
     refresh();
 }
 
 QVariantMap Client::backFromCollection() {
     if (busy() || browseHistory.isEmpty()) return {};
     const auto saved = browseHistory.takeLast();
-    covers.stop(); ++detailGeneration;
-    detailBook = saved["detail"].toObject(); items = saved["items"].toArray();
-    currentPage = saved["page"].toInt(); count = saved["total"].toInt(); localView = saved["local"].toBool();
-    activeCollection = saved["collectionId"].toInt(); activeCollectionName = saved["collectionName"].toString();
-    committedQuery = saved["query"].toString(); retryQuery=committedQuery; detailMessage = UiMessage::fromJson(saved["notice"]);
-    collectionList = false; retryKind = 0; message.clear();
-    invalidateLibrary(); emit catalogChanged(); emit detailChanged(); notifyOperation(); emit feedbackChanged(); publishDataChanges();
-    return {{"query", committedQuery}, {"catalogY", saved["catalogY"].toDouble()}, {"detailY", saved["detailY"].toDouble()}};
+    changeBrowsePage(saved.tab, saved.page);
+    detailBook = saved.detail;
+    detailMessage = saved.notice;
+    emit detailChanged();
+    return {{"query", committedQuery}, {"catalogY", saved.catalogY}, {"detailY", saved.detailY}, {"navigation", saved.navigation}};
 }
 
 void Client::finish(UiMessage text, bool success, const QString &operation, const QString &syncState,bool persistStatus) {
@@ -1615,19 +1703,22 @@ QNetworkRequest Client::request(const QString &path) const {
     return request;
 }
 
-bool Client::setCredentials(const QJsonObject &response) {
+bool Client::acceptCredentials(const QJsonObject &response) {
     const QString access = response["accessToken"].toString();
     const QString refresh = response["refreshToken"].toString();
     static const QRegularExpression nativeRefresh("^[a-f0-9]{64}$");
     if (access.isEmpty() || access.size() > 8192 || access.contains('\r') || access.contains('\n') ||
-        !nativeRefresh.match(refresh).hasMatch()) {
-        invalidateSession();
-        finish(uiMessage("the_server_response_contains_no_valid_session"), false, "login");
-        return false;
-    }
+        !nativeRefresh.match(refresh).hasMatch()) return false;
     token = access.toUtf8(); refreshToken = refresh;
     saveSession(); // A storage failure leaves this login usable until the application closes.
     return true;
+}
+
+bool Client::setCredentials(const QJsonObject &response) {
+    if (acceptCredentials(response)) return true;
+    invalidateSession();
+    finish(uiMessage("the_server_response_contains_no_valid_session"), false, "login");
+    return false;
 }
 
 bool Client::saveSession() {
@@ -1654,27 +1745,90 @@ bool Client::saveSession() {
 
 void Client::invalidateSession() {
     ++accountGeneration;
+    resetSessionRestore();
     cancelCleanup();
-    token.clear(); refreshToken.clear(); sessionStored = false; sessionNotice.clear();
     covers.stop();
+    clearCredentials();
+}
+
+void Client::clearCredentials() {
+    token.clear(); refreshToken.clear(); sessionStored = false; sessionNotice.clear();
     const QString path = scopeDir+"/session.json";
     if ((QFile::exists(path) || QFileInfo(path).isSymLink()) && !QFile::remove(path))
         sessionNotice = uiMessage("could_not_remove_the_invalid_session_from_this_device");
     emit connectionChanged(); notifyOperation();
 }
 
+void Client::startupRestoreSession() {
+    if (accountGeneration != startupAccountGeneration || authenticated() || refreshToken.isEmpty() ||
+        sessionRestoreReply || !networkConnected()) return;
+    startSessionRestore();
+}
+
 void Client::restoreSession() {
-    if (registryLoading) { recordsReady=[this] { restoreSession(); }; return; }
-    if (busy() || authenticated() || refreshToken.isEmpty()) return;
-    beginFeedback("connection");
+    if (authenticated()) return;
+    restoreSessionThen([this] { refresh(); });
+}
+
+void Client::restoreSessionThen(const std::function<void()> &resume, const QString &context) {
+    if (registryLoading) { recordsReady=[this,resume,context] { restoreSessionThen(resume,context); }; return; }
+    if (busy()) return;
+    if (authenticated()) { resume(); return; }
+    if (refreshToken.isEmpty()) return;
+    beginFeedback(context);
     working = true;
     message = uiMessage("restoring_session");
     notifyOperation(); emit feedbackChanged();
-    jsonRequest("/api/v1/auth/refresh", {{"refreshToken", refreshToken}}, [this](const QJsonObject &response) {
-        if (!setCredentials(response)) return;
-        working = false;
-        refresh();
-    }, false);
+    if (sessionRestoreReply) {
+        sessionRestoreResume = resume;
+    } else if (ensureNetwork()) {
+        sessionRestoreResume = resume;
+        startSessionRestore();
+    }
+}
+
+void Client::resetSessionRestore() {
+    sessionRestoreReply.clear();
+    sessionRestoreResume = {};
+    startupCatalogPending = false;
+}
+
+void Client::startSessionRestore() {
+    const auto account = accountGeneration;
+    const auto credential = refreshToken;
+    sessionRestoreReply = sendJsonRequest("/api/v1/auth/refresh", {{"refreshToken", credential}}, false,
+        [this,account,credential](QNetworkReply *reply, const QByteArray &bytes) {
+            if (sessionRestoreReply != reply || account != accountGeneration || credential != refreshToken) return;
+            sessionRestoreReply.clear();
+            auto resume = std::exchange(sessionRestoreResume, {});
+            const int code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            UiMessage failure;
+            if (failedJsonReply(*reply, code, bytes.size())) {
+                if (code == 401) clearCredentials();
+                failure = requestError(*reply, code);
+            } else {
+                const auto response = QJsonDocument::fromJson(bytes);
+                if (!response.isObject()) {
+                    failure = uiMessage("the_server_returned_invalid_data");
+                } else if (!acceptCredentials(response.object())) {
+                    clearCredentials();
+                    failure = uiMessage("the_server_response_contains_no_valid_session");
+                }
+            }
+            if (account != accountGeneration) return;
+            if (!resume) {
+                if (failure.code.isEmpty()) {
+                    startupCatalogPending = true;
+                    loadStartupCatalog();
+                }
+            } else if (!failure.code.isEmpty()) {
+                finish(failure, false, "/api/v1/auth/refresh", code == 401 ? "auth" : "error");
+            } else {
+                working = false;
+                resume();
+                notifyOperation();
+            }
+        });
 }
 
 void Client::renewSession(const std::function<void()> &resume) {
@@ -1692,14 +1846,10 @@ bool Client::ensureNetwork() {
     return false;
 }
 
-void Client::jsonRequest(const QString &path, const QJsonObject &payload, const Callback &callback, bool renew, bool get, bool arrayResponse) {
-    if (checkingLibrary && verificationCancelled) { finish(uiMessage("verification_cancelled"),false,"verify"); return; }
-    if (!ensureNetwork()) return;
-    const auto generation=fileGeneration,account=accountGeneration;
+QNetworkReply *Client::sendJsonRequest(const QString &path, const QJsonObject &payload, bool get, const ReplyCallback &callback) {
     auto request = this->request(path);
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     auto reply = get ? network.get(request) : network.post(request, QJsonDocument(payload).toJson(QJsonDocument::Compact));
-    if (checkingLibrary) activeVerification=reply;
     auto bytes = std::make_shared<QByteArray>();
     connect(reply, &QNetworkReply::readyRead, this, [reply, bytes] {
         bytes->append(reply->readAll());
@@ -1707,15 +1857,40 @@ void Client::jsonRequest(const QString &path, const QJsonObject &payload, const 
     });
     // Bound the whole operation as well as inactivity between packets.
     QTimer::singleShot(20000, reply, [reply] { if (!reply->isFinished()) reply->abort(); });
-    connect(reply, &QNetworkReply::finished, this, [this, reply, bytes, callback, path, payload, renew, get, arrayResponse,generation,account] {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, bytes, callback, path] {
         reply->deleteLater();
+        bytes->append(reply->readAll());
+        logEvent(path.section('?', 0, 0), int(reply->error()), reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt());
+        callback(reply, *bytes);
+    });
+    return reply;
+}
+
+UiMessage Client::requestError(const QNetworkReply &reply, int code) const {
+    switch (reply.error()) {
+    case QNetworkReply::SslHandshakeFailedError: return uiMessage("could_not_verify_the_server_tls_certificate_check_the_trusted_ca_3413a3");
+    case QNetworkReply::HostNotFoundError: return uiMessage("server_not_found_1_check_wi_fi_and_dns").arg(endpoint.host());
+    case QNetworkReply::ConnectionRefusedError: return uiMessage("the_server_refused_the_connection_check_the_address_and_network");
+    case QNetworkReply::TimeoutError:
+    case QNetworkReply::OperationCanceledError: return uiMessage("connection_timed_out_check_the_network_and_try_again");
+    default: break;
+    }
+    if (code == 401) return uiMessage("not_signed_in_or_session_expired_sign_in_again");
+    if (code >= 400) return uiMessage("server_http_error").arg(code);
+    return uiMessage("the_server_is_unavailable_downloaded_books_can_be_read_offline");
+}
+
+void Client::jsonRequest(const QString &path, const QJsonObject &payload, const Callback &callback, bool renew, bool get, bool arrayResponse) {
+    if (checkingLibrary && verificationCancelled) { finish(uiMessage("verification_cancelled"),false,"verify"); return; }
+    if (!ensureNetwork()) return;
+    const auto generation=fileGeneration,account=accountGeneration;
+    auto *reply = sendJsonRequest(path, payload, get,
+        [this, callback, path, payload, renew, get, arrayResponse,generation,account](QNetworkReply *reply, const QByteArray &bytes) {
         if (generation!=fileGeneration) return;
         if (account!=accountGeneration) { finish(uiMessage("the_file_profile_or_account_changed_retry_the_operation"),false,"file"); return; }
         if (activeVerification==reply) activeVerification.clear();
         if (checkingLibrary && verificationCancelled) { finish(uiMessage("verification_cancelled"),false,"verify"); return; }
-        bytes->append(reply->readAll());
         const int code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        logEvent(path.section('?', 0, 0), int(reply->error()), code);
         if (code == 401 && renew && (path.startsWith("/api/v1/books/") || path.startsWith("/api/v1/collections")) && !refreshToken.isEmpty()) {
             if (!get && path.endsWith("/progress")) {
                 // A refreshed token is not permission to replay an old sync
@@ -1730,27 +1905,22 @@ void Client::jsonRequest(const QString &path, const QJsonObject &payload, const 
             }
             return;
         }
-        if (reply->error() != QNetworkReply::NoError || code < 200 || code >= 300 || bytes->size() > maxJson) {
+        if (failedJsonReply(*reply, code, bytes.size())) {
             if (code == 401) invalidateSession();
             finish(path == "/api/v1/auth/logout" ? uiMessage("signed_out_on_this_device_server_session_revocation_was_not_confirmed") :
-                   reply->error() == QNetworkReply::SslHandshakeFailedError ? uiMessage("could_not_verify_the_server_tls_certificate_check_the_trusted_ca_3413a3") :
-                   reply->error() == QNetworkReply::HostNotFoundError ? uiMessage("server_not_found_1_check_wi_fi_and_dns").arg(endpoint.host()) :
-                   reply->error() == QNetworkReply::ConnectionRefusedError ? uiMessage("the_server_refused_the_connection_check_the_address_and_network") :
-                   reply->error() == QNetworkReply::TimeoutError || reply->error() == QNetworkReply::OperationCanceledError ? uiMessage("connection_timed_out_check_the_network_and_try_again") :
-                   code == 401 ? uiMessage("not_signed_in_or_session_expired_sign_in_again") :
-                   code >= 400 ? uiMessage("server_http_error").arg(code) :
-                   uiMessage("the_server_is_unavailable_downloaded_books_can_be_read_offline"), false, path, code==401 ? "auth" : "error");
+                   requestError(*reply, code), false, path, code==401 ? "auth" : "error");
             return;
         }
-        if (!get && path.endsWith("/progress") && bytes->trimmed().isEmpty()) { callback({}); return; }
+        if (!get && path.endsWith("/progress") && bytes.trimmed().isEmpty()) { callback({}); return; }
         QJsonParseError error;
-        const auto doc = QJsonDocument::fromJson(*bytes, &error);
+        const auto doc = QJsonDocument::fromJson(bytes, &error);
         if (error.error != QJsonParseError::NoError || (arrayResponse ? !doc.isArray() : !doc.isObject())) {
             finish(uiMessage("the_server_returned_invalid_data"), false, path);
             return;
         }
         callback(arrayResponse ? QJsonObject{{"items", doc.array()}} : doc.object());
     });
+    if (checkingLibrary) activeVerification=reply;
 }
 
 void Client::login(const QString &address, const QString &username, const QString &password) {
@@ -1787,12 +1957,14 @@ void Client::login(const QString &address, const QString &username, const QStrin
 void Client::refresh(int targetPage, const QString &query) {
     if (busy()) return;
     if (targetPage < 0 || query.size() > 500) return;
-    if (localView || collectionList) invalidateLibrary();
-    collectionList = false;
+    if (localView || collectionList) changeBrowsePage(CatalogTab, catalogBrowsePage);
+    pageAttempted = true;
+    if (!authenticated() && hasSavedSession()) {
+        restoreSessionThen([this, targetPage, query] { refresh(targetPage, query); }, "catalog");
+        return;
+    }
     covers.stop();
-    localView = false;
     beginFeedback("catalog");
-    emit catalogChanged();
     if (token.isEmpty()) { finish(uiMessage("sign_in_to_the_server_first"), false, "catalog"); return; }
     retryKind = 1; retryPage = targetPage; retryQuery = query;
     working = true;
@@ -1804,49 +1976,104 @@ void Client::refresh(int targetPage, const QString &query) {
     params.addQueryItem("collapseSeries", "false");
     params.addQueryItem("q", QString::fromLatin1(QUrl::toPercentEncoding(query)));
     const QString route = activeCollection > 0 ? "/api/v1/collections/"+QString::number(activeCollection)+"/books?"+params.toString(QUrl::FullyEncoded) : "/api/v1/books/query";
-    jsonRequest(route, {{"sort", QJsonArray{}}, {"pagination", QJsonObject{{"page", targetPage}, {"size", pageSize}}}, {"q", query}},
+    jsonRequest(route, catalogPayload(targetPage, query),
         [this, targetPage, query](const QJsonObject &response) {
-            const auto array = response["items"].toArray();
-            if (!response["items"].isArray() || !response["total"].isDouble() || response["total"].toDouble() < 0 ||
-                response["page"].toInt(-1) != targetPage || array.size() > pageSize) {
-                finish(uiMessage("the_server_returned_an_invalid_catalog"), false, "catalog"); return;
-            }
-            QJsonArray parsed;
-            for (auto value : array) {
-                auto book = value.toObject();
-                if (!positiveId(book["id"]) || !book["files"].isArray()) {
-                    finish(uiMessage("invalid_book_record"), false, "catalog"); return;
-                }
-                book["files"] = bookFiles(book);
-                parsed.append(selectBookFile(book));
-            }
-            covers.stop();
-            bool saved=true;
-            for (auto value : parsed) {
-                const auto book = value.toObject();
-                const int bookId = book["id"].toInt();
-                for (const auto &fileId : filesByBook.value(bookId)) {
-#ifdef BOOKORBIT_TEST_HTTP
-                    ++presentationCounters.metadataVisits;
-#endif
-                    auto record = downloads.value(fileId).toObject();
-                    if (record["bookId"].toInt() != bookId) continue;
-                    auto stored = record["book"].toObject();
-                    stored["hasCover"] = book["hasCover"];
-                    stored["coverVersion"] = book["coverVersion"];
-                    stored["readStatus"] = book["readStatus"];
-                    stored["readingProgress"] = book["readingProgress"];
-                    record["book"] = stored;
-                    if (!saveRecord(fileId, record)) saved=false;
-                }
-                if (book["hasCover"] == false) covers.remove(bookId);
-            }
-            items = parsed; currentPage = targetPage; count = response["total"].toInt(); committedQuery=query;
-            invalidateLibrary(); emit catalogChanged();
-            cleanupCovers();
-            covers.fetch(items);
-            finish(!saved ? uiMessage("details_received_but_not_saved_for_offline_use") : items.isEmpty() ? uiMessage("no_books_found") : UiMessage{}, saved, "catalog");
+            const auto [message, saved] = applyCatalogResponse(response, targetPage, query, false);
+            finish(message, saved, "catalog");
         }, true, activeCollection > 0);
+}
+
+void Client::loadStartupCatalog() {
+    if (!startupCatalogPending || registryLoading) return;
+    startupCatalogPending = false;
+    if (busy() || tabSelected || selectedTab() != CatalogTab || pageAttempted || !downloads.isEmpty() ||
+        !authenticated()) return;
+
+    const auto account = accountGeneration;
+    const auto fileOperation = fileGeneration;
+    const auto access = token;
+    const auto reportFailure = [this,account,fileOperation](const UiMessage &error) {
+        if (account != accountGeneration || fileOperation != fileGeneration || busy() ||
+            (!uiContext.isEmpty() && uiContext != "catalog")) return;
+        retryKind = authenticated() ? 1 : 0;
+        retryPage = 0;
+        retryQuery.clear();
+        feedbackContext = "catalog";
+        feedbackBookId = feedbackFileId = 0;
+        feedbackResult = "error";
+        feedbackHidden = false;
+        message = error;
+        notifyOperation();
+        emit feedbackChanged();
+    };
+    if (!networkConnected()) {
+        reportFailure(uiMessage("wi_fi_is_disconnected_connect_to_a_network_and_try_again"));
+        return;
+    }
+    sendJsonRequest("/api/v1/books/query", catalogPayload(0, {}), false,
+        [this,account,access,reportFailure](QNetworkReply *reply, const QByteArray &bytes) {
+            if (account != accountGeneration || token != access || tabSelected || selectedTab() != CatalogTab || pageAttempted) return;
+            const int code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            if (failedJsonReply(*reply, code, bytes.size())) {
+                if (code == 401) clearCredentials();
+                reportFailure(requestError(*reply, code));
+                return;
+            }
+            const auto response = QJsonDocument::fromJson(bytes);
+            if (!response.isObject()) {
+                reportFailure(uiMessage("the_server_returned_invalid_data"));
+                return;
+            }
+            const auto [error, saved] = applyCatalogResponse(response.object(), 0, {}, true);
+            if (!saved) reportFailure(error);
+        });
+}
+
+std::pair<UiMessage,bool> Client::applyCatalogResponse(const QJsonObject &response, int targetPage, const QString &query, bool background) {
+    const auto array = response["items"].toArray();
+    if (!response["items"].isArray() || !response["total"].isDouble() || response["total"].toDouble() < 0 ||
+        response["page"].toInt(-1) != targetPage || array.size() > pageSize) {
+        return {uiMessage("the_server_returned_an_invalid_catalog"), false};
+    }
+    QJsonArray parsed;
+    for (auto value : array) {
+        auto book = value.toObject();
+        if (!positiveId(book["id"]) || !book["files"].isArray()) {
+            return {uiMessage("invalid_book_record"), false};
+        }
+        book["files"] = bookFiles(book);
+        parsed.append(selectBookFile(book));
+    }
+    covers.stop();
+    bool saved=true;
+    for (auto value : parsed) {
+        const auto book = value.toObject();
+        const int bookId = book["id"].toInt();
+        for (const auto &fileId : filesByBook.value(bookId)) {
+#ifdef BOOKORBIT_TEST_HTTP
+            ++presentationCounters.metadataVisits;
+#endif
+            auto record = downloads.value(fileId).toObject();
+            if (record["bookId"].toInt() != bookId) continue;
+            auto stored = record["book"].toObject();
+            stored["hasCover"] = book["hasCover"];
+            stored["coverVersion"] = book["coverVersion"];
+            stored["readStatus"] = book["readStatus"];
+            stored["readingProgress"] = book["readingProgress"];
+            record["book"] = stored;
+            if (!saveRecord(fileId, record)) saved=false;
+        }
+        if (book["hasCover"] == false) covers.remove(bookId);
+    }
+    const bool sameQuery = query == committedQuery;
+    emit browseResultsAboutToChange(sameQuery && targetPage == currentPage, sameQuery && targetPage < currentPage ? -1 : 0);
+    pageAttempted = true;
+    items = parsed; currentPage = targetPage; count = response["total"].toInt(); committedQuery=query;
+    invalidateLibrary(); emit catalogChanged(); publishDataChanges();
+    emit browseResultsChanged();
+    cleanupCovers();
+    covers.fetch(items, !background);
+    return {!saved ? uiMessage("details_received_but_not_saved_for_offline_use") : items.isEmpty() ? uiMessage("no_books_found") : UiMessage{}, saved};
 }
 
 void Client::download(int index) {
@@ -2297,6 +2524,7 @@ void Client::selectAccount(int index) {
 void Client::logout() {
     if (busy()) return;
     ++accountGeneration;
+    resetSessionRestore();
     cancelCleanup();
     beginFeedback("connection");
     covers.stop();
@@ -2307,9 +2535,8 @@ void Client::logout() {
         finish(sessionNotice, false, "logout"); return;
     }
     sessionStored = false; sessionNotice.clear();
-    token.clear(); refreshToken.clear(); retryKind = 0; localView = true;
-    items = {}; count = currentPage = 0; collectionItems = {}; detailBook = {};
-    ++detailGeneration; browseHistory.clear(); collectionList = false; activeCollection = 0; activeCollectionName.clear();
+    token.clear(); refreshToken.clear(); retryKind = 0;
+    clearNavigation();
     invalidateLibrary(); invalidateSync(); detailPending=true;
     emit connectionChanged(); emit catalogChanged(); notifyOperation(); publishDataChanges();
     cleanupCovers();
@@ -2327,14 +2554,14 @@ void Client::logout() {
 
 void Client::showDownloaded(bool value) {
     if (busy()) return;
-    detailBook = {}; emit detailChanged(); ++detailGeneration; browseHistory.clear(); collectionList = false; activeCollection = 0; activeCollectionName.clear();
-    if (!value) { refresh(); return; }
-    localView = true;
-    refreshRecents();
-    covers.stop();
-    items = {}; count = currentPage = 0;
-    cleanupCovers();
-    invalidateLibrary(); emit catalogChanged(); publishDataChanges();
+    if (value) {
+        if (localView && detailVisible()) closeDetail();
+        selectTab(DownloadsTab);
+    } else {
+        if (selectedTab() != CatalogTab) changeBrowsePage(CatalogTab, catalogBrowsePage);
+        tabSelected = true;
+        refresh(currentPage, committedQuery);
+    }
 }
 
 void Client::invalidateBook(int bookId,bool sync) {
@@ -2715,7 +2942,16 @@ void Client::finishBookProgress(int bookId,const QJsonValue &readStatus,const QJ
         record["book"]=update(record["book"].toObject());
         if (!saveRecord(fileId,record)) saved=false;
     }
-    for (int i=0;i<items.size();++i) if (items[i].toObject()["id"].toInt()==bookId) items[i]=update(items[i].toObject());
+    const auto updatePage = [bookId, &update](QJsonArray &books) {
+        for (int i=0;i<books.size();++i) if (books[i].toObject()["id"].toInt()==bookId) books[i]=update(books[i].toObject());
+    };
+    updatePage(items);
+    updatePage(catalogBrowsePage.items);
+    updatePage(collectionsBrowsePage.items);
+    for (auto &saved : browseHistory) {
+        updatePage(saved.page.items);
+        if (saved.detail["id"].toInt() == bookId) saved.detail = update(saved.detail);
+    }
     if (detailBook["id"].toInt()==bookId) { detailBook=update(detailBook); detailPending=true; }
     invalidateBook(bookId,false);
     dismissConflict();

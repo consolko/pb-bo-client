@@ -46,13 +46,15 @@ To roll back, close the app and restore the previous executable and, if necessar
 <a id="start"></a>
 ## Getting started
 
-1. Open the app and go to **Settings**. Under **Saved connections**, tap **Add**.
+1. Open the app and tap **Sign in** in the header. To add another server later, go to **Settings** → **Saved connections** → **Add**.
 2. Enter the server address, such as `https://books.example.org`, your username and password. Tap **Sign in**. Use the server's base address without `/api/v1`.
 3. If needed, go to **Book download folder** → **Choose folder…**. This setting affects new downloads; existing books stay where they are.
 4. Open **Catalog** or **Collections**, choose a book and format, then tap **Download …**.
 5. Once downloaded, tap **Read …**. If the file is still being registered in the built-in library, wait and try again. You can also open the downloaded book from the PocketBook library.
 
-Browsing the catalog and collections, downloading, and syncing positions require a network connection and server sign-in. The app invokes the built-in PocketBook network connection flow when needed. Use **Downloads** for books already on the device.
+When you have downloaded books, the app opens **Downloads**. You can read them immediately, including while BookOrbit restores your session. With Wi-Fi off, the app waits until you request server data before prompting you to connect.
+
+Switching tabs restores the search field, page and scroll position. Tap the active **Catalog** or **Collections** tab again to refresh its results from the server. The app remembers your place until you close it, sign out or switch accounts.
 
 In **Settings** → **Interface language**, choose **English**, **Русский** or **Follow system**. Your choice is stored on the device and applies to all saved connections. Book titles, descriptions and other server content retain their original language.
 

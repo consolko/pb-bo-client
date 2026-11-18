@@ -71,8 +71,9 @@ void CoverCache::stop() {
     saveIndex();
 }
 
-void CoverCache::fetch(const QJsonArray &items) {
+void CoverCache::fetch(const QJsonArray &items, bool allowPrompt) {
     stop();
+    allowNetworkPrompt=allowPrompt;
     for (const auto value : items) {
         const auto book = value.toObject();
         if (!positiveId(book["id"])) continue;
@@ -88,7 +89,7 @@ void CoverCache::fetch(const QJsonArray &items) {
 
 void CoverCache::fetchNext() {
     if (queue.isEmpty()) { saveIndex(); emit drained(); return; }
-    if (!connectNetwork()) { stop(); emit networkUnavailable(); return; }
+    if (!(allowNetworkPrompt ? connectNetwork() : networkConnected())) { stop(); emit networkUnavailable(); return; }
     const auto [id,coverVersion] = queue.takeFirst();
     const int run = generation;
     const QString file = path(id);

@@ -150,7 +150,7 @@ int main(int argc, char **argv) {
     engine.load(QUrl("qrc:/Main.qml"));
     std::fprintf(stderr, "bookorbit: QML roots %lld\n", static_cast<long long>(engine.rootObjects().size()));
     if (engine.rootObjects().isEmpty()) { client.logDiagnostic("app.qml.failed"); return 1; }
-    QObject::connect(&updater,&UpdateManager::startupCommitted,&client,&Client::restoreSession);
+    QObject::connect(&updater,&UpdateManager::startupCommitted,&client,&Client::startupRestoreSession);
     auto *window=qobject_cast<QQuickWindow*>(engine.rootObjects().first());
     if(!window) return 1;
     auto ready=std::make_shared<bool>(false);

@@ -80,6 +80,7 @@ bool indexed=true;
 bool opened=false;
 ReaderRecents history;
 bool connectNetwork() { return true; }
+bool networkConnected() { return true; }
 QString readerProfile() { return profile; }
 bool readerPosition(const QString &,QString *value,bool *completed) {
     *value=position;
@@ -744,6 +745,107 @@ void presentationChecks(QGuiApplication &app, QTranslator &russian, const QUrl &
     history={};
 }
 
+void tabNavigationChecks(const QUrl &endpoint, const QString &root, const QString &fault) {
+    mode(fault, "features");
+    Client client(endpoint, root+"/tab-navigation", nullptr, false);
+    require(waitForLibrary(client), "load isolated library for tab navigation");
+    QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty("client", &client);
+    engine.rootContext()->setContextProperty("screenWidth", 600);
+    engine.rootContext()->setContextProperty("screenHeight", 800);
+    engine.load(QUrl("qrc:/Main.qml"));
+    require(!engine.rootObjects().isEmpty(), "load QML for tab navigation");
+    const auto window = engine.rootObjects().first();
+    auto item = [window](const char *name) {
+        const auto view = window->findChild<QQuickItem *>(QString::fromLatin1(name));
+        require(view, name);
+        return view;
+    };
+    auto click = [&](const char *name) { require(QMetaObject::invokeMethod(item(name), "clicked"), name); };
+    const auto search = item("searchField"), list = item("catalog"), grid = item("coverCatalog");
+    const auto catalogQuery = QStringLiteral("Книга коллекции");
+    const auto collectionQuery = QStringLiteral("Автор коллекции");
+    const auto counts = [&] { return QJsonDocument::fromJson(bytes(root+"/requests.json")).object(); };
+    const auto offsetFromOrigin = [](QQuickItem *view) {
+        return view->property("contentY").toDouble() - view->property("originY").toDouble();
+    };
+    const auto scroll = [&](QQuickItem *view, int row, int offset) {
+        require(QMetaObject::invokeMethod(view,"positionViewAtIndex",Q_ARG(int,row),Q_ARG(int,0)), "scroll test view to row");
+        view->setProperty("contentY", view->property("contentY").toDouble() + offset);
+        QCoreApplication::processEvents();
+        return offsetFromOrigin(view);
+    };
+    const auto atOffset = [&](QQuickItem *view, double y) { return qAbs(offsetFromOrigin(view)-y) < 1; };
+
+    require(wait(client, [&] { client.login(endpoint.toString(), "demo", "demo"); }), "log in for tab navigation");
+    search->setProperty("text", catalogQuery);
+    require(wait(client, [&] { click("searchButton"); }) && wait(client, [&] { client.refresh(1, catalogQuery); }),
+            "open the second page of a committed catalog search");
+    QCoreApplication::processEvents();
+    search->setProperty("text", "catalog draft");
+    const double listOffset = scroll(list, 3, 19);
+    click("coverViewButton");
+    const double gridOffset = grid->property("cellHeight").toDouble() + 21;
+    require(until([&] { return grid->isVisible() && !window->property("browseRestorePending").toBool() &&
+                               grid->property("contentHeight").toDouble() - grid->height() > gridOffset; }),
+            "wait until the second grid row is scrollable");
+    grid->setProperty("contentY", grid->property("originY").toDouble() + gridOffset);
+    require(listOffset > 100 && gridOffset > 100, "catalog list and grid both have a nonzero anchor");
+
+    click("downloadsTab");
+    search->setProperty("text", "download filter");
+    click("searchButton");
+    search->setProperty("text", "download draft");
+    require(wait(client, [&] { click("collectionsTab"); }) && client.collectionsView(), "load collection list on first visit");
+    require(wait(client, [&] { client.openCollection(12, "Общая библиотека"); }), "open the public collection");
+    search->setProperty("text", collectionQuery);
+    require(wait(client, [&] { click("searchButton"); }) && wait(client, [&] { client.refresh(1, collectionQuery); }),
+            "open the second page of a committed collection search");
+    search->setProperty("text", "collection draft");
+
+    const auto beforeReturn = counts();
+    click("catalogTab");
+    require(!client.busy() && client.page() == 1 && client.catalogQuery() == catalogQuery && client.total() == 20,
+            "return restores the catalog page and applied filter immediately");
+    require(search->property("text").toString() == "catalog draft", "return restores the unapplied catalog draft");
+    const bool gridRestored = until([&] { return atOffset(grid, gridOffset); });
+    std::printf("TAB GRID: before=%.3f after=%.3f origin=%.3f height=%.3f content=%.3f visible=%d\n",
+                gridOffset, offsetFromOrigin(grid), grid->property("originY").toDouble(),
+                grid->height(), grid->property("contentHeight").toDouble(), grid->isVisible());
+    require(gridRestored, "return restores the catalog grid anchor");
+    click("listViewButton");
+    require(until([&] { return atOffset(list, listOffset); }), "return preserves the other catalog layout's list anchor");
+    click("downloadsTab");
+    require(client.localQuery() == "download filter" && search->property("text").toString() == "download draft",
+            "download search keeps the draft separate from the applied filter");
+    click("collectionsTab");
+    require(!client.busy() && client.collectionId() == 12 && client.page() == 1 && client.catalogQuery() == collectionQuery &&
+            search->property("text").toString() == "collection draft" && counts() == beforeReturn,
+            "return restores a nested collection and all three switches avoid HTTP");
+
+    require(wait(client, [&] { click("collectionsTab"); }) && client.collectionId() == 12 && client.page() == 1 &&
+            client.catalogQuery() == collectionQuery && client.total() == 20 &&
+            counts()["GET /api/v1/collections/12/books"].toInt() == beforeReturn["GET /api/v1/collections/12/books"].toInt()+1,
+            "pressing the active collection tab updates its committed page and filter");
+    click("catalogTab");
+    mode(fault, "error");
+    const auto beforeFailure = client.books();
+    require(!wait(client, [&] { click("catalogTab"); }) && client.books() == beforeFailure && client.page() == 1 &&
+            search->property("text").toString() == "catalog draft" && atOffset(list,listOffset),
+            "failed refresh preserves the page, draft and scroll offset");
+
+    mode(fault, "tabs_remove_anchor");
+    require(wait(client, [&] { click("catalogTab"); }) && client.catalogQuery() == catalogQuery && client.page() == 1 &&
+            client.books().size() == 9 && client.books()[3].toMap()["bookId"].toInt() == 18 &&
+            until([&] { return atOffset(list,listOffset); }),
+            "refresh restores the offset against the next surviving ID when the anchor is removed");
+
+    require(wait(client, [&] { client.logout(); }) && client.offlineOnly() && client.collections().isEmpty() &&
+            client.localQuery().isEmpty() && search->property("text").toString().isEmpty(),
+            "sign-out clears both server results and the local query draft");
+    mode(fault, "");
+}
+
 void syncCollectionNavigationChecks(const QUrl &endpoint,const QString &root,const QString &fault) {
     mode(fault,"features");
     Client client(endpoint,root+"/sync-collection",nullptr,false);
@@ -1036,6 +1138,7 @@ int main(int argc,char **argv) {
             "ordinary ZIP cannot replace a valid EPUB or its persisted record");
     storageFailureChecks(endpoint,root,fault);
     staleFirstDownloadChecks(endpoint,root,fault);
+    tabNavigationChecks(endpoint,root,fault);
     syncCollectionNavigationChecks(endpoint,root,fault);
     commitBoundaryChecks(endpoint,root,fault);
     modelChecks();

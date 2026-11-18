@@ -144,6 +144,8 @@ class Handler(BaseHTTPRequestHandler):
         mode = fault.read_text().strip() if fault and fault.exists() else ""
         if mode == "audit_catalog_error" and path == "/api/v1/books/query":
             return self.send(503, {})
+        if mode == "bad_catalog_json" and path == "/api/v1/books/query":
+            return self.send(200, b"not JSON", "text/plain")
         if mode == "audit_post401" and path == "/api/v1/books/files/101/progress" and self.command == "POST":
             fault.write_text("audit_refresh_race")
             return self.send(401, {})
@@ -155,6 +157,13 @@ class Handler(BaseHTTPRequestHandler):
             expiry = (datetime.now(timezone.utc)+timedelta(hours=1)).isoformat()
             return self.send(200, {"accessToken": TOKEN, "refreshToken": "0"*64, "accessTokenExpiresAt": expiry, "refreshTokenExpiresAt": expiry, "user": {"id": 1, "username": "demo"}})
         if path in ("/api/v1/auth/refresh", "/api/v1/auth/logout") and self.command == "POST":
+            if mode == "hold_refresh" and path.endswith("/refresh"):
+                fault.write_text("refresh_waiting")
+                deadline = time.monotonic() + 10
+                while fault.read_text().strip() == "refresh_waiting":
+                    if time.monotonic() >= deadline:
+                        return self.send(503, {})
+                    time.sleep(0.01)
             if mode == "audit_refresh_race":
                 self.server.progress["101"] = {"cfi": "epubcfi(/6/2!/4/82/1)", "pageNumber": None, "percentage": 40}
                 fault.write_text("")
@@ -247,7 +256,10 @@ class Handler(BaseHTTPRequestHandler):
             if type(page) is not int or page < 0 or type(size) is not int or not 1 <= size <= 100:
                 return self.send(400, {"message": "Invalid pagination"})
             query = str(body.get("q", "")).casefold()
-            items = [dict(book) for book in (library_books() if mode == "features" else BOOKS) if query in book["title"].casefold()]
+            catalog = library_books() if mode in ("features", "tabs_remove_anchor") else BOOKS
+            items = [dict(book) for book in catalog if query in book["title"].casefold()]
+            if mode == "tabs_remove_anchor":
+                items = [book for book in items if book["id"] != 17]
             if mode == "cover_removed":
                 for book in items:
                     if book["id"] == 1:

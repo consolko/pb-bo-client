@@ -83,8 +83,41 @@ int main(int argc, char **argv) {
         settle(400);
         require(window->grabWindow().save(root+"/"+QString::fromLatin1(name)+".png"), name);
     };
-    require(wait(client, [&] { client.login(client.server(), "demo", "demo"); }), "load catalog into production QML"); capture("catalog");
     auto item = [&](const char *name) { return findItem(window->contentItem(), QString::fromLatin1(name)); };
+    auto password = item("passwordField");
+    require(!client.offlineOnly() && item("catalog")->isVisible() && item("loginButton")->isVisible(), "first launch opens Catalog with header sign-in");
+    capture("first-launch");
+    tap("navigationButton"); settle();
+    require(item("connectButton")->isVisible() && !password->isVisible(), "gear opens general settings");
+    tap("loginButton"); settle();
+    require(password->isVisible() && !item("connectButton")->isVisible(), "settings header sign-in opens the form directly");
+    tap("navigationButton"); settle();
+    require(item("connectButton")->isVisible() && !password->isVisible(), "back from sign-in restores general settings");
+    tap("navigationButton"); settle();
+    tap("loginButton"); settle();
+    require(password->isVisible() && item("serverField")->property("text").toString() == client.server(), "Catalog header sign-in opens the prefilled connection form in one tap");
+    capture("first-login-form");
+    password->setProperty("text", "ui-test-only");
+    tap("navigationButton"); settle();
+    require(!client.offlineOnly() && item("catalog")->isVisible() && !password->isVisible() && password->property("text").toString().isEmpty(),
+            "back from sign-in restores Catalog and clears the password");
+    tap("downloadsTab"); settle();
+    tap("loginButton"); settle();
+    require(password->isVisible(), "Downloads header sign-in opens the form directly");
+    tap("navigationButton"); settle();
+    require(client.offlineOnly() && item("catalog")->isVisible() && !password->isVisible(), "back from sign-in restores Downloads");
+    tap("collectionsTab"); settle();
+    tap("loginButton"); settle();
+    require(password->isVisible(), "Collections header sign-in opens the form directly");
+    tap("navigationButton"); settle();
+    require(client.collectionsView() && !password->isVisible(), "back from sign-in restores Collections");
+    tap("loginButton"); settle();
+    item("usernameField")->setProperty("text", "demo");
+    password->setProperty("text", "demo");
+    require(wait(client, [&] { tap("loginButton"); }) && client.authenticated() && !client.offlineOnly() && !client.collectionsView() &&
+            client.collectionId() == 0 && client.total() == 23 && item("catalog")->isVisible() && !password->isVisible(),
+            "first sign-in submits the form and opens the full catalog");
+    capture("catalog");
     require(!item("loginButton")->isVisible() && item("syncButton")->isEnabled(), "active authorization hides login and enables sync");
     require(item("reading-1")->property("text").toString() == "В BookOrbit: читаю · 37,5 %", "catalog shows reading progress");
     require(item("reading-2")->property("text").toString() == "В BookOrbit: прочитано", "finished books show status without percentage");
@@ -133,7 +166,6 @@ int main(int argc, char **argv) {
     require(!item("loginButton")->isVisible(), "current authenticated connection does not offer redundant login");
     tap("navigationButton"); settle(); tap("addConnection"); settle();
     require(item("loginButton")->isVisible(), "a different connection still offers login");
-    auto password = item("passwordField");
     password->setProperty("text", "ui-test-only"); settle();
     require(password->property("displayText") != password->property("text"), "password starts masked");
     tap("showPassword"); settle();
@@ -195,12 +227,27 @@ int main(int argc, char **argv) {
     require(!window->property("coverGrid").toBool() && item("catalog")->isVisible() && !grid->isVisible(), "toggle restores original list");
     require(wait(client, [&] { tap("bookAction-2"); }), "row download icon downloads single-format book");
     require(!client.detailVisible() && client.books()[1].toMap()["downloaded"].toBool(), "nested download action does not open row details");
+    require(item("bookAction-2")->property("text").toString() == "Читать" &&
+            item("reading-2")->property("text").toString() == "В BookOrbit: прочитано", "Russian reading action and completed status have distinct labels");
     auto catalog = window->findChild<QQuickItem *>("catalog");
     catalog->setProperty("contentY", 140); settle();
     require(wait(client, [&] { tap("book-2"); }), "touch opens PDF-only book details");
     capture("pdf-only"); tap("navigationButton"); settle();
     require(!client.detailVisible() && catalog->property("contentY").toDouble() > 100, "back restores list position");
     catalog->setProperty("contentY", 0); settle();
+    auto search = item("searchField");
+    search->setProperty("text", "Очень ДЛИННОЕ");
+    require(wait(client, [&] { tap("searchButton"); }) && client.catalogQuery() == "Очень ДЛИННОЕ" &&
+            client.total() == 1 && catalog->property("count").toInt() == 1, "catalog search shows the single matching book");
+    capture("catalog-filtered");
+    tap("downloadsTab"); settle();
+    require(client.offlineOnly() && search->property("text").toString().isEmpty(), "Downloads starts with its independent search field");
+    tap("catalogTab"); settle();
+    require(!client.offlineOnly() && client.page() == 0 && client.total() == 1 && catalog->property("count").toInt() == 1 &&
+            client.catalogQuery() == "Очень ДЛИННОЕ" && search->property("text").toString() == client.catalogQuery(),
+            "returning from Downloads restores the catalog search and its results");
+    capture("catalog-return");
+    require(wait(client, [&] { tap("clearSearch"); }) && client.total() == 23 && client.catalogQuery().isEmpty(), "clearing the restored search fetches the full catalog");
     require(wait(client, [&] { tap("book-1"); }), "touch opens full metadata"); capture("details");
     require(qAbs(item("detailCoverFrame")->width() - 180*screen.width()/600.0) < 1, "detail cover uses enlarged reference proportions");
     require(qAbs(item("detailCoverFrame")->mapToScene(QPointF()).y()-item("detailTitle")->mapToScene(QPointF()).y()) < 1, "detail cover and title align at top");
@@ -233,7 +280,6 @@ int main(int argc, char **argv) {
     tap("navigationButton"); settle();
     require(wait(client, [&] { tap("collectionsTab"); }), "touch loads collection list"); capture("collections");
     require(wait(client, [&] { tap("collection-12"); }), "touch enters public collection"); capture("collection-books");
-    auto search = window->findChild<QQuickItem *>("searchField");
     require(search != nullptr, "collection search field available");
     search->setProperty("text", "Автор коллекции");
     require(wait(client, [&] { tap("searchButton"); }) && client.total() == 20, "search stays within collection");
@@ -308,6 +354,8 @@ int main(int argc, char **argv) {
         {"conflictRemote",QJsonObject{{"cfi","epubcfi(/6/2!/4/42/1:0)"},{"percentage",40},{"pageNumber",QJsonValue::Null}}}};
     require(recordFile.open(QIODevice::WriteOnly|QIODevice::Truncate) && recordFile.write(QJsonDocument(record).toJson())>0, "seed isolated conflict"); recordFile.close();
     require((client.configure(client.server(),client.username()) && waitForLibrary(client)), "reload saved conflict without network authentication"); settle();
+    require(item("syncList")->isVisible(), "reloading the account restores the sync list");
+    tap("syncBook-book:1"); settle();
     tap("choosePosition-101"); settle();
     require(!item("conflictLoginButton")->isVisible() && !item("loginButton")->isVisible(),
             "saved session does not offer redundant login in conflict or screen header");
@@ -353,8 +401,25 @@ int main(int argc, char **argv) {
     require(!wait(client,[&] { client.showDownloaded(false); }) && !client.hasSavedSession(), "UI final 401 invalidates saved connection");
     require(item("loginButton")->isVisible() && item("loginButton")->parentItem() == item("header") && !item("syncButton")->isEnabled(), "expired authorization shows header login and disables sync");
     capture("expired-session");
-    tap("loginButton"); settle(); tap("loginButton"); settle();
-    require(window->property("addingConnection").toBool() && password->isVisible(), "connect opens password form after final 401");
+    tap("loginButton"); settle();
+    require(password->isVisible(), "catalog header sign-in opens the form directly after final 401");
+    tap("navigationButton"); settle();
+    require(!client.offlineOnly() && item("catalog")->isVisible() && !password->isVisible(), "back from sign-in restores the catalog");
+    client.showSyncFile(101); settle();
+    tap("loginButton"); settle();
+    require(password->isVisible(), "book details header sign-in opens the form directly after final 401");
+    tap("navigationButton"); settle();
+    require(client.detailVisible() && !password->isVisible(), "back from sign-in restores book details");
+    client.inspectConflict(101);
+    require(waitUntil([&] { return client.progressConflict() && !client.busy(); }), "signed-out position dialog is ready");
+    tap("conflictLoginButton"); settle();
+    require(password->isVisible(), "sign-in from the position dialog opens the form directly");
+    tap("navigationButton"); settle();
+    const auto conflictLogin = item("conflictLoginButton");
+    require(client.progressConflict() && conflictLogin && conflictLogin->isVisible(), "back from sign-in restores the position dialog");
+    tap("deferConflict"); settle();
+    tap("loginButton"); settle();
+    require(password->isVisible(), "open password form for reauthentication");
     password->setProperty("text","demo"); setFault("features");
     int configured = 0;
     const auto settingsConnection = QObject::connect(&client,&Client::completed,&client,[&](const QString &operation,bool) {
@@ -363,7 +428,7 @@ int main(int argc, char **argv) {
     require(wait(client,[&] { tap("loginButton"); }) && configured==1 && client.authenticated(),
             "QML login configures account once and restores catalog access");
     QObject::disconnect(settingsConnection);
-    require(!item("loginButton")->isVisible() && item("syncButton")->isEnabled(), "successful login hides its button and re-enables sync");
+    require(!item("loginButton")->isVisible() && item("syncButton")->isVisible() && item("syncButton")->isEnabled(), "successful login returns to catalog and re-enables sync");
     auto edge=[&](const char *view,int direction) {
         auto v=item(view); v->setProperty("contentY",direction>0 ? qMax(0.0,v->property("contentHeight").toDouble()-v->height()) : 0.0); settle();
     };
@@ -438,6 +503,9 @@ int main(int argc, char **argv) {
     app.removeTranslator(&russian);
     QLocale::setDefault(QLocale("en"));
     client.retranslate(); engine.retranslate();
+    client.closeDetail(); client.showDownloaded(true); settle();
+    require(item("bookAction-2")->property("text").toString() == "Read" &&
+            item("reading-2")->property("text").toString() == "In BookOrbit: read", "English reading action and completed status keep their labels");
     client.showSyncFile(101); settle();
     require(item("downloadButton")->property("text").toString()=="Choose position", "English book action after live retranslation");
     capture("card-conflict-en");

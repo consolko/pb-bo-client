@@ -10,7 +10,9 @@ struct ClientWorkerCheck {
     static bool recentsIdle(const Client &client) { return !client.registryLoading && !client.recentsScheduled && !client.recentsRequested; }
     static void changeAccount(Client &client) { ++client.accountGeneration; }
     static bool receiving(const Client &client) { return client.activeDownload && !client.activeDownload->isFinished(); }
+    static QPointer<QNetworkReply> sessionRestoreReply(const Client &client) { return client.sessionRestoreReply; }
     static bool coverPending(const Client &client) { return bool(client.covers.task); }
+    static bool coversIdle(const Client &client) { return client.covers.queue.isEmpty() && !client.covers.active && !client.covers.task; }
     static void stopCovers(Client &client) { client.covers.stop(); }
     static FileCancellation task(const Client &client) { return client.fileTask; }
     static bool cleanupRunning(const Client &client) { return client.cleanupState==Client::CleanupState::Running; }

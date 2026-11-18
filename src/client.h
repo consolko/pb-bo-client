@@ -133,7 +133,9 @@ public:
     int collectionId() const { return activeCollection; }
     QString collectionName() const { return activeCollectionName; }
     Q_INVOKABLE void showCollections();
-    Q_INVOKABLE void openCollection(int id, const QString &name, double catalogOffset = 0, double detailOffset = 0);
+    Q_INVOKABLE void showCollectionList();
+    Q_INVOKABLE void openCollection(int id, const QString &name, double catalogOffset = 0, double detailOffset = 0,
+                                   const QVariantMap &navigation = {});
     Q_INVOKABLE QVariantMap backFromCollection();
     Q_INVOKABLE void showDetail(int bookId);
     Q_INVOKABLE void refreshDetail();
@@ -204,10 +206,12 @@ public:
     Q_INVOKABLE bool configure(const QString &server, const QString &username);
     Q_INVOKABLE void selectAccount(int index);
     Q_INVOKABLE void logout();
+    Q_INVOKABLE void selectTab(int tab);
     Q_INVOKABLE void showDownloaded(bool value);
     Q_INVOKABLE void cancelDownload();
     Q_INVOKABLE void retry();
     Q_INVOKABLE void login(const QString &server, const QString &username, const QString &password);
+    void startupRestoreSession();
     Q_INVOKABLE void restoreSession();
     Q_INVOKABLE void refresh(int page = 0, const QString &query = {});
     Q_INVOKABLE void download(int index);
@@ -240,6 +244,11 @@ signals:
     void feedbackChanged();
     void libraryChanged();
     void catalogChanged();
+    void browseViewAboutToChange();
+    void browseViewChanged(bool restore);
+    void browseResultsAboutToChange(bool keepAnchor, int direction);
+    void browseResultsChanged();
+    void browseSessionReset();
     void detailChanged();
     void conflictChanged();
     void syncSummaryChanged();
@@ -357,9 +366,18 @@ private:
     QJsonObject conflictRemote;
     bool ensureNetwork();
     using Callback = std::function<void(const QJsonObject &)>;
+    using ReplyCallback = std::function<void(QNetworkReply *, const QByteArray &)>;
     QNetworkRequest request(const QString &path) const;
+    QNetworkReply *sendJsonRequest(const QString &path, const QJsonObject &payload, bool get, const ReplyCallback &callback);
+    UiMessage requestError(const QNetworkReply &reply, int code) const;
     void jsonRequest(const QString &path, const QJsonObject &payload, const Callback &callback, bool renew = true, bool get = false, bool arrayResponse = false);
+    bool acceptCredentials(const QJsonObject &response);
     bool setCredentials(const QJsonObject &response);
+    void startSessionRestore();
+    void restoreSessionThen(const std::function<void()> &resume, const QString &context = "connection");
+    void resetSessionRestore();
+    void loadStartupCatalog();
+    std::pair<UiMessage,bool> applyCatalogResponse(const QJsonObject &response, int targetPage, const QString &query, bool background);
     void renewSession(const std::function<void()> &resume);
     void finish(UiMessage text, bool success, const QString &operation, const QString &syncState = {},bool persistStatus=true);
     bool saveRecord(const QString &id, const QJsonObject &record);
@@ -382,6 +400,7 @@ private:
     QString pathFor(const QJsonObject &book) const;
     bool validDownloadDirectory(const QString &path) const;
     bool saveSession();
+    void clearCredentials();
     void invalidateSession();
     void logEvent(const QString &event, int code = 0, int http = 0);
     QNetworkAccessManager network;
@@ -396,9 +415,35 @@ private:
     QByteArray token;
     QString refreshToken;
     UiMessage sessionNotice;
+    QPointer<QNetworkReply> sessionRestoreReply;
+    std::function<void()> sessionRestoreResume;
+    quint64 startupAccountGeneration = 0;
+    bool startupCatalogPending = false;
     QJsonArray items;
     QJsonArray collectionItems;
-    QList<QJsonObject> browseHistory;
+    enum BrowseTab { DownloadsTab, CatalogTab, CollectionsTab };
+    struct BrowsePage {
+        QJsonArray items;
+        int page = 0, total = 0, collection = 0;
+        QString query, name;
+        bool attempted = false;
+    };
+    struct BrowseHistoryItem {
+        BrowseTab tab;
+        BrowsePage page;
+        QJsonObject detail;
+        UiMessage notice;
+        double catalogY, detailY;
+        QVariantMap navigation;
+    };
+    QList<BrowseHistoryItem> browseHistory;
+    BrowsePage catalogBrowsePage, collectionsBrowsePage;
+    bool pageAttempted = false, collectionListAttempted = false, tabSelected = false;
+    BrowseTab selectedTab() const;
+    BrowsePage currentBrowsePage() const;
+    void changeBrowsePage(BrowseTab tab, BrowsePage page, bool restore = true);
+    void clearNavigation();
+    void loadCollections();
     QJsonObject detailBook, fileChoices;
     UiMessage detailMessage;
     QString activeCollectionName;

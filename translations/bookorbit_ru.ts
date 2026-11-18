@@ -915,6 +915,11 @@ Download an EPUB from the catalog.</source>
       <translation>Прочитано</translation>
     </message>
     <message>
+      <source>Read</source>
+      <comment>Open a book</comment>
+      <translation>Читать</translation>
+    </message>
+    <message>
       <source>Read </source>
       <translation>Читать </translation>
     </message>

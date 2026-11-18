@@ -10,18 +10,23 @@ import xml.etree.ElementTree as ET
 
 root = Path(__file__).resolve().parents[1]
 catalog = ET.parse(root / 'translations/bookorbit_ru.ts')
-messages = {m.findtext('source'): m.findtext('translation') for m in catalog.findall('.//message')}
-for source, translation in messages.items():
+messages = {(m.findtext('source'), m.findtext('comment', '')): m.findtext('translation')
+            for m in catalog.findall('.//context[name="BookOrbit"]/message')}
+for (source, _), translation in messages.items():
     assert translation, f'Empty translation: {source}'
     assert collections.Counter(re.findall(r'%[1-9][0-9]*', source)) == collections.Counter(re.findall(r'%[1-9][0-9]*', translation)), source
     assert source.count('\n') == translation.count('\n'), f'Newlines differ: {source}'
+literal = r'("(?:[^"\\]|\\.)*")'
+translated_source = re.compile(r'(?:qsTranslate|QCoreApplication::translate|QT_TRANSLATE_NOOP)\("BookOrbit",\s*'
+                               + literal + r'(?:,\s*' + literal + r')?')
 for path in [root / 'qml/Main.qml', *root.glob('src/*.cpp'), *root.glob('src/*.h')]:
-    for match in re.finditer(r'(?:qsTranslate|QCoreApplication::translate|QT_TRANSLATE_NOOP)\("BookOrbit",\s*("(?:[^"\\]|\\.)*")', path.read_text()):
+    for match in translated_source.finditer(path.read_text()):
         source = json.loads(match[1])
-        assert source in messages, f'Missing Russian translation in {path.name}: {source}'
+        comment = json.loads(match[2]) if match[2] else ''
+        assert (source, comment) in messages, f'Missing Russian translation in {path.name}: {source} ({comment})'
 for path in root.glob('src/*.cpp'):
     for match in re.finditer(r'trUpdate\(("(?:[^"\\]|\\.)*")', path.read_text()):
-        assert json.loads(match[1]) in messages, f'Missing update translation: {match[1]}'
+        assert (json.loads(match[1]), '') in messages, f'Missing update translation: {match[1]}'
 sources=(root / 'src/i18n.h').read_text()
 codes=re.findall(r'\{"([^"\n]+)", QT_TRANSLATE_NOOP\("BookOrbit",\s*("(?:[^"\\]|\\.)*")\)\}', sources)
 assert len(codes)==len({code for code, _ in codes}), 'Duplicate message codes'

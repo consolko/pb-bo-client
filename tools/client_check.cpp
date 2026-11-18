@@ -14,12 +14,15 @@
 #include <QDir>
 #include <QJsonDocument>
 #include <QCryptographicHash>
+#include <QSemaphore>
 #include <QUuid>
 #include <cstdio>
 #include <cstdlib>
 
 bool networkAvailable = true;
-bool connectNetwork() { return networkAvailable; }
+int networkConnectCalls = 0;
+bool connectNetwork() { ++networkConnectCalls; return networkAvailable; }
+bool networkConnected() { return networkAvailable; }
 QString fakePosition;
 bool fakeCompleted=false;
 QString fakeProfile="default";
@@ -67,6 +70,12 @@ QByteArray contents(const QString &path) { QFile f(path); require(f.open(QIODevi
 void write(const QString &path, const QByteArray &data) { QFile f(path); require(f.open(QIODevice::WriteOnly) && f.write(data) == data.size(), "write test data"); }
 int requests(const QString &root, const QString &route) {
     return QJsonDocument::fromJson(contents(root+"/requests.json")).object()[route].toInt();
+}
+bool waitingForRefresh(const QString &fault) {
+    return waitUntil([&] {
+        QFile state(fault);
+        return state.open(QIODevice::ReadOnly) && state.readAll() == "refresh_waiting";
+    });
 }
 int rssKiB() {
     QFile status("/proc/self/status");
@@ -129,6 +138,90 @@ int main(int argc, char **argv) {
             "refresh 503 retains saved session for a later retry");
     write(fault,"");
     require(wait(pending,[&] { pending.restoreSession(); }) && pending.authenticated(), "saved session can be restored after transient refresh failure");
+    require(waitUntil([&] { return ClientWorkerCheck::coversIdle(c) && ClientWorkerCheck::coversIdle(resumed) &&
+            ClientWorkerCheck::coversIdle(pending); }), "finish previous cover requests before measuring startup traffic");
+    {
+        const int prompts = networkConnectCalls;
+        const int refreshes = requests(root,"POST /api/v1/auth/refresh");
+        Client restarted(endpoint,root);
+        networkAvailable = false;
+        restarted.startupRestoreSession();
+        require(waitForLibrary(restarted) && restarted.hasSavedSession() && !restarted.authenticated() &&
+                !ClientWorkerCheck::sessionRestoreReply(restarted) && networkConnectCalls == prompts &&
+                requests(root,"POST /api/v1/auth/refresh") == refreshes,
+                "offline startup preserves the session without requesting a connection");
+        networkAvailable = true;
+    }
+    {
+        const auto oldSession = contents(sessionFile);
+        const int prompts = networkConnectCalls;
+        const int refreshes = requests(root,"POST /api/v1/auth/refresh");
+        const int catalogRequests = requests(root,"POST /api/v1/books/query");
+        Client restarted(endpoint,root);
+        int completed = 0;
+        QObject::connect(&restarted,&Client::completed,&restarted,[&] { ++completed; });
+        restarted.startupRestoreSession();
+        require(waitUntil([&] { return restarted.authenticated() && restarted.books().size() == 3; }) &&
+                !restarted.busy() && !completed && restarted.status().isEmpty() && networkConnectCalls == prompts &&
+                requests(root,"POST /api/v1/auth/refresh") == refreshes+1 &&
+                requests(root,"POST /api/v1/books/query") == catalogRequests+1 &&
+                restarted.hasSavedSession() && contents(sessionFile) != oldSession,
+                "online startup persists the rotated session and loads an empty local library's catalog quietly");
+    }
+    for (const QByteArray faultMode : {"audit_catalog_error", "bad_catalog_json"}) {
+        Client restarted(endpoint,root);
+        write(fault,faultMode);
+        int completed = 0;
+        QObject::connect(&restarted,&Client::completed,&restarted,[&] { ++completed; });
+        restarted.startupRestoreSession();
+        require(waitUntil([&] { return restarted.canRetry(); }) && restarted.authenticated() &&
+                restarted.books().isEmpty() && !restarted.busy() && !completed &&
+                restarted.feedback()["context"] == "catalog" && restarted.feedback()["result"] == "error" &&
+                !restarted.status().isEmpty(),
+                "startup catalog failure reports catalog feedback and offers retry");
+        write(fault,"");
+        require(wait(restarted,[&] { restarted.retry(); }) && restarted.books().size() == 3 && !restarted.canRetry(),
+                "retry loads catalog after a startup catalog error");
+    }
+    {
+        const int refreshes = requests(root,"POST /api/v1/auth/refresh");
+        const int catalogRequests = requests(root,"POST /api/v1/books/query");
+        const int collectionRequests = requests(root,"GET /api/v1/collections");
+        Client restarted(endpoint,root);
+        write(fault,"hold_refresh");
+        restarted.startupRestoreSession();
+        require(waitForLibrary(restarted) && waitingForRefresh(fault) && !restarted.busy(),
+                "background refresh stays pending without making the client busy");
+        require(wait(restarted,[&] {
+            restarted.selectTab(2);
+            write(fault,"");
+        }) && restarted.authenticated() && restarted.collectionsView() && !restarted.collections().isEmpty() &&
+                requests(root,"POST /api/v1/auth/refresh") == refreshes+1 &&
+                requests(root,"POST /api/v1/books/query") == catalogRequests &&
+                requests(root,"GET /api/v1/collections") == collectionRequests+1,
+                "explicit collections navigation shares the in-flight refresh");
+    }
+    {
+        const QString accountRoot = root+"/startup-account-switch";
+        const QString accountsFile = accountRoot+"/accounts.json";
+        const QString firstScope = accountRoot+"/"+QFileInfo(sessionFile).dir().dirName();
+        const auto saved = contents(sessionFile);
+        require(QDir().mkpath(firstScope), "create isolated account switch fixture");
+        write(accountsFile, contents(root+"/accounts.json"));
+        write(firstScope+"/session.json", saved);
+        Client restarted(endpoint,accountRoot);
+        write(fault,"hold_refresh");
+        restarted.startupRestoreSession();
+        require(waitForLibrary(restarted) && waitingForRefresh(fault), "start refresh under the original account");
+        const auto oldReply = ClientWorkerCheck::sessionRestoreReply(restarted);
+        require(oldReply && restarted.configure(restarted.server(),"other-user") && waitForLibrary(restarted),
+                "change account while refresh is pending");
+        write(fault,"");
+        require(waitUntil([&] { return oldReply.isNull(); }) && restarted.username() == "other-user" &&
+                !restarted.authenticated() && !restarted.hasSavedSession() &&
+                !QFile::exists(restarted.downloadDirectory()+"/session.json") && contents(firstScope+"/session.json") == saved,
+                "old refresh reply leaves both account scopes' credentials intact");
+    }
     write(sessionFile, QJsonDocument(QJsonObject{{"refreshToken", QString(64, '0')}, {"password", "legacy secret"}}).toJson());
     require(QFile::setPermissions(sessionFile, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ReadGroup | QFileDevice::ReadOther), "seed permissive legacy session");
     Client migrated(endpoint, root); require(waitForLibrary(migrated),"registry snapshot loaded");
@@ -155,10 +248,15 @@ int main(int argc, char **argv) {
     Client noCache(endpoint, root); require(waitForLibrary(noCache),"registry snapshot loaded");
     require(noCache.books().isEmpty() && noCache.status().isEmpty() && !QFile::exists(catalogPath),
             "restart discards obsolete catalog and duplicate sign-in prompt");
+    const auto cachedCatalog = c.books();
     c.showDownloaded(true);
     write(fault, "error");
-    require(!wait(c, [&] { c.showDownloaded(false); }) && c.books().isEmpty(),
-            "reopening catalog uses network and never falls back to stale books");
+    const int beforeReturn = requests(root, "POST /api/v1/books/query");
+    c.selectTab(1);
+    require(!c.busy() && c.books() == cachedCatalog && requests(root, "POST /api/v1/books/query") == beforeReturn,
+            "returning to the catalog shows remembered books without a request");
+    require(!wait(c, [&] { c.selectTab(1); }) && c.books() == cachedCatalog,
+            "a failed explicit refresh preserves the catalog page");
     write(fault, "");
     require(wait(c, [&] { c.retry(); }) && c.books().size() == 3, "catalog retry restores fresh online books");
     write(fault, "renew");
@@ -172,6 +270,60 @@ int main(int argc, char **argv) {
     require(!wait(c, [&] { c.open(0); }) && !opened && scanned == file, "unindexed book cannot open before native registration");
     indexed = true;
     require(wait(c, [&] { c.open(0); }) && opened, "indexed book can open");
+    {
+        require(waitUntil([&] { return ClientWorkerCheck::coversIdle(c); }), "finish previous cover requests before measuring reader startup traffic");
+        const auto saved = contents(sessionFile);
+        const int catalogRequests = requests(root,"POST /api/v1/books/query");
+        const int prompts = networkConnectCalls;
+        Client restarted(endpoint,root);
+        write(fault,"hold_refresh");
+        restarted.startupRestoreSession();
+        require(waitForLibrary(restarted) && waitingForRefresh(fault) && restarted.offlineOnly(), "downloaded library starts while refresh is pending");
+        opened = false;
+        require(wait(restarted,[&] { restarted.openFile(101,false); }) && opened &&
+                !restarted.authenticated() && ClientWorkerCheck::sessionRestoreReply(restarted),
+                "local reader opens before the server returns a refreshed session");
+        const auto feedback = restarted.feedback();
+        write(fault,"");
+        require(waitUntil([&] { return restarted.authenticated(); }) && restarted.offlineOnly() &&
+                restarted.feedback() == feedback && restarted.hasSavedSession() && contents(sessionFile) != saved &&
+                requests(root,"POST /api/v1/books/query") == catalogRequests && networkConnectCalls == prompts,
+                "successful refresh rotates credentials after opening and leaves that file operation intact");
+    }
+    {
+        const auto saved = contents(sessionFile);
+        for (const QByteArray faultMode : {"error", "expired"}) {
+            const bool expired = faultMode == "expired";
+            Client restarted(endpoint,root);
+            require(waitForLibrary(restarted) && restarted.hasSavedSession(), "load local book and session for refresh error");
+            auto release = std::make_shared<QSemaphore>();
+            ClientWorkerCheck::executor(restarted).submit(&restarted,[release](const FileCancellation &) {
+                release->acquire();
+                return true;
+            },[](bool,bool) {});
+            write(fault, faultMode);
+            opened = false;
+            int completions = 0;
+            QObject::connect(&restarted,&Client::completed,&restarted,[&] { ++completions; });
+            restarted.startupRestoreSession();
+            restarted.openFile(101,false);
+            const auto fileFeedback = restarted.feedback();
+            const auto fileTask = ClientWorkerCheck::task(restarted);
+            require(fileTask && restarted.busy(), "local file worker is pending during refresh");
+            require(waitUntil([&] { return !ClientWorkerCheck::sessionRestoreReply(restarted); }) &&
+                    !restarted.authenticated() && restarted.hasSavedSession() != expired &&
+                    QFile::exists(sessionFile) != expired && restarted.feedback() == fileFeedback &&
+                    restarted.offlineOnly() && restarted.busy() && !completions && !fileTask->load(),
+                    expired ? "background 401 clears only credentials while the local file worker continues" :
+                              "background 503 preserves credentials and leaves the local file worker intact");
+            require(wait(restarted,[&] { release->release(); }) && opened && completions == 1,
+                    "local file opens successfully after a background refresh error");
+        }
+        write(fault,"");
+        write(sessionFile,saved);
+        require(QFile::setPermissions(sessionFile, QFileDevice::ReadOwner|QFileDevice::WriteOwner),
+                "restore protected session fixture for remaining checks");
+    }
     require(wait(c, [&] { c.download(1); }), "download second book");
     const auto scope = QFileInfo(file).absolutePath();
     require(QFile::exists(scope+"/records/101.json") && !QFile::exists(scope+"/downloads.json"), "per-book records replace shared registry");
@@ -1117,7 +1269,9 @@ int main(int argc, char **argv) {
             features.books().first().toMap()["title"].toString() == "%2B",
             "retry preserves literal percent encoding in collection search");
     write(fault, "bad_collections");
-    require(!wait(features, [&] { features.showCollections(); }) && features.collections().isEmpty(), "reject wrong collection response shape");
+    const auto cachedCollections = features.collections();
+    require(!wait(features, [&] { features.showCollections(); }) && features.collections() == cachedCollections,
+            "wrong collection response preserves the previously loaded list");
     write(fault, "features");
     require(wait(features, [&] { features.retry(); }), "retry collection list after malformed response");
     require(wait(features, [&] { features.openCollection(11, "К прочтению"); }) && features.total() == 2, "own collection membership");

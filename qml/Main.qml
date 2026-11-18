@@ -50,49 +50,124 @@ ApplicationWindow {
         }
         MouseArea { anchors.fill: parent }
     }
-    property var libraryAnchor: null
-    function captureLibraryAnchor() {
-        if (libraryAnchor) return
-        const ids = []
-        for (let i = 0; i < catalog.count; ++i) ids.push(catalogBooks.idAt(i))
-        const anchors = []
-        for (const view of [catalog, coverCatalog]) {
-            if (view.width <= 0 || view.height <= 0) continue
-            const grid = view === coverCatalog
-            const top = view.originY === undefined ? 0 : view.originY
-            const columns = grid ? Math.max(1, Math.floor(view.width / view.cellWidth)) : 1
-            let at = view.indexAt(1, view.contentY + 1)
-            if (at < 0) at = view.indexAt(1, view.contentY + (view === coverCatalog ? view.cellHeight / 2 : 20 * u))
-            // A hidden grid can retain an offset without instantiated delegates.
-            if (grid && at < 0 && view.count > 0) at = Math.min(view.count - 1, Math.max(0, Math.floor((view.contentY - top) / view.cellHeight) * columns))
-            if (at < 0) continue
-            const item = view.itemAtIndex(at)
-            const y = grid ? top + Math.floor(at / columns) * view.cellHeight : item ? item.y : view.contentY
-            anchors.push({view: view, ids: ids, at: at, grid: grid, offset: view.contentY - y})
-            if (view === catalog && at > 0) libraryAtBeginning = false
-        }
-        libraryAnchor = {account: activeAccount, offline: client.offlineOnly, page: client.page, views: anchors}
+    property var browseViews: ({})
+    property var libraryAnchors: null
+    property var resultAnchors: null
+    property int browseRestoreRevision: 0
+    property bool browseRestorePending: false
+    function browseKey() {
+        if (client.offlineOnly) return "downloads"
+        if (client.collectionsView) return "collections"
+        return client.collectionId > 0 ? "collection" : "catalog"
     }
-    function restoreLibraryAnchor() { Qt.callLater(window.applyLibraryAnchor) }
-    function applyLibraryAnchor() {
-        const pending = libraryAnchor
-        libraryAnchor = null
-        if (!pending || pending.account !== activeAccount || pending.offline !== client.offlineOnly || pending.page !== client.page) return
-        for (const saved of pending.views) {
-            let row = catalogBooks.rowFor(saved.ids[saved.at])
-            for (let i = saved.at + 1; row < 0 && i < saved.ids.length; ++i) row = catalogBooks.rowFor(saved.ids[i])
-            for (let i = saved.at - 1; row < 0 && i >= 0; --i) row = catalogBooks.rowFor(saved.ids[i])
-            saved.view.forceLayout()
-            if (row < 0) { saved.view.positionViewAtBeginning(); continue }
-            saved.view.positionViewAtIndex(row, ListView.Beginning)
-            saved.view.forceLayout()
-            const item = saved.view.itemAtIndex(row)
-            const top = saved.view.originY === undefined ? 0 : saved.view.originY
-            const columns = saved.grid ? Math.max(1, Math.floor(saved.view.width / saved.view.cellWidth)) : 1
-            const y = saved.grid ? top + Math.floor(row / columns) * saved.view.cellHeight : item ? item.y : null
-            if (y !== null) saved.view.contentY = Math.max(top, Math.min(y + saved.offset,
-                Math.max(top, top + saved.view.contentHeight - saved.view.height)))
+    function savedBrowseView() {
+        const saved = browseViews[browseKey()]
+        return saved && saved.collection === client.collectionId ? saved : null
+    }
+    function scrollView() {
+        if (client.collectionsView) return collectionList
+        return activeCatalog.visible || catalog.count > 0 ? activeCatalog : catalog
+    }
+    function viewMode(view) { return view === coverCatalog ? "grid" : "list" }
+    function viewIds(view) {
+        if (view === collectionList) return client.collections.map(item => item.id)
+        const ids = []
+        for (let i = 0; i < view.count; ++i) ids.push(catalogBooks.idAt(i))
+        return ids
+    }
+    function captureAnchor(view, ids) {
+        if (view.width <= 0 || view.height <= 0 || ids.length === 0) return null
+        const grid = view === coverCatalog
+        const columns = grid ? Math.max(1, Math.floor(view.width / view.cellWidth)) : 1
+        let row = view.indexAt(1, view.contentY + 1)
+        if (row < 0) row = view.indexAt(1, view.contentY + (grid ? view.cellHeight / 2 : 20 * u))
+        if (grid && row < 0) row = Math.min(ids.length - 1, Math.max(0, Math.floor((view.contentY - view.originY) / view.cellHeight) * columns))
+        if (row < 0) return null
+        const item = view.itemAtIndex(row)
+        const y = grid ? view.originY + Math.floor(row / columns) * view.cellHeight : item ? item.y : view.contentY
+        return {ids: ids, row: row, offset: view.contentY - y}
+    }
+    function restoreAnchor(view, anchor, direction) {
+        view.forceLayout()
+        if (!anchor) {
+            if (direction < 0) view.positionViewAtEnd()
+            else view.positionViewAtBeginning()
+            return
         }
+        const collectionIds = view === collectionList ? viewIds(view) : null
+        const rowFor = id => collectionIds ? collectionIds.indexOf(id) : catalogBooks.rowFor(id)
+        let row = rowFor(anchor.ids[anchor.row])
+        // Prefer the closest surviving item in the previous order.
+        for (let distance = 1; row < 0 && distance < anchor.ids.length; ++distance) {
+            if (anchor.row + distance < anchor.ids.length) row = rowFor(anchor.ids[anchor.row + distance])
+            if (row < 0 && anchor.row >= distance) row = rowFor(anchor.ids[anchor.row - distance])
+        }
+        if (row < 0) { view.positionViewAtBeginning(); return }
+        view.positionViewAtIndex(row, ListView.Beginning)
+        view.forceLayout()
+        const item = view.itemAtIndex(row)
+        const top = view.originY
+        let y
+        if (view === coverCatalog) {
+            const columns = Math.max(1, Math.floor(view.width / view.cellWidth))
+            y = top + Math.floor(row / columns) * view.cellHeight
+        } else if (item) y = item.y
+        else return
+        const bottom = top + Math.max(0, view.contentHeight - view.height)
+        view.contentY = Math.max(top, Math.min(y + anchor.offset, bottom))
+    }
+    function rememberBrowseView() {
+        const view = scrollView(), previous = savedBrowseView()
+        const anchors = previous ? Object.assign({}, previous.anchors) : {}
+        if (view.visible && !browseRestorePending) anchors[viewMode(view)] = captureAnchor(view, viewIds(view))
+        const saved = {collection: client.collectionId, draft: search.text, grid: coverGrid, anchors: anchors}
+        browseViews[browseKey()] = saved
+        return saved
+    }
+    function scheduleBrowseRestore(anchors, direction) {
+        const revision = ++browseRestoreRevision
+        browseRestorePending = true
+        Qt.callLater(function() {
+            if (revision !== browseRestoreRevision) return
+            browseRestorePending = false
+            if (client.detailVisible || settings || syncView) return
+            const view = scrollView()
+            restoreAnchor(view, anchors && anchors[viewMode(view)], direction)
+        })
+    }
+    function restoreBrowseView(saved) {
+        browseViews[browseKey()] = saved
+        search.text = saved ? saved.draft : client.offlineOnly ? client.localQuery : client.catalogQuery
+        if (!client.offlineOnly && !client.collectionsView) coverGrid = saved ? saved.grid : false
+        scheduleBrowseRestore(saved ? saved.anchors : null, 0)
+    }
+    function selectTab(tab) {
+        Qt.inputMethod.hide()
+        client.selectTab(tab)
+    }
+    function selectCoverMode(grid) {
+        Qt.inputMethod.hide()
+        if (coverGrid === grid) return
+        const saved = rememberBrowseView()
+        const anchor = saved.anchors[grid ? "list" : "grid"]
+        const mode = grid ? "grid" : "list"
+        if (!saved.anchors[mode] && anchor) saved.anchors[mode] = {ids: anchor.ids, row: anchor.row, offset: 0}
+        coverGrid = grid
+        scheduleBrowseRestore(saved.anchors, 0)
+    }
+    function captureLibraryAnchor() {
+        if (libraryAnchors || browseRestorePending) return
+        const ids = viewIds(catalog)
+        libraryAnchors = {list: captureAnchor(catalog, ids), grid: captureAnchor(coverCatalog, ids), revision: browseRestoreRevision}
+    }
+    function restoreLibraryAnchor() {
+        Qt.callLater(function() {
+            const anchors = libraryAnchors
+            libraryAnchors = null
+            if (!anchors || anchors.revision !== browseRestoreRevision || !client.offlineOnly) return
+            if (anchors.list) restoreAnchor(catalog, anchors.list, 0)
+            if (anchors.grid) restoreAnchor(coverCatalog, anchors.grid, 0)
+        })
     }
     readonly property var updater: typeof updateManager === "undefined" ? null : updateManager
     Connections {
@@ -106,11 +181,6 @@ ApplicationWindow {
     property bool coverGrid: false
     readonly property var activeCatalog: coverGrid && !client.offlineOnly ? coverCatalog : catalog
     property real savedCatalogY: 0
-    property real savedLibraryY: 0
-    property bool libraryAtBeginning: true
-    property real pageOffset: 0
-    property int pageDirection: 0
-    property bool catalogTransition: false
     property int pendingFileId: 0
     property bool formatDownload: false
     readonly property var languageCodes: ["system"].concat(client.languageCodes)
@@ -127,6 +197,7 @@ ApplicationWindow {
     onSyncBookKeyChanged: selectedSyncBook = client.syncBookDetails(syncBookKey)
     readonly property bool loginRequired: !client.authenticated && !client.hasSavedSession
     property bool addingConnection: false
+    property bool connectionFromSettings: false
     property bool browsingFolders: false
     property string folderPath: "/mnt/ext1"
     property real keyboardSpace: Qt.inputMethod.visible ? Math.max(Qt.inputMethod.keyboardRectangle.height, height * 0.4) : 0
@@ -136,11 +207,10 @@ ApplicationWindow {
     readonly property var uiMessage: client.feedback
     readonly property bool messageVisible: (uiMessage.context === uiContext || (settings && !addingConnection && uiMessage.context === "connection")) && (!uiMessage.bookId || !client.detailVisible || uiMessage.bookId === detailData.bookId) && (!uiMessage.fileId || !client.detailVisible || uiMessage.fileId === detailData.fileId)
     onUiContextChanged: Qt.callLater(function() { client.setUiContext(window.uiContext) })
-    readonly property string activeAccount: client.server + "\n" + client.username
-    onActiveAccountChanged: { libraryAnchor = null; savedLibraryY = 0; libraryAtBeginning = true; if (client.offlineOnly) search.text = client.localQuery }
     onSyncViewChanged: if (syncView) client.syncFilter = "all"
     Connections { target: Qt.application; function onStateChanged() { if (Qt.application.state === Qt.ApplicationActive) client.refreshRecents() } }
     function showFile(fileId) {
+        rememberBrowseView()
         savedCatalogY = activeCatalog.contentY
         fullDescription = false
         client.showSyncFile(fileId)
@@ -163,11 +233,14 @@ ApplicationWindow {
     }
     function submitSearch() {
         Qt.inputMethod.hide()
-        if (client.offlineOnly) { libraryAtBeginning = true; client.searchDownloaded(search.text); catalog.positionViewAtBeginning(); savedLibraryY = 0 }
-        else { pageOffset = activeCatalog.contentY; pageDirection = 0; catalogTransition = true; client.refresh(0, search.text) }
+        if (client.offlineOnly) {
+            client.searchDownloaded(search.text)
+            scheduleBrowseRestore(null, 0)
+        } else client.refresh(0, search.text)
     }
     function clearSearch() { search.text = ""; submitSearch() }
     function showBook(id) {
+        rememberBrowseView()
         savedCatalogY = activeCatalog.contentY
         fullDescription = false
         client.showDetail(id)
@@ -214,23 +287,22 @@ ApplicationWindow {
     }
     function pageContent(direction) {
         if (formatDialog.visible || progressDialog.visible || Qt.inputMethod.visible || settings || client.busy) return
-        if (client.offlineOnly && !client.detailVisible && !syncView) libraryAtBeginning = false
         const target = client.detailVisible ? detailScroll.contentItem : syncView ? (syncBookKey ? syncDetails.contentItem : syncList) : client.collectionsView ? collectionList : activeCatalog
         const top = target.originY === undefined ? 0 : target.originY
         const bottom = top + Math.max(0, target.contentHeight-target.height)
         const edge = direction > 0 ? target.contentY >= bottom-1 : target.contentY <= top+1
         if (edge && !client.detailVisible && !syncView && !client.collectionsView && !client.offlineOnly &&
                 (direction > 0 ? (client.page+1)*client.pageSize < client.total : client.page > 0)) {
-            pageOffset = target.contentY; pageDirection = direction; catalogTransition = true
             client.refresh(client.page + direction, client.catalogQuery)
         } else target.contentY = Math.max(top, Math.min(bottom, target.contentY + direction*target.height*0.85))
     }
     function backCollection() {
         const saved = client.backFromCollection()
         if (saved.query !== undefined) {
-            search.text = saved.query; savedCatalogY = saved.catalogY
+            restoreBrowseView(saved.navigation && saved.navigation.draft !== undefined ? saved.navigation : savedBrowseView())
+            savedCatalogY = saved.catalogY
             Qt.callLater(function() { detailScroll.contentItem.contentY = saved.detailY })
-        } else { search.text = ""; client.showCollections() }
+        } else client.showCollectionList()
     }
     function revealField(field) {
         if (!settings || !field || !field.activeFocus || !field.mapToItem) return
@@ -247,25 +319,37 @@ ApplicationWindow {
         settings = true
     }
     function connectionForm(fresh) {
+        connectionFromSettings = settings
         server.text = fresh ? "https://" : client.server
         username.text = fresh ? "" : client.username
         password.text = ""
         addingConnection = true
+        settings = true
         settingsScroll.contentItem.contentY = 0
     }
     function back() {
-        if (client.progressConflict) { if (!client.busy) client.dismissConflict(); return }
         if (formatDialog.visible) { formatDialog.close(); return }
         if (Qt.inputMethod.visible) { Qt.inputMethod.hide(); return }
+        if (addingConnection) {
+            addingConnection = false
+            settings = connectionFromSettings
+            password.text = ""
+            return
+        }
+        if (client.progressConflict) { if (!client.busy) client.dismissConflict(); return }
         if (browsingFolders) { browsingFolders = false; return }
-        if (addingConnection) { addingConnection = false; password.text = ""; return }
         if (syncView && !settings && !client.detailVisible) {
             if (syncBookKey) syncBookKey = ""
             else syncView = false
             return
         }
         if (settings) { settings = false; password.text = ""; Qt.inputMethod.hide() }
-        else if (client.detailVisible) { client.closeDetail(); Qt.callLater(function() { activeCatalog.contentY = savedCatalogY }) }
+        else if (client.detailVisible) {
+            client.closeDetail()
+            const saved = savedBrowseView()
+            if (saved && saved.anchors[viewMode(scrollView())]) scheduleBrowseRestore(saved.anchors, 0)
+            else Qt.callLater(function() { activeCatalog.contentY = savedCatalogY })
+        }
         else if (client.collectionId > 0 && !client.busy) window.backCollection()
         else if (!client.busy) Qt.quit()
     }
@@ -378,8 +462,7 @@ ApplicationWindow {
                         client.login(server.text, username.text, password.text)
                         password.text = ""
                         Qt.inputMethod.hide()
-                    } else if (window.settings) window.connectionForm(false)
-                    else window.editConnection()
+                    } else window.connectionForm(false)
                 }
             }
             Action {
@@ -446,9 +529,9 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     spacing: 8 * window.u
                 Text { text: qsTranslate("BookOrbit", "Server address"); font.pixelSize: 16 * window.u }
-                Field { id: server; inputMethodHints: Qt.ImhUrlCharactersOnly; Accessible.name: qsTranslate("BookOrbit", "Server address") }
+                Field { id: server; objectName: "serverField"; inputMethodHints: Qt.ImhUrlCharactersOnly; Accessible.name: qsTranslate("BookOrbit", "Server address") }
                 Text { text: qsTranslate("BookOrbit", "Username"); font.pixelSize: 16 * window.u }
-                Field { id: username; inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText; Accessible.name: qsTranslate("BookOrbit", "Username") }
+                Field { id: username; objectName: "usernameField"; inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText; Accessible.name: qsTranslate("BookOrbit", "Username") }
                 Text { text: qsTranslate("BookOrbit", "Sign-in password"); font.pixelSize: 16 * window.u }
                 Field { id: password; objectName: "passwordField"; echoMode: showPassword.checked ? TextInput.Normal : TextInput.Password; inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText; Accessible.name: qsTranslate("BookOrbit", "Password") }
                 CheckBox {
@@ -667,9 +750,9 @@ ApplicationWindow {
             visible: !window.settings && !window.syncView && !client.detailVisible
             Layout.fillWidth: true
             spacing: 8 * window.u
-            Action { objectName: "downloadsTab"; text: qsTranslate("BookOrbit", "Downloads"); checked: client.offlineOnly; Layout.fillWidth: true; enabled: !client.busy; onClicked: { window.libraryAtBeginning = window.savedLibraryY === 0; client.showDownloaded(true); search.text = client.localQuery; Qt.callLater(function() { if (window.libraryAtBeginning) catalog.positionViewAtBeginning(); else catalog.contentY = window.savedLibraryY }) } }
-            Action { objectName: "catalogTab"; text: qsTranslate("BookOrbit", "Catalog"); checked: !client.offlineOnly && !client.collectionsView && client.collectionId === 0; Layout.fillWidth: true; enabled: !client.busy; onClicked: { if (client.offlineOnly) window.savedLibraryY = window.libraryAtBeginning ? 0 : catalog.contentY; search.text = ""; window.pageDirection = 0; window.pageOffset = 0; window.catalogTransition = true; client.showDownloaded(false) } }
-            Action { objectName: "collectionsTab"; text: qsTranslate("BookOrbit", "Collections"); checked: client.collectionsView || client.collectionId > 0; Layout.fillWidth: true; enabled: !client.busy; onClicked: { if (client.offlineOnly) window.savedLibraryY = window.libraryAtBeginning ? 0 : catalog.contentY; search.text = ""; client.showCollections() } }
+            Action { objectName: "downloadsTab"; text: qsTranslate("BookOrbit", "Downloads"); checked: client.offlineOnly; Layout.fillWidth: true; enabled: !client.busy; onClicked: window.selectTab(0) }
+            Action { objectName: "catalogTab"; text: qsTranslate("BookOrbit", "Catalog"); checked: !client.offlineOnly && !client.collectionsView && client.collectionId === 0; Layout.fillWidth: true; enabled: !client.busy; onClicked: window.selectTab(1) }
+            Action { objectName: "collectionsTab"; text: qsTranslate("BookOrbit", "Collections"); checked: client.collectionsView || client.collectionId > 0; Layout.fillWidth: true; enabled: !client.busy; onClicked: window.selectTab(2) }
         }
         RowLayout {
             visible: !window.settings && !window.syncView && !client.detailVisible && client.collectionId > 0
@@ -693,7 +776,7 @@ ApplicationWindow {
                     Accessible.role: Accessible.RadioButton
                     Accessible.checked: checked
                     enabled: !client.busy
-                    onClicked: { Qt.inputMethod.hide(); window.coverGrid = false }
+                    onClicked: window.selectCoverMode(false)
                 }
                 Action {
                     objectName: "coverViewButton"
@@ -702,7 +785,7 @@ ApplicationWindow {
                     Accessible.role: Accessible.RadioButton
                     Accessible.checked: checked
                     enabled: !client.busy
-                    onClicked: { Qt.inputMethod.hide(); window.coverGrid = true }
+                    onClicked: window.selectCoverMode(true)
                 }
             }
         }
@@ -819,7 +902,7 @@ ApplicationWindow {
                 objectName: "collection-" + modelData.id
                 width: collectionList.width
                 height: (modelData.isOwner ? 66 : 84) * window.u
-                onClicked: { search.text = ""; activeCatalog.contentY = 0; client.openCollection(modelData.id, modelData.name) }
+                onClicked: client.openCollection(modelData.id, modelData.name)
                 enabled: !client.busy
                 background: Rectangle { color: parent.down ? "#dddddd" : "white"; Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: "#aaaaaa" } }
                 contentItem: RowLayout {
@@ -837,9 +920,6 @@ ApplicationWindow {
         ListView {
             id: catalog
             objectName: "catalog"
-            onMovementStarted: window.libraryAtBeginning = false
-            onOriginYChanged: if (client.offlineOnly && window.libraryAtBeginning)
-                Qt.callLater(function() { if (client.offlineOnly && window.libraryAtBeginning) catalog.positionViewAtBeginning() })
             visible: !window.settings && !window.syncView && !client.detailVisible && !client.collectionsView && (!window.coverGrid || client.offlineOnly || count === 0)
             Layout.fillWidth: true; Layout.fillHeight: true
             clip: true
@@ -895,7 +975,7 @@ ApplicationWindow {
                             id: bookAction
                             anchors.bottom: parent.bottom
                             objectName: "bookAction-" + modelData.bookId
-                            text: !modelData.downloaded ? (modelData.needsRepair ? qsTranslate("BookOrbit", "Retry") : qsTranslate("BookOrbit", "Download")) : !modelData.readable ? qsTranslate("BookOrbit", "About this book") : modelData.remoteFileChanged ? qsTranslate("BookOrbit", "Local") : modelData.hasConflict ? qsTranslate("BookOrbit", "Choose") : modelData.pendingProgress ? qsTranslate("BookOrbit", "Check") : qsTranslate("BookOrbit", "Read")
+                            text: !modelData.downloaded ? (modelData.needsRepair ? qsTranslate("BookOrbit", "Retry") : qsTranslate("BookOrbit", "Download")) : !modelData.readable ? qsTranslate("BookOrbit", "About this book") : modelData.remoteFileChanged ? qsTranslate("BookOrbit", "Local") : modelData.hasConflict ? qsTranslate("BookOrbit", "Choose") : modelData.pendingProgress ? qsTranslate("BookOrbit", "Check") : qsTranslate("BookOrbit", "Read", "Open a book")
                             icon.source: modelData.downloaded ? "" : "qrc:/icons/download.svg"
                             Accessible.name: (modelData.downloaded ? text : modelData.needsRepair ? qsTranslate("BookOrbit", "Download again") : qsTranslate("BookOrbit", "Download")) + ": " + modelData.title
                             enabled: !client.busy && (modelData.downloaded || modelData.supported && client.authenticated)
@@ -909,7 +989,7 @@ ApplicationWindow {
                 visible: catalog.count === 0 && !client.busy
                 Text {
                     width: parent.width
-                    text: client.offlineOnly ? (client.localQuery.length ? qsTranslate("BookOrbit", "No results for your search.") : qsTranslate("BookOrbit", "No downloaded books yet.\nChoose a book from the catalog.")) : !client.authenticated ? qsTranslate("BookOrbit", "Sign in to download books.") : client.canRetry ? qsTranslate("BookOrbit", "Could not load books.\nTap Retry.") : search.text.length ? qsTranslate("BookOrbit", "No results for your search.") : client.collectionId > 0 ? qsTranslate("BookOrbit", "No books available in this collection yet.") : qsTranslate("BookOrbit", "No books available in the catalog yet.")
+                    text: client.offlineOnly ? (client.localQuery.length ? qsTranslate("BookOrbit", "No results for your search.") : qsTranslate("BookOrbit", "No downloaded books yet.\nChoose a book from the catalog.")) : !client.authenticated ? qsTranslate("BookOrbit", "Sign in to download books.") : client.canRetry ? qsTranslate("BookOrbit", "Could not load books.\nTap Retry.") : client.catalogQuery.length ? qsTranslate("BookOrbit", "No results for your search.") : client.collectionId > 0 ? qsTranslate("BookOrbit", "No books available in this collection yet.") : qsTranslate("BookOrbit", "No books available in the catalog yet.")
                     wrapMode: Text.Wrap; horizontalAlignment: Text.AlignHCenter; font.pixelSize: 19 * window.u; color: "#444444"
                 }
                 Action { visible: search.text.length > 0; anchors.horizontalCenter: parent.horizontalCenter; text: qsTranslate("BookOrbit", "Clear search"); enabled: !client.busy; onClicked: window.clearSearch() }
@@ -1072,7 +1152,7 @@ ApplicationWindow {
                     Action {
                         required property var modelData
                         text: modelData.name + "  ›"; Layout.fillWidth: true; enabled: !client.busy
-                        onClicked: { window.syncView = false; search.text = ""; client.openCollection(modelData.id, modelData.name, window.savedCatalogY, detailScroll.contentItem.contentY) }
+                        onClicked: { window.syncView = false; client.openCollection(modelData.id, modelData.name, window.savedCatalogY, detailScroll.contentItem.contentY, window.rememberBrowseView()) }
                     }
                 }
             }
@@ -1149,9 +1229,9 @@ ApplicationWindow {
         modal: true
         header: RowLayout {
             Text { text: qsTranslate("BookOrbit", "Choose reading position"); Layout.fillWidth: true; Layout.margins: 16 * window.u; font.pixelSize: 22 * window.u; font.bold: true }
-            Action { objectName: "conflictLoginButton"; text: qsTranslate("BookOrbit", "Sign in"); visible: window.loginRequired; Layout.rightMargin: 16 * window.u; enabled: !client.busy; onClicked: { client.dismissConflict(); window.editConnection() } }
+            Action { objectName: "conflictLoginButton"; text: qsTranslate("BookOrbit", "Sign in"); visible: window.loginRequired; Layout.rightMargin: 16 * window.u; enabled: !client.busy; onClicked: window.connectionForm(false) }
         }
-        visible: client.progressConflict
+        visible: client.progressConflict && !window.addingConnection
         closePolicy: Popup.NoAutoClose
         background: Rectangle { color: "white"; border.color: "black"; radius: 3 * window.u }
         contentItem: ScrollView {
@@ -1221,6 +1301,26 @@ ApplicationWindow {
         target: client
         function onLibraryAboutToReset() { window.captureLibraryAnchor() }
         function onLibraryReset() { window.restoreLibraryAnchor() }
+        function onBrowseViewAboutToChange() { window.rememberBrowseView() }
+        function onBrowseViewChanged(restore) { window.restoreBrowseView(restore ? window.savedBrowseView() : null) }
+        function onBrowseResultsAboutToChange(keepAnchor, direction) {
+            const saved = window.rememberBrowseView()
+            if (!keepAnchor) saved.anchors = {}
+            window.resultAnchors = {anchors: saved.anchors, direction: direction}
+        }
+        function onBrowseResultsChanged() {
+            const pending = window.resultAnchors
+            window.resultAnchors = null
+            if (pending) window.scheduleBrowseRestore(pending.anchors, pending.direction)
+        }
+        function onBrowseSessionReset() {
+            window.browseViews = ({})
+            window.libraryAnchors = null
+            window.resultAnchors = null
+            window.savedCatalogY = 0
+            window.coverGrid = false
+            window.restoreBrowseView(null)
+        }
         function onSyncSummaryChanged() {
             window.selectedSyncBook = client.syncBookDetails(window.syncBookKey)
             if (window.syncBookKey && !window.selectedSyncBook.key) window.syncBookKey = ""
@@ -1229,13 +1329,6 @@ ApplicationWindow {
             if (client.syncBatch.running && !window.settings && !client.detailVisible) window.syncView = true
         }
         function onCompleted(operation, success) {
-            if (window.catalogTransition && window.uiMessage.context === "catalog") {
-                const direction = window.pageDirection, offset = window.pageOffset
-                Qt.callLater(function() { activeCatalog.contentY = success ? (direction < 0 ? Math.max(0,activeCatalog.contentHeight-activeCatalog.height) : 0) : offset })
-                if (success) { window.pageDirection = 0; window.catalogTransition = false }
-                else search.text = client.catalogQuery
-            }
-
             if (operation === "sync" && window.syncData.total > 0 && !window.settings) {
                 window.syncView = true
                 window.syncBookKey = ""
@@ -1243,6 +1336,9 @@ ApplicationWindow {
             if (success && operation === "catalog" && client.authenticated && window.addingConnection) {
                 window.addingConnection = false
                 window.settings = false
+                window.syncView = false
+                window.syncBookKey = ""
+                search.text = client.catalogQuery
             }
         }
     }

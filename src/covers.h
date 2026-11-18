@@ -21,7 +21,7 @@ public:
     int revision() const { return version; }
     void remove(int bookId);
     void cleanup(const QSet<int> &visible, const QSet<int> &downloaded);
-    void fetch(const QJsonArray &items);
+    void fetch(const QJsonArray &items, bool allowNetworkPrompt = true);
     void stop();
 #ifdef BOOKORBIT_TEST_HTTP
     std::shared_ptr<std::atomic<quint64>> decodes=std::make_shared<std::atomic<quint64>>(0);
@@ -44,5 +44,5 @@ private:
     QPointer<QNetworkReply> active;
     FileCancellation task;
     int version=0, generation=0;
-    bool indexDirty=false;
+    bool indexDirty=false, allowNetworkPrompt=true;
 };
