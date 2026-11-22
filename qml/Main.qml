@@ -194,7 +194,36 @@ ApplicationWindow {
     readonly property var detailFormat: (detailData.files || []).find(file => file.id === detailData.fileId) || ({})
     readonly property var pendingFormat: (detailData.files || []).find(file => file.id === pendingFileId) || ({})
     property var selectedSyncBook: ({})
-    onSyncBookKeyChanged: selectedSyncBook = client.syncBookDetails(syncBookKey)
+    readonly property var syncFiles: selectedSyncBook.files || []
+    property int selectedSyncFileId: 0
+    readonly property int selectedSyncFileIndex: syncFiles.findIndex(file => file.fileId === selectedSyncFileId)
+    readonly property var selectedSyncFile: syncFiles[selectedSyncFileIndex] || ({})
+    readonly property var syncFormatCounts: {
+        const counts = {}
+        for (const file of syncFiles) counts[file.format] = (counts[file.format] || 0) + 1
+        return counts
+    }
+    function syncFileLabel(file, includeStatus) {
+        const parts = [file.format]
+        if (includeStatus) parts.push(file.label)
+        if (syncFormatCounts[file.format] > 1) {
+            if (file.filename) parts.push(file.filename)
+            if (file.sizeLabel) parts.push(file.sizeLabel)
+        }
+        return parts.join(" · ")
+    }
+    onSyncBookKeyChanged: {
+        selectedSyncFileId = 0
+        refreshSyncBook()
+    }
+    function refreshSyncBook() {
+        const book = syncBookKey ? client.syncBookDetails(syncBookKey) : ({})
+        const files = book.files || []
+        const selected = files.find(file => file.fileId === selectedSyncFileId)
+            || files.find(file => file.state === book.state) || files[0]
+        selectedSyncFileId = selected ? selected.fileId : 0
+        selectedSyncBook = book
+    }
     readonly property bool loginRequired: !client.authenticated && !client.hasSavedSession
     property bool addingConnection: false
     property bool connectionFromSettings: false
@@ -205,7 +234,10 @@ ApplicationWindow {
 
     readonly property string uiContext: settings ? (addingConnection ? "connection" : "settings") : client.detailVisible ? "book" : syncView ? "sync" : "catalog"
     readonly property var uiMessage: client.feedback
-    readonly property bool messageVisible: (uiMessage.context === uiContext || (settings && !addingConnection && uiMessage.context === "connection")) && (!uiMessage.bookId || !client.detailVisible || uiMessage.bookId === detailData.bookId) && (!uiMessage.fileId || !client.detailVisible || uiMessage.fileId === detailData.fileId)
+    readonly property bool messageVisible: (uiMessage.context === uiContext || (settings && !addingConnection && uiMessage.context === "connection"))
+        && (!uiMessage.bookId || !client.detailVisible || uiMessage.bookId === detailData.bookId)
+        && (!uiMessage.fileId || (client.detailVisible ? uiMessage.fileId === detailData.fileId
+            : uiContext !== "sync" || !syncBookKey || uiMessage.fileId === selectedSyncFileId))
     onUiContextChanged: Qt.callLater(function() { client.setUiContext(window.uiContext) })
     onSyncViewChanged: if (syncView) client.syncFilter = "all"
     Connections { target: Qt.application; function onStateChanged() { if (Qt.application.state === Qt.ApplicationActive) client.refreshRecents() } }
@@ -286,7 +318,7 @@ ApplicationWindow {
         })
     }
     function pageContent(direction) {
-        if (formatDialog.visible || progressDialog.visible || Qt.inputMethod.visible || settings || client.busy) return
+        if (formatDialog.visible || syncFileSelector.popup.visible || progressDialog.visible || Qt.inputMethod.visible || settings || client.busy) return
         const target = client.detailVisible ? detailScroll.contentItem : syncView ? (syncBookKey ? syncDetails.contentItem : syncList) : client.collectionsView ? collectionList : activeCatalog
         const top = target.originY === undefined ? 0 : target.originY
         const bottom = top + Math.max(0, target.contentHeight-target.height)
@@ -329,6 +361,7 @@ ApplicationWindow {
     }
     function back() {
         if (formatDialog.visible) { formatDialog.close(); return }
+        if (syncFileSelector.popup.visible) { syncFileSelector.popup.close(); return }
         if (Qt.inputMethod.visible) { Qt.inputMethod.hide(); return }
         if (addingConnection) {
             addingConnection = false
@@ -496,7 +529,11 @@ ApplicationWindow {
             maximumLineCount: client.busy ? 2 : 3
             elide: Text.ElideRight
             objectName: "operationMessage"
-            text: client.libraryLoading ? qsTranslate("BookOrbit", "Loading downloaded books…") : window.messageVisible ? (window.uiMessage.text || "") : ""
+            readonly property bool shownInSyncDetails: window.uiContext === "sync" && !!window.syncBookKey
+                && window.uiMessage.fileId === window.selectedSyncFileId
+                && window.uiMessage.text === window.selectedSyncFile.reason
+            text: client.libraryLoading ? qsTranslate("BookOrbit", "Loading downloaded books…")
+                : window.messageVisible && !shownInSyncDetails ? (window.uiMessage.text || "") : ""
             visible: text.length > 0
             font.pixelSize: 15 * window.u
             font.bold: client.busy
@@ -862,27 +899,85 @@ ApplicationWindow {
             ColumnLayout {
                 width: syncDetails.availableWidth; spacing: 16 * window.u
                 Text { text: window.selectedSyncBook.title || qsTranslate("BookOrbit", "Book unavailable"); textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 24 * window.u; font.bold: true }
-                Repeater {
-                    model: window.selectedSyncBook.files || []
-                    ColumnLayout {
-                        required property var modelData
-                        Layout.fillWidth: true; spacing: 12 * window.u
-                        Text { text: modelData.filename || modelData.format; textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere; font.pixelSize: 15 * window.u; color: "#444444" }
-                        Text { objectName: "syncState-" + modelData.fileId; text: modelData.label; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 21 * window.u; font.bold: true }
-                        Text { text: modelData.reason; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 18 * window.u }
-                        Text { text: modelData.checkedAt ? qsTranslate("BookOrbit", "Last attempt: ") + modelData.checkedAt : ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
-                        Action { objectName: "choosePosition-" + modelData.fileId; visible: modelData.state === "conflict"; text: qsTranslate("BookOrbit", "Choose position"); Layout.fillWidth: true; enabled: !client.busy; onClicked: client.inspectConflict(modelData.fileId) }
-                        Action { visible: modelData.state === "network"; text: qsTranslate("BookOrbit", "Connect to network"); Layout.fillWidth: true; enabled: !client.busy; onClicked: client.connectForSync() }
-                        Action { objectName: "retrySync-" + modelData.fileId; text: modelData.state === "synced" ? qsTranslate("BookOrbit", "Check again") : qsTranslate("BookOrbit", "Retry sync"); visible: modelData.state !== "file"; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.syncFile(modelData.fileId) }
-                        Action { text: modelData.state === "file" ? qsTranslate("BookOrbit", "Open file details") : qsTranslate("BookOrbit", "About this book"); Layout.fillWidth: true; enabled: !client.busy; onClicked: client.showSyncFile(modelData.fileId) }
-                        Action { text: qsTranslate("BookOrbit", "Read locally"); visible: modelData.available; Layout.fillWidth: true; enabled: !client.busy; onClicked: { client.showSyncFile(modelData.fileId); client.openSelected(false) } }
-                        Rectangle { Layout.fillWidth: true; height: 1; color: "#aaaaaa" }
+                Choice {
+                    id: syncFileSelector
+                    objectName: "syncFileSelector"
+                    visible: window.syncFiles.length > 1
+                    Layout.fillWidth: true; Layout.minimumWidth: 0
+                    enabled: !client.busy
+                    function bindSelection() { currentIndex = Qt.binding(function() { return window.selectedSyncFileIndex }) }
+                    onModelChanged: Qt.callLater(bindSelection)
+                    model: window.syncFiles.map(file => window.syncFileLabel(file, true))
+                    currentIndex: window.selectedSyncFileIndex
+                    displayText: qsTranslate("BookOrbit", "Format: ") + window.syncFileLabel(window.selectedSyncFile, false)
+                    Accessible.name: displayText
+                    contentItem: Text {
+                        text: syncFileSelector.displayText
+                        textFormat: Text.PlainText
+                        font: syncFileSelector.font
+                        color: syncFileSelector.enabled ? "black" : "#777777"
+                        verticalAlignment: Text.AlignVCenter
+                        elide: Text.ElideMiddle
                     }
+                    onActivated: index => {
+                        window.selectedSyncFileId = window.syncFiles[index].fileId
+                        bindSelection()
+                    }
+                    delegate: ItemDelegate {
+                        id: syncFileOption
+                        required property string modelData
+                        required property int index
+                        objectName: "syncFileOption-" + index
+                        width: syncFileSelector.width
+                        implicitHeight: Math.max(48 * window.u, contentItem.implicitHeight + topPadding + bottomPadding)
+                        text: modelData
+                        font.pixelSize: 16 * window.u
+                        highlighted: syncFileSelector.highlightedIndex === index
+                        Accessible.name: text
+                        background: Rectangle { color: syncFileOption.highlighted || syncFileOption.down ? "black" : "white" }
+                        contentItem: Text {
+                            text: syncFileOption.text
+                            textFormat: Text.PlainText
+                            wrapMode: Text.Wrap
+                            verticalAlignment: Text.AlignVCenter
+                            font: syncFileOption.font
+                            color: syncFileOption.highlighted || syncFileOption.down ? "white" : "black"
+                        }
+                    }
+                }
+                ColumnLayout {
+                    id: syncFileDetails
+                    readonly property var file: window.selectedSyncFile
+                    visible: !!syncFileDetails.file.fileId
+                    Layout.fillWidth: true; spacing: 12 * window.u
+                    Text {
+                        visible: window.syncFiles.length === 1
+                        text: qsTranslate("BookOrbit", "Format: ") + (syncFileDetails.file.format || "")
+                        textFormat: Text.PlainText; Layout.fillWidth: true; wrapMode: Text.Wrap
+                        font.pixelSize: 15 * window.u; color: "#444444"
+                    }
+                    Text { objectName: "syncState-" + syncFileDetails.file.fileId; text: syncFileDetails.file.label || ""; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 21 * window.u; font.bold: true }
+                    Text { text: syncFileDetails.file.reason || ""; textFormat: Text.PlainText; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 18 * window.u }
+                    Text { text: syncFileDetails.file.checkedAt ? qsTranslate("BookOrbit", "Last attempt: ") + syncFileDetails.file.checkedAt : ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
+                    Action { objectName: "choosePosition-" + syncFileDetails.file.fileId; visible: syncFileDetails.file.state === "conflict"; text: qsTranslate("BookOrbit", "Choose position"); Layout.fillWidth: true; checked: true; enabled: !client.busy; onClicked: client.inspectConflict(syncFileDetails.file.fileId) }
+                    Action { objectName: "syncConnectNetwork-" + syncFileDetails.file.fileId; visible: syncFileDetails.file.state === "network"; text: qsTranslate("BookOrbit", "Connect to network"); Layout.fillWidth: true; enabled: !client.busy; onClicked: client.connectForSync() }
+                    Action { objectName: "retrySync-" + syncFileDetails.file.fileId; text: qsTranslate("BookOrbit", "Sync reading position"); visible: syncFileDetails.file.state !== "file" && syncFileDetails.file.state !== "conflict"; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.syncFile(syncFileDetails.file.fileId) }
+                    Action {
+                        objectName: "syncAbout-" + syncFileDetails.file.fileId
+                        text: syncFileDetails.file.state === "file" ? qsTranslate("BookOrbit", "Open file details") : qsTranslate("BookOrbit", "About this book")
+                        Layout.fillWidth: true; enabled: !client.busy
+                        onClicked: {
+                            window.fullDescription = false
+                            client.showSyncFile(syncFileDetails.file.fileId)
+                            detailScroll.contentItem.contentY = 0
+                        }
+                    }
+                    Action { objectName: "syncReadLocal-" + syncFileDetails.file.fileId; text: qsTranslate("BookOrbit", "Read locally"); visible: !!syncFileDetails.file.available; Layout.fillWidth: true; enabled: !client.busy; onClicked: client.openFile(syncFileDetails.file.fileId, false) }
                 }
             }
         }
         Text { visible: window.syncView && !window.settings && !client.detailVisible && !window.syncBookKey && window.syncData.unsupported > 0; text: qsTranslate("BookOrbit", "Other books without position sync support: ") + window.syncData.unsupported; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
-        Action { objectName: "syncAllStatusButton"; visible: window.syncView && !window.settings && !client.detailVisible && !window.syncBookKey; text: client.busy ? qsTranslate("BookOrbit", "Syncing books…") : qsTranslate("BookOrbit", "Sync now"); Layout.fillWidth: true; checked: true; enabled: !client.busy && client.authenticated && window.syncData.total > 0; onClicked: client.syncAll() }
+        Action { objectName: "syncAllStatusButton"; visible: window.syncView && !window.settings && !client.detailVisible && !window.syncBookKey; text: client.busy ? qsTranslate("BookOrbit", "Syncing books…") : qsTranslate("BookOrbit", "Sync all books"); Layout.fillWidth: true; checked: true; enabled: !client.busy && client.authenticated && window.syncData.total > 0; onClicked: client.syncAll() }
         Text { objectName: "batchProgress"; visible: client.syncBatch.running; text: qsTranslate("BookOrbit", "Files completed: ") + client.syncBatch.completed + qsTranslate("BookOrbit", " of ") + client.syncBatch.total; Layout.fillWidth: true; font.pixelSize: 16 * window.u }
         Action {
             objectName: "stopSync"; visible: client.syncBatch.running; Layout.fillWidth: true
@@ -1130,10 +1225,10 @@ ApplicationWindow {
                 }
                 Text { text: !window.detailData.supported && window.detailData.format ? qsTranslate("BookOrbit", "The file exceeds the 100 MiB download limit.") : !window.detailData.readable && window.detailData.format ? qsTranslate("BookOrbit", "Available to download; opening this format from the app is not supported yet.") : window.detailData.format && window.detailData.format !== "EPUB" && window.detailData.format !== "FB2" ? qsTranslate("BookOrbit", "Position sync is not supported for this format yet.") : window.detailData.format === "FB2" ? qsTranslate("BookOrbit", "Experimental FB2 sync: prose books, including covers and long sections. Unsupported structures keep their progress unchanged.") : ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u }
                 Text { objectName: "fileCheckResult"; text: window.detailData.remoteFileChanged ? qsTranslate("BookOrbit", "The server file differs. Progress sync is paused") : window.detailData.syncResult || ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
-                Text { text: window.detailData.hasConflict ? qsTranslate("BookOrbit", "The reader and BookOrbit have different positions. Check again and choose the one to use.") : window.detailData.pendingProgress ? qsTranslate("BookOrbit", "The incoming position has not been applied yet. Close all books in the built-in reader and check again.") : ""; visible: !window.detailData.remoteFileChanged && text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
+                Text { text: window.detailData.hasConflict ? qsTranslate("BookOrbit", "The reader and BookOrbit have different positions. Choose which position to use.") : window.detailData.pendingProgress ? qsTranslate("BookOrbit", "The incoming position has not been applied yet. Close all books in the built-in reader and sync again.") : ""; visible: !window.detailData.remoteFileChanged && text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 16 * window.u }
                 Action { objectName: "redownloadButton"; text: qsTranslate("BookOrbit", "Download again"); visible: !!window.detailData.remoteFileChanged; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.downloadSelected() }
                 Action { objectName: "readReaderPosition"; text: qsTranslate("BookOrbit", "Read from reader position"); visible: !!window.detailData.hasConflict && !!window.detailData.readable && !!window.detailData.downloaded; Layout.fillWidth: true; enabled: !client.busy; onClicked: client.openSelected(false) }
-                Action { objectName: "reconcilePositions"; text: qsTranslate("BookOrbit", "Compare positions"); visible: !!window.detailData.canSync; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.syncSelected() }
+                Action { objectName: "reconcilePositions"; text: qsTranslate("BookOrbit", "Sync reading position"); visible: !!window.detailData.canSync; Layout.fillWidth: true; enabled: !client.busy && client.authenticated; onClicked: client.syncSelected() }
                 Text { text: window.detailData.notice || ""; visible: text.length > 0; Layout.fillWidth: true; wrapMode: Text.Wrap; font.pixelSize: 14 * window.u; color: "#444444" }
                 Text {
                     id: description
@@ -1322,7 +1417,7 @@ ApplicationWindow {
             window.restoreBrowseView(null)
         }
         function onSyncSummaryChanged() {
-            window.selectedSyncBook = client.syncBookDetails(window.syncBookKey)
+            window.refreshSyncBook()
             if (window.syncBookKey && !window.selectedSyncBook.key) window.syncBookKey = ""
         }
         function onSyncBatchChanged() {

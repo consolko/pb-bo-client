@@ -298,6 +298,37 @@ int main(int argc, char **argv) {
     auto setFault = [&](const QByteArray &mode) {
         require(fault.open(QIODevice::WriteOnly) && fault.write(mode)==mode.size(), "set verification fixture mode"); fault.close();
     };
+    auto pickSyncFile = [&](int index) {
+        const auto selector = item("syncFileSelector");
+        require(selector && selector->isVisible() &&
+                QMetaObject::invokeMethod(selector, "activated", Q_ARG(int, index)), "pick a file in the sync selector");
+        settle();
+    };
+    auto syncOptions = [&] {
+        const auto selector = item("syncFileSelector");
+        require(selector && selector->isVisible(), "file selector displayed");
+        QStringList options;
+        for (int index = 0; index < selector->property("count").toInt(); ++index) {
+            QString label;
+            require(QMetaObject::invokeMethod(selector, "textAt", Q_RETURN_ARG(QString, label), Q_ARG(int, index)),
+                    "read displayed file option");
+            options.append(label);
+        }
+        return options;
+    };
+    auto visible = [&](const char *name) {
+        const auto control = item(name);
+        return control && control->isVisible();
+    };
+    tap("navigationButton"); settle();
+    tap("syncButton"); settle();
+    tap("syncBook-book:1"); settle();
+    require(visible("syncDetails") && visible("syncState-202") && !visible("syncFileSelector") &&
+            visible("retrySync-202") && item("retrySync-202")->property("text").toString()=="Синхронизировать позицию" &&
+            !visible("syncState-201"),
+            "one eligible FB2 opens directly even with a downloaded PDF beside it");
+    tap("navigationButton"); settle();
+    tap("navigationButton"); settle();
     auto reveal = [&](const char *scrollName, const char *targetName) {
         auto scroll=item(scrollName);
         auto flick=qvariant_cast<QObject *>(scroll->property("contentItem"));
@@ -333,29 +364,82 @@ int main(int argc, char **argv) {
     reveal("detailScroll","redownloadButton"); capture("library-check-mismatch");
     setFault("features");
     require(wait(client,[&] { tap("redownloadButton"); }) && !client.detail()["remoteFileChanged"].toBool(), "card redownload action clears verified mismatch");
+    const auto epubPath = destination+"/"+ClientWorkerCheck::record(client, "101").value("filename").toString();
     client.closeDetail(); client.showDownloaded(true); settle();
     tap("syncButton"); settle();
     require(item("syncList")->isVisible() && item("syncList")->property("count").toInt()==1 && client.syncSummary()["total"].toInt()==1,
-            "sync list opens with one EPUB book, independently of catalog and other formats");
+            "sync list groups the downloaded EPUB and FB2 into one book and excludes PDF");
     capture("sync-list");
     require(QMetaObject::invokeMethod(item("syncFilter"),"activated",Q_ARG(int,3)),"select synced in native combo"); settle();
     require(item("syncList")->property("count").toInt()==0, "unverified book does not appear under synchronized filter");
     require(QMetaObject::invokeMethod(item("syncFilter"),"activated",Q_ARG(int,1)),"select waiting in native combo"); settle();
     require(item("syncList")->property("count").toInt()==1, "waiting filter exposes the unverified book");
     require(QMetaObject::invokeMethod(item("syncFilter"),"activated",Q_ARG(int,0)),"select all in native combo"); settle(); tap("syncBook-book:1"); settle();
-    require(item("syncDetails")->isVisible() && item("syncState-101")->property("text").toString()=="Ещё не проверено", "book opens file-specific sync actions");
+    require(visible("syncDetails") && visible("syncFileSelector") && syncOptions().size()==2 &&
+            syncOptions().filter("EPUB").size()==1 && syncOptions().filter("FB2").size()==1 &&
+            !syncOptions().join(" ").contains(".epub") && !syncOptions().join(" ").contains(".fb2"),
+            "different formats show compact choices with no duplicate filename information");
+    const auto epubOption = QString("syncFileOption-%1").arg(syncOptions().indexOf(syncOptions().filter("EPUB").first())).toLatin1();
+    tap("syncFileSelector"); settle();
+    capture("sync-formats-open");
+    tap(epubOption.constData()); settle();
+    require(visible("syncState-101") && !visible("syncState-202"), "only the selected EPUB exposes sync status");
     capture("sync-details");
-    // Seed only this test account's own journal; no native reader database is changed.
+    reveal("syncDetails", "syncAbout-101");
+    tap("syncAbout-101"); settle();
+    require(client.detailVisible() && client.detail()["fileId"].toInt()==101, "About opens the selected EPUB");
+    tap("navigationButton"); settle();
+    require(visible("syncDetails") && visible("syncState-101"), "returning from About keeps the selected EPUB");
+    tap("navigationButton"); settle();
+    tap("navigationButton"); settle();
+    require(wait(client,[&] { client.showDownloaded(false); }) && wait(client,[&] { client.showDetail(1); }),
+            "load details for a second EPUB");
+    client.selectFile(203);
+    require(wait(client,[&] { client.downloadSelected(); }), "download a second EPUB without replacing the first EPUB or FB2");
+    client.closeDetail(); client.showDownloaded(true); settle();
+    // Set up contrasting states in the isolated account journal.
     const auto key=QCryptographicHash::hash((client.server()+"\n"+client.username()).toUtf8(),QCryptographicHash::Sha256).toHex().left(24);
+    QFile duplicateRecord(root+"/"+QString::fromLatin1(key)+"/records/203.json");
+    require(duplicateRecord.open(QIODevice::ReadOnly), "read second EPUB download record");
+    auto duplicate = QJsonDocument::fromJson(duplicateRecord.readAll()).object(); duplicateRecord.close();
+    duplicate.remove("syncStatus");
+    duplicate.remove("progress");
+    require(duplicateRecord.open(QIODevice::WriteOnly|QIODevice::Truncate) &&
+            duplicateRecord.write(QJsonDocument(duplicate).toJson())>0, "seed unverified second EPUB"); duplicateRecord.close();
     QFile recordFile(root+"/"+QString::fromLatin1(key)+"/records/101.json");
     require(recordFile.open(QIODevice::ReadOnly), "read isolated download record");
     auto record=QJsonDocument::fromJson(recordFile.readAll()).object(); recordFile.close();
     record["progress"]=QJsonObject{{"profile",readerProfile()},{"conflictLocal","epubcfi(/6/2!/4/14/1:0)"},
         {"conflictRemote",QJsonObject{{"cfi","epubcfi(/6/2!/4/42/1:0)"},{"percentage",40},{"pageNumber",QJsonValue::Null}}}};
     require(recordFile.open(QIODevice::WriteOnly|QIODevice::Truncate) && recordFile.write(QJsonDocument(record).toJson())>0, "seed isolated conflict"); recordFile.close();
+    tap("syncButton"); settle();
     require((client.configure(client.server(),client.username()) && waitForLibrary(client)), "reload saved conflict without network authentication"); settle();
     require(item("syncList")->isVisible(), "reloading the account restores the sync list");
     tap("syncBook-book:1"); settle();
+    const auto duplicateOptions = syncOptions();
+    const auto epubs = duplicateOptions.filter("EPUB");
+    require(duplicateOptions.size()==3 && epubs.size()==2 && epubs[0]!=epubs[1] &&
+            epubs.filter("Первое издание.epub").size()==1 && epubs.filter("Другое издание.epub").size()==1 &&
+            epubs.filter("КБ").size()==2 && epubs.filter("Ещё не проверено").size()==1 &&
+            visible("choosePosition-101") && !visible("retrySync-101") && !visible("syncState-203"),
+            "duplicate EPUB choices show names, sizes and different statuses while the card shows one action group");
+    const auto secondEpub = duplicateOptions.indexOf(epubs.filter("Другое издание.epub").first());
+    const auto firstEpub = duplicateOptions.indexOf(epubs.filter("Первое издание.epub").first());
+    const auto selectedLabel = item("syncFileSelector")->property("displayText").toString();
+    require(selectedLabel.contains("Первое издание.epub") && selectedLabel.contains("КБ") &&
+            !selectedLabel.contains(item("syncState-101")->property("text").toString()),
+            "the closed selector identifies the edition without repeating the card status");
+    tap("syncFileSelector"); settle(); capture("sync-editions-open");
+    const auto alternateOption = QString("syncFileOption-%1").arg(secondEpub).toLatin1();
+    tap(alternateOption.constData()); settle();
+    require(visible("retrySync-203") && visible("syncReadLocal-203") && !visible("choosePosition-101"),
+            "choosing the second EPUB switches all actions to that edition");
+    capture("sync-edition-selected");
+    reveal("syncDetails", "syncAbout-203"); tap("syncAbout-203"); settle();
+    require(client.detailVisible() && client.detail()["fileId"].toInt()==203, "About uses the chosen duplicate EPUB file ID");
+    tap("navigationButton"); settle();
+    require(visible("syncDetails") && visible("syncState-203"), "return from About keeps the chosen duplicate EPUB");
+    pickSyncFile(firstEpub);
     tap("choosePosition-101"); settle();
     require(!item("conflictLoginButton")->isVisible() && !item("loginButton")->isVisible(),
             "saved session does not offer redundant login in conflict or screen header");
@@ -366,6 +450,20 @@ int main(int argc, char **argv) {
     tap("deferConflict"); settle();
     require(!client.progressConflict() && client.syncBooks()[0].toMap()["state"]=="conflict", "later closes the dialog but retains the conflict");
     require(wait(client,[&] { client.restoreSession(); }), "restore test session for conflict controls");
+    auto progressRequests = [&] {
+        QFile counts(QFileInfo(fault).dir().filePath("requests.json"));
+        require(counts.open(QIODevice::ReadOnly), "read isolated fixture request counts");
+        const auto requests = QJsonDocument::fromJson(counts.readAll());
+        require(requests.isObject(), "fixture request counts are valid");
+        const auto object = requests.object();
+        return qMakePair(object.value("GET /api/v1/books/files/101/progress").toInt(),
+                         object.value("POST /api/v1/books/files/101/progress").toInt());
+    };
+    require(recordFile.open(QIODevice::ReadOnly), "read conflict journal before Later");
+    const auto conflictJournal = recordFile.readAll(); recordFile.close();
+    const auto requestsBeforeDeferring = progressRequests();
+    QString positionBeforeDeferring;
+    require(waitUntil([&] { return readerPosition(epubPath, &positionBeforeDeferring); }), "native EPUB position available");
     tap("choosePosition-101"); settle();
     require(!item("applyConflict")->isEnabled(), "reopening conflict clears the old radio selection");
     tap("conflictRemote"); settle();
@@ -392,7 +490,28 @@ int main(int argc, char **argv) {
             tap("conflictRemote"); settle();
         }
     }
-    tap("navigationButton"); settle(); capture("sync-list-conflict");
+    QString positionAfterDeferring;
+    require(recordFile.open(QIODevice::ReadOnly), "read conflict journal after Later");
+    require(recordFile.readAll()==conflictJournal && progressRequests()==requestsBeforeDeferring &&
+            readerPosition(epubPath, &positionAfterDeferring) &&
+            positionAfterDeferring==positionBeforeDeferring,
+            "Later keeps the journal and native position unchanged and sends no progress request");
+    recordFile.close();
+    pickSyncFile(secondEpub);
+    bool retryCompleted = false;
+    reveal("syncDetails", "retrySync-203");
+    waitForClient(client, [&] { tap("retrySync-203"); }, &retryCompleted);
+    settle();
+    require(retryCompleted && client.feedback()["fileId"].toInt()==203 && !client.detailVisible() &&
+            visible("syncDetails") && visible("syncState-203") &&
+            !visible("syncState-101") && item("syncState-203")->property("text").toString()!="Ещё не проверено",
+            "sync targets the second EPUB and the refreshed card keeps that file selected");
+    if (client.progressConflict()) {
+        tap("deferConflict"); settle();
+    }
+    tap("navigationButton"); settle();
+    require(visible("syncList") && !visible("syncDetails"), "back from a reading position returns to the sync list");
+    capture("sync-list-conflict");
     tap("navigationButton"); settle();
     require(item("catalog")->isVisible() && !item("syncList")->isVisible(), "back restores the downloaded library");
     require(client.syncModel()->rowCount() == client.syncBooks().size() && !client.syncSummary().contains("books"),
@@ -462,15 +581,29 @@ int main(int argc, char **argv) {
     const double blockedY=item("catalog")->property("contentY").toDouble();
     QMetaObject::invokeMethod(window,"pageContent",Q_ARG(QVariant,1)); settle();
     require(item("catalog")->property("contentY").toDouble()==blockedY,"format dialog has priority over page navigation");
-    tap("file-205"); tap("formatConfirm"); setFault("features");
+    const auto downloadOnlyFormat = item("file-205");
+    require(downloadOnlyFormat, "download-only format has a delegate");
+    auto formatsView = downloadOnlyFormat->parentItem();
+    while (formatsView && !formatsView->property("contentY").isValid()) formatsView = formatsView->parentItem();
+    require(formatsView && QMetaObject::invokeMethod(formatsView, "positionViewAtEnd"), "scroll to the last format option");
+    settle();
+    tap("file-205");
+    require(window->property("pendingFileId").toInt()==205, "touch selects the download-only format");
+    tap("formatConfirm"); setFault("features");
+    require(client.detail()["fileId"].toInt()==205, "format confirmation selects the download-only file");
+    reveal("detailScroll", "downloadButton");
     require(wait(client,[&] { tap("downloadButton"); }) && !item("downloadButton")->isVisible(),"download-only format never offers an active reading button");
     capture("download-only"); client.closeDetail(); client.showDownloaded(true); settle();
     tap("syncButton"); settle();
     QMetaObject::invokeMethod(item("syncFilter"),"activated",Q_ARG(int,1)); settle(); setFault("slow_progress");
+    require(item("syncList")->property("count").toInt()==0 && item("syncAllStatusButton")->isEnabled() &&
+            item("syncAllStatusButton")->property("text").toString()=="Синхронизировать все книги",
+            "batch action advertises all books and remains available when the current filter shows none");
     require(!wait(client,[&] {
         tap("syncAllStatusButton");
         QTimer::singleShot(100,&client,[&] {
-            require(client.syncBatch()["running"].toBool() && item("stopSync")->isVisible(),"stop control appears during the native QML batch");
+            require(client.syncBatch()["running"].toBool() && client.syncBatch()["total"].toInt()==3 &&
+                    item("stopSync")->isVisible(), "batch queues all three eligible files from the filtered-out book");
             require(window->grabWindow().save(root+"/sync-running.png"),"capture running batch");
             tap("stopSync"); require(!item("stopSync")->isEnabled(),"repeated stop is disabled");
         });
@@ -488,7 +621,9 @@ int main(int argc, char **argv) {
     require((client.configure(client.server(),client.username()) && waitForLibrary(client)),"reload pending state"); client.showSyncFile(101); settle();
     require(!item("loginButton")->isVisible() && !item("syncButton")->isEnabled(), "saved session in book details hides login while sync waits for authorization");
     capture("signed-out-details");
-    require(item("downloadButton")->property("text").toString()=="Читать с позиции ридера" && item("reconcilePositions")->isVisible(),"pending card exposes local reading and a separate reconciliation action");
+    require(item("downloadButton")->property("text").toString()=="Читать с позиции ридера" && visible("reconcilePositions") &&
+            item("reconcilePositions")->property("text").toString()=="Синхронизировать позицию",
+            "pending card exposes local reading and a separate single-file sync action");
     capture("card-pending");
     record["progress"]=QJsonObject{{"profile",readerProfile()},{"conflictLocal","epubcfi(/6/2!/4/14/1:0)"},
         {"conflictRemote",QJsonObject{{"cfi","epubcfi(/6/2!/4/42/1:0)"},{"percentage",40}}}};
@@ -507,7 +642,9 @@ int main(int argc, char **argv) {
     require(item("bookAction-2")->property("text").toString() == "Read" &&
             item("reading-2")->property("text").toString() == "In BookOrbit: read", "English reading action and completed status keep their labels");
     client.showSyncFile(101); settle();
-    require(item("downloadButton")->property("text").toString()=="Choose position", "English book action after live retranslation");
+    require(item("downloadButton")->property("text").toString()=="Choose position" && visible("reconcilePositions") &&
+            item("reconcilePositions")->property("text").toString()=="Sync reading position",
+            "English book actions after live retranslation");
     capture("card-conflict-en");
     detailFlick->setProperty("contentY",detailFlick->property("contentY").toDouble()+item("downloadButton")->mapToItem(detailFlick,QPointF()).y()-20); settle();
     tap("downloadButton"); settle();
@@ -519,10 +656,28 @@ int main(int argc, char **argv) {
     client.setSyncFilter("all"); settle();
     require(item("syncFilter")->property("currentIndex").toInt()==0 && item("syncList")->property("count").toInt()==client.syncSummary()["total"].toInt(),
         "all-groups selector and visible model agree after retranslation");
-    require(client.syncBookDetails("book:1").value("label").toString()=="Choose a position","sync model retranslates its cached status labels");
+    require(client.syncBookDetails("book:1").value("label").toString()=="Positions differ","sync model retranslates its cached status labels");
+    require(item("syncAllStatusButton")->property("text").toString()=="Sync all books", "batch scope is explicit in English");
+    tap("syncBook-book:1"); settle();
+    require(visible("choosePosition-101") && item("choosePosition-101")->property("text").toString()=="Choose position" &&
+            syncOptions().filter("EPUB · Positions differ").size()==1 && syncOptions().filter("KiB").size()==2,
+            "English file choices and the selected conflict action retranslate");
     capture("sync-en");
+    const auto englishOptions = syncOptions();
+    pickSyncFile(englishOptions.indexOf(englishOptions.filter("FB2").first()));
+    require(visible("retrySync-202") && item("retrySync-202")->property("text").toString()=="Sync reading position",
+            "English sync card names the single-file action");
 
     std::printf("PDF=%s\nFB2=%s\n", qPrintable(pdfPath), qPrintable(fb2Path));
     require(warnings == 0, "no QML warnings during navigation and downloads");
     if (argc > 3) { QTimer::singleShot(180000, &app, &QCoreApplication::quit); return app.exec(); }
+    // The stock reader takes focus, so leave this check until the end.
+    pickSyncFile(englishOptions.indexOf(englishOptions.filter("Другое издание.epub").first()));
+    reveal("syncDetails", "syncReadLocal-203");
+    bool opened = false;
+    QObject::connect(&client, &Client::completed, &app, [&](const QString &operation, bool success) {
+        if (operation=="open") opened = success;
+    });
+    require(wait(client,[&] { tap("syncReadLocal-203"); }) && opened && client.feedback()["fileId"].toInt()==203,
+            "Read locally dispatches the selected EPUB to the stock reader");
 }

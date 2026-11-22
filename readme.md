@@ -61,9 +61,11 @@ In **Settings** → **Interface language**, choose **English**, **Русский
 <a id="sync"></a>
 ## Position sync
 
-Close books in the built-in reader, return to the app and open **Sync**, then tap **Sync now**. To sync a single EPUB or FB2, use **Compare positions** in its details. **The Home button does not close a book.** After receiving a position, open the book as usual.
+Close books in the built-in reader and return to the app. **The Home button does not close a book.** To sync the entire current connection, open **Sync** and tap **Sync all books**. The status filters affect the list only. The batch includes all downloaded files that support position sync for the current connection.
 
-When positions conflict, choose **Use reader position** or **Use BookOrbit position**. After syncing multiple books, review their results in the sync view. Open a conflicting book to compare and choose its position.
+For a single EPUB or supported FB2, use **Sync reading position** in the book details. You can also open a book from the **Sync** list and select the file you want to sync. After receiving a position, open the book as usual.
+
+Review batch results in **Sync**. For a conflict, open the book, select the affected file and tap **Choose position**. Then select **Use reader position** or **Use BookOrbit position**. Tap **Decide later** to keep both positions and return to the conflict later.
 
 Limitations:
 

@@ -77,6 +77,13 @@ QString fileFormat(const QJsonObject &file) {
         "doc", "docx", "html", "htm", "chm", "cbz", "cbr", "cb7", "cbx", "m4b", "mp3", "m4a", "opus", "ogg", "flac"};
     return formats.contains(format) ? format : QString{};
 }
+QString fileSizeLabel(const QJsonValue &size) {
+    const double bytes = size.toDouble(-1);
+    if (bytes < 0) return {};
+    if (bytes < 1024) return QString::number(bytes, 'f', 0) + QCoreApplication::translate("BookOrbit", " B");
+    if (bytes < 1024 * 1024) return QString::number(bytes / 1024, 'f', 0) + QCoreApplication::translate("BookOrbit", " KiB");
+    return QString::number(bytes / (1024 * 1024), 'f', 1) + QCoreApplication::translate("BookOrbit", " MiB");
+}
 QJsonArray bookFiles(const QJsonObject &book) {
     QJsonArray result;
     QSet<int> seen;
@@ -1113,17 +1120,17 @@ QVariantMap Client::syncFileStatus(const QString &id, const QString &profile,Loc
     else if (progressProfile && progress["outgoing"].isObject()) state="uncertain";
     else if (progressProfile && progress["pending"].isObject() && (state=="synced" || state=="unknown")) state="pending";
     const QMap<QString,QString> labels{
-        {"synced",QCoreApplication::translate("BookOrbit", "Synced")},{"conflict",QCoreApplication::translate("BookOrbit", "Choose a position")},{"reader",QCoreApplication::translate("BookOrbit", "Close the reader")},
+        {"synced",QCoreApplication::translate("BookOrbit", "Synced")},{"conflict",QCoreApplication::translate("BookOrbit", "Positions differ")},{"reader",QCoreApplication::translate("BookOrbit", "Close the reader")},
         {"reader_unknown",QCoreApplication::translate("BookOrbit", "Could not check the reader")},{"network",QCoreApplication::translate("BookOrbit", "Waiting for network")},
         {"pending",QCoreApplication::translate("BookOrbit", "Position not applied yet")},{"uncertain",QCoreApplication::translate("BookOrbit", "Result needs verification")},
         {"unknown",QCoreApplication::translate("BookOrbit", "Not checked yet")},{"auth",QCoreApplication::translate("BookOrbit", "Sign in to BookOrbit")},{"file",QCoreApplication::translate("BookOrbit", "Check the book file")},
         {"position",QCoreApplication::translate("BookOrbit", "Could not match the position")},{"error",QCoreApplication::translate("BookOrbit", "Could not sync")}};
     if (!labels.contains(state)) state="unknown";
     if (state=="network") reason=QCoreApplication::translate("BookOrbit", "Connect to a network and retry sync");
-    if (state=="unknown") reason=QCoreApplication::translate("BookOrbit", "Run sync to check the position status.");
+    if (state=="unknown") reason=QCoreApplication::translate("BookOrbit", "Sync can update the reading position on this PocketBook or in BookOrbit.");
     const auto at=QDateTime::fromString(saved["at"].toString(),Qt::ISODate).toLocalTime();
     return {{"fileId",id.toInt()},{"filename",book["selectedFile"].toObject()["filename"].toString(record["filename"].toString())},
-        {"format",record["format"].toString("epub").toUpper()},
+        {"format",record["format"].toString("epub").toUpper()},{"sizeLabel",fileSizeLabel(record["bytes"])},
         {"state",state},{"label",labels[state]},{"reason",reason},{"available",available},
         {"checkedAt",sameProfile && at.isValid() ? at.toString("dd.MM.yyyy HH:mm") : QString{}}};
 }
@@ -1316,8 +1323,7 @@ QVariantMap Client::detail() const {
         const auto info = fileSummary(book);
         for (const auto key : {"downloaded", "readable", "supported", "needsRepair", "remoteFileChanged", "syncResult"}) file[key] = info[key];
         file["format"] = fileFormat(value.toObject()).toUpper();
-        const double bytes = value.toObject()["sizeBytes"].toDouble(-1);
-        file["sizeLabel"] = bytes < 0 ? QString{} : bytes < 1024 ? QString::number(bytes, 'f', 0)+QCoreApplication::translate("BookOrbit", " B") : bytes < 1024*1024 ? QString::number(bytes/1024, 'f', 0)+QCoreApplication::translate("BookOrbit", " KiB") : QString::number(bytes/(1024*1024), 'f', 1)+QCoreApplication::translate("BookOrbit", " MiB");
+        file["sizeLabel"] = fileSizeLabel(value.toObject()["sizeBytes"]);
         files.append(file);
     }
     result["files"] = files;
@@ -2950,9 +2956,9 @@ void Client::finishBookProgress(int bookId,const QJsonValue &readStatus,const QJ
     updatePage(collectionsBrowsePage.items);
     for (auto &saved : browseHistory) {
         updatePage(saved.page.items);
-        if (saved.detail["id"].toInt() == bookId) saved.detail = update(saved.detail);
+        if (saved.detail.value("id").toInt() == bookId) saved.detail = update(saved.detail);
     }
-    if (detailBook["id"].toInt()==bookId) { detailBook=update(detailBook); detailPending=true; }
+    if (detailBook.value("id").toInt()==bookId) { detailBook=update(detailBook); detailPending=true; }
     invalidateBook(bookId,false);
     dismissConflict();
     finish(saved ? text : uiMessage("details_received_but_not_saved_for_offline_use"),saved,"progress");

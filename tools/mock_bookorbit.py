@@ -93,9 +93,11 @@ def library_books():
     books = [dict(book, files=list(book["files"])) for book in BOOKS]
     books[0].update(title="Очень длинное название тестовой книги для проверки переноса на две строки",
                     readStatus={"status": "reading"}, readingProgress=37.5)
+    books[0]["files"][0] = dict(books[0]["files"][0], filename="Первое издание.epub")
     books[1].update(authors=[], readStatus={"status": "read"}, readingProgress=100)
     books[2].update(readStatus={"status": "reading"}, readingProgress="42")
-    books[0]["files"] += [{"id": i, "format": fmt, "role": "content", "filename": f"Тестовая книга.{fmt}", "sizeBytes": len(raw)}
+    books[0]["files"] += [{"id": i, "format": fmt, "role": "content",
+                           "filename": "Другое издание.epub" if i == 203 else f"Тестовая книга.{fmt}", "sizeBytes": len(raw)}
                            for i, (fmt, raw) in EXTRA_FILES.items() if i != 204]
     books[0]["files"] += [{"id": 900, "format": "opf", "role": "supplementary", "sizeBytes": 100}]
     books[1]["files"] = [{"id": 204, "format": "pdf", "role": "primary", "sizeBytes": len(pdf())}]

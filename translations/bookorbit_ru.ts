@@ -984,8 +984,8 @@ Download an EPUB from the catalog.</source>
       <translation>Повторить сверку</translation>
     </message>
     <message>
-      <source>Run sync to check the position status.</source>
-      <translation>Выполните сверку, чтобы узнать состояние позиции.</translation>
+      <source>Sync can update the reading position on this PocketBook or in BookOrbit.</source>
+      <translation>Синхронизация может обновить позицию чтения на этом PocketBook или в BookOrbit.</translation>
     </message>
     <message>
       <source>Russian</source>
@@ -1136,6 +1136,14 @@ Download an EPUB from the catalog.</source>
       <translation>Синхронизировать</translation>
     </message>
     <message>
+      <source>Sync all books</source>
+      <translation>Синхронизировать все книги</translation>
+    </message>
+    <message>
+      <source>Sync reading position</source>
+      <translation>Синхронизировать позицию</translation>
+    </message>
+    <message>
       <source>Sync stopped by user</source>
       <translation>Сверка остановлена пользователем</translation>
     </message>
@@ -1196,8 +1204,8 @@ Download an EPUB from the catalog.</source>
       <translation>Файл не поддерживается или превышает 100 МБ</translation>
     </message>
     <message>
-      <source>The incoming position has not been applied yet. Close all books in the built-in reader and check again.</source>
-      <translation>Входящая позиция ещё не применена. Закройте все книги в штатной читалке и повторите сверку.</translation>
+      <source>The incoming position has not been applied yet. Close all books in the built-in reader and sync again.</source>
+      <translation>Позиция BookOrbit ещё не применена. Закройте все книги в штатной читалке и повторите синхронизацию.</translation>
     </message>
     <message>
       <source>The incoming position has not been applied yet. Sync the position or choose Read locally.</source>
@@ -1240,8 +1248,8 @@ Download an EPUB from the catalog.</source>
       <translation>Координата распознана, но не удалось оценить процент книги для отправки. Позиции не изменены.</translation>
     </message>
     <message>
-      <source>The reader and BookOrbit have different positions. Check again and choose the one to use.</source>
-      <translation>На ридере и в BookOrbit разные позиции. Повторите сверку и выберите нужную.</translation>
+      <source>The reader and BookOrbit have different positions. Choose which position to use.</source>
+      <translation>На ридере и в BookOrbit разные позиции. Выберите нужную.</translation>
     </message>
     <message>
       <source>The reader and BookOrbit have different saved positions. Where would you like to continue?</source>
