@@ -47,7 +47,11 @@ int main(int argc, char **argv) {
     require(argc >= 3 && !screen.isEmpty(), "isolated UI check initialized");
     const QString root = QString::fromLocal8Bit(argv[1]);
     QFile fault(QString::fromLocal8Bit(argv[2]));
-    require(fault.open(QIODevice::WriteOnly) && fault.write("features") == 8, "enable synthetic multi-format library"); fault.close();
+    auto setFault = [&](const QByteArray &mode) {
+        require(fault.open(QIODevice::WriteOnly) && fault.write(mode) == mode.size(), "set fixture mode");
+        fault.close();
+    };
+    setFault("features");
     Client client(QUrl("http://host.containers.internal:8766"), root, nullptr, false); require(waitForLibrary(client),"registry snapshot loaded");
     const QString destination = "/mnt/ext1/books/BookOrbit/"+QFileInfo(root).fileName();
     require(QDir().mkpath(destination) && client.setDownloadDirectory(destination), "isolated native download destination");
@@ -278,7 +282,11 @@ int main(int argc, char **argv) {
     require(fb2Path.endsWith(".fb2") && QFile::exists(pdfPath), "native multi-format files coexist");
     capture("downloaded-detail");
     tap("navigationButton"); settle();
-    require(wait(client, [&] { tap("collectionsTab"); }), "touch loads collection list"); capture("collections");
+    setFault("collections_without_media_type");
+    require(wait(client, [&] { tap("collectionsTab"); }) && item("collectionList")->property("count").toInt() == 3,
+            "touch displays collections without mediaType in the server response");
+    capture("collections");
+    setFault("features");
     require(wait(client, [&] { tap("collection-12"); }), "touch enters public collection"); capture("collection-books");
     require(search != nullptr, "collection search field available");
     search->setProperty("text", "Автор коллекции");
@@ -295,9 +303,6 @@ int main(int argc, char **argv) {
     tap("book-1"); settle(); capture("offline-details");
     for (int i=0; i<30 && (!readerBookIndexed(pdfPath) || !readerBookIndexed(fb2Path)); ++i) settle(200);
     require(readerBookIndexed(pdfPath) && readerBookIndexed(fb2Path), "native scanner indexes PDF and FB2");
-    auto setFault = [&](const QByteArray &mode) {
-        require(fault.open(QIODevice::WriteOnly) && fault.write(mode)==mode.size(), "set verification fixture mode"); fault.close();
-    };
     auto pickSyncFile = [&](int index) {
         const auto selector = item("syncFileSelector");
         require(selector && selector->isVisible() &&

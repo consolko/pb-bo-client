@@ -1457,7 +1457,7 @@ Client::BrowseTab Client::selectedTab() const {
 }
 
 Client::BrowsePage Client::currentBrowsePage() const {
-    return {items, currentPage, count, activeCollection, committedQuery, activeCollectionName, pageAttempted};
+    return {items, currentPage, count, activeCollection, committedQuery, activeCollectionName, pageLoaded};
 }
 
 void Client::changeBrowsePage(BrowseTab tab, BrowsePage page, bool restore) {
@@ -1475,7 +1475,7 @@ void Client::changeBrowsePage(BrowseTab tab, BrowsePage page, bool restore) {
     activeCollection = page.collection;
     committedQuery = std::move(page.query);
     activeCollectionName = std::move(page.name);
-    pageAttempted = page.attempted;
+    pageLoaded = page.loaded;
     retryKind = 0;
     message.clear();
     invalidateLibrary();
@@ -1488,7 +1488,7 @@ void Client::clearNavigation() {
     libraryQuery.clear(); committedQuery.clear();
     items = {}; collectionItems = {}; detailBook = {}; browseHistory.clear();
     catalogBrowsePage = {}; collectionsBrowsePage = {};
-    pageAttempted = collectionListAttempted = tabSelected = false;
+    pageLoaded = collectionListLoaded = browseRequested = false;
     retryKind = retryPage = 0; retryQuery.clear(); retryBook = {};
     ++detailGeneration; detailMessage.clear();
     activeCollection = 0; activeCollectionName.clear(); collectionList = false;
@@ -1498,7 +1498,7 @@ void Client::clearNavigation() {
 
 void Client::selectTab(int tab) {
     if (busy() || tab < DownloadsTab || tab > CollectionsTab) return;
-    tabSelected = true;
+    browseRequested = true;
     const bool same = tab == selectedTab();
     if (!same) {
         changeBrowsePage(BrowseTab(tab), tab == CatalogTab ? catalogBrowsePage : tab == CollectionsTab ? collectionsBrowsePage : BrowsePage{});
@@ -1506,8 +1506,8 @@ void Client::selectTab(int tab) {
     if (tab == DownloadsTab) {
         refreshRecents();
     } else if (collectionList) {
-        if (same || !collectionListAttempted) loadCollections();
-    } else if (same || !pageAttempted) {
+        if (same || !collectionListLoaded) loadCollections();
+    } else if (same || !pageLoaded) {
         refresh(currentPage, committedQuery);
     }
 }
@@ -1525,12 +1525,11 @@ void Client::showCollectionList() {
     if (busy() || collectionList) return;
     browseHistory.clear();
     changeBrowsePage(CollectionsTab, {});
-    if (!collectionListAttempted) loadCollections();
+    if (!collectionListLoaded) loadCollections();
 }
 
 void Client::loadCollections() {
     beginFeedback("catalog");
-    collectionListAttempted = true;
     if (!authenticated() && hasSavedSession()) {
         restoreSessionThen([this] { loadCollections(); }, "catalog");
         return;
@@ -1547,10 +1546,12 @@ void Client::loadCollections() {
                 finish(uiMessage("the_server_returned_an_invalid_collection_list"), false, "collections"); return;
             }
             seen.insert(collection["id"].toInt());
-            if (collection["mediaType"] == "books") parsed.append(collection);
+            // BookOrbit 3.7 removed mediaType along with podcast collections.
+            if (!collection.contains("mediaType") || collection["mediaType"] == "books") parsed.append(collection);
         }
         emit browseResultsAboutToChange(true, 0);
         collectionItems = parsed;
+        collectionListLoaded = true;
         emit catalogChanged();
         emit browseResultsChanged();
         finish({}, true, "collections");
@@ -1964,7 +1965,7 @@ void Client::refresh(int targetPage, const QString &query) {
     if (busy()) return;
     if (targetPage < 0 || query.size() > 500) return;
     if (localView || collectionList) changeBrowsePage(CatalogTab, catalogBrowsePage);
-    pageAttempted = true;
+    browseRequested = true;
     if (!authenticated() && hasSavedSession()) {
         restoreSessionThen([this, targetPage, query] { refresh(targetPage, query); }, "catalog");
         return;
@@ -1992,7 +1993,7 @@ void Client::refresh(int targetPage, const QString &query) {
 void Client::loadStartupCatalog() {
     if (!startupCatalogPending || registryLoading) return;
     startupCatalogPending = false;
-    if (busy() || tabSelected || selectedTab() != CatalogTab || pageAttempted || !downloads.isEmpty() ||
+    if (busy() || browseRequested || selectedTab() != CatalogTab || pageLoaded || !downloads.isEmpty() ||
         !authenticated()) return;
 
     const auto account = accountGeneration;
@@ -2018,7 +2019,7 @@ void Client::loadStartupCatalog() {
     }
     sendJsonRequest("/api/v1/books/query", catalogPayload(0, {}), false,
         [this,account,access,reportFailure](QNetworkReply *reply, const QByteArray &bytes) {
-            if (account != accountGeneration || token != access || tabSelected || selectedTab() != CatalogTab || pageAttempted) return;
+            if (account != accountGeneration || token != access || browseRequested || selectedTab() != CatalogTab || pageLoaded) return;
             const int code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
             if (failedJsonReply(*reply, code, bytes.size())) {
                 if (code == 401) clearCredentials();
@@ -2073,7 +2074,7 @@ std::pair<UiMessage,bool> Client::applyCatalogResponse(const QJsonObject &respon
     }
     const bool sameQuery = query == committedQuery;
     emit browseResultsAboutToChange(sameQuery && targetPage == currentPage, sameQuery && targetPage < currentPage ? -1 : 0);
-    pageAttempted = true;
+    pageLoaded = true;
     items = parsed; currentPage = targetPage; count = response["total"].toInt(); committedQuery=query;
     invalidateLibrary(); emit catalogChanged(); publishDataChanges();
     emit browseResultsChanged();
@@ -2565,7 +2566,6 @@ void Client::showDownloaded(bool value) {
         selectTab(DownloadsTab);
     } else {
         if (selectedTab() != CatalogTab) changeBrowsePage(CatalogTab, catalogBrowsePage);
-        tabSelected = true;
         refresh(currentPage, committedQuery);
     }
 }

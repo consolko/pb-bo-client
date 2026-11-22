@@ -198,6 +198,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/collections" and self.command == "GET":
             if mode == "bad_collections":
                 return self.send(200, {"items": COLLECTIONS})
+            if mode == "collections_without_media_type":
+                return self.send(200, [{key: value for key, value in item.items() if key != "mediaType"}
+                                       for item in COLLECTIONS if item["mediaType"] == "books"])
             return self.send(200, COLLECTIONS)
         collection = re.fullmatch(r"/api/v1/collections/(\d+)/books", path)
         if collection and self.command == "GET":

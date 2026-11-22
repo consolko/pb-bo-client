@@ -1224,10 +1224,26 @@ int main(int argc, char **argv) {
     require(!wait(features,[&] { features.verifyLibrary(); }) && features.status().contains("совпало: 1") &&
             features.status().contains("не проверено: 4"), "cancellation between files preserves completed result and skips remaining files");
     QObject::disconnect(cancelBetween);
-    require(wait(features, [&] { features.showCollections(); }) && features.collections().size() == 3,
-            "collection array includes own and public books, excludes podcasts");
-    require(wait(features, [&] { features.openCollection(12, "Общая библиотека"); }) && features.total() == 23 && features.books().size() == 10,
-            "collection uses paginated server membership");
+    write(fault, "error");
+    require(!wait(features, [&] { features.selectTab(2); }) && features.canRetry() && features.collections().isEmpty(),
+            "first failed collections request offers retry");
+    features.selectTab(0);
+    write(fault, "features");
+    features.selectTab(2);
+    require(waitUntil([&] { return !features.busy(); }) && features.collections().size() == 3,
+            "reopening Collections retries a failed first load and excludes legacy podcast collections");
+    write(fault, "collections_without_media_type");
+    require(wait(features, [&] { features.selectTab(2); }) && features.collections().size() == 3 &&
+            features.collections().at(1).toMap().value("id").toInt() == 12,
+            "collections from BookOrbit 3.7 and later load without mediaType");
+    write(fault, "error");
+    require(!wait(features, [&] { features.openCollection(12, "Общая библиотека"); }) && features.canRetry() && features.books().isEmpty(),
+            "first failed collection books request offers retry");
+    features.selectTab(0);
+    write(fault, "features");
+    features.selectTab(2);
+    require(waitUntil([&] { return !features.busy(); }) && features.collectionId() == 12 && features.total() == 23 && features.books().size() == 10,
+            "reopening the collection retries the first page and uses paginated server membership");
     require(wait(features, [&] { features.refresh(2); }) && features.books().size() == 3 && features.collectionId() == 12,
             "last page stays in selected collection");
     require(wait(features, [&] { features.refresh(0, "Автор коллекции"); }) && features.total() == 20,

@@ -426,7 +426,7 @@ private:
         QJsonArray items;
         int page = 0, total = 0, collection = 0;
         QString query, name;
-        bool attempted = false;
+        bool loaded = false;
     };
     struct BrowseHistoryItem {
         BrowseTab tab;
@@ -438,7 +438,7 @@ private:
     };
     QList<BrowseHistoryItem> browseHistory;
     BrowsePage catalogBrowsePage, collectionsBrowsePage;
-    bool pageAttempted = false, collectionListAttempted = false, tabSelected = false;
+    bool pageLoaded = false, collectionListLoaded = false, browseRequested = false;
     BrowseTab selectedTab() const;
     BrowsePage currentBrowsePage() const;
     void changeBrowsePage(BrowseTab tab, BrowsePage page, bool restore = true);
